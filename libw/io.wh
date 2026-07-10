@@ -1,0 +1,6 @@
+sc.true
+
+fn print_string(u8* s) -> void;
+fn print_number(u64 num) -> void;
+fn print_signed_number(i64 num) -> void;
+fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) -> void;
