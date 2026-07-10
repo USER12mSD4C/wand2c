@@ -44,6 +44,30 @@ fn strcmp(u8* s1, u8* s2) {
     return(one);
 }
 
+fn strcpy(u8* dest, u8* src) {
+    u8* original_dest = dest;
+    u8 active = 1;
+    while (active != 0) {
+        u8* p_out*o = dest;
+        u8* p_in*i = src;
+        active = p_in;
+        p_out = active;
+        if (active != 0) {
+            dest++;
+            src++;
+        }
+    }
+    return(original_dest);
+}
+
+fn strcat(u8* dest, u8* src) {
+    u8* original_dest = dest;
+    u64 dest_len = strlen(dest);
+    dest = dest + dest_len;
+    strcpy(dest, src);
+    return(original_dest);
+}
+
 fn memcpy(u8* dest, u8* src, u64 n) {
     u64 i = 0;
     while (i < n) {
@@ -85,4 +109,53 @@ fn atoi(u8* s) {
         }
     }
     return(u64 res);
+}
+
+fn itoa(i64 num, u8* buf) {
+    u8* original_buf = buf;
+    if (num == 0) {
+        u8* p0*o = buf;
+        p0 = 48; // '0'
+        buf++;
+        u8* p_end*o = buf;
+        p_end = 0;
+        return(original_buf);
+    }
+
+    u64 is_negative = 0;
+    u64 temp_num = 0;
+    if (num < 0) {
+        is_negative = 1;
+        temp_num = 0 - num;
+    } else {
+        temp_num = num;
+    }
+
+    // Временный реверсивный буфер на стеке
+    u8[32] rev_buf;
+    u64 pos = 0;
+    while (temp_num > 0) {
+        u64 rem = temp_num % 10;
+        rev_buf[pos] = rem + 48;
+        pos = pos + 1;
+        temp_num = temp_num / 10;
+    }
+
+    if (is_negative == 1) {
+        u8* p_sign*o = buf;
+        p_sign = 45; // '-'
+        buf++;
+    }
+
+    while (pos > 0) {
+        pos = pos - 1;
+        u8 digit = rev_buf[pos];
+        u8* p_digit*o = buf;
+        p_digit = digit;
+        buf++;
+    }
+
+    u8* p_final*o = buf;
+    p_final = 0;
+    return(original_buf);
 }

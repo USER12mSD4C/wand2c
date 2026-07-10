@@ -5,4 +5,5 @@ fn mfree(void* ptr) -> void;
 
 fn mem_init(u64 initial_size) -> void;
 fn malloc(u64 size) -> void*;
+fn calloc(u64 num, u64 size) -> void*;
 fn mfree_all() -> void;

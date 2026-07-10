@@ -5,11 +5,7 @@ sect.rand_state
 EOS
 
 fn exit(u64 code) {
-    ::nasm::{
-        mov rax, 60
-        mov rdi, [code]
-        syscall
-    }
+    sys_exit(code); // Прямой вызов платформенного примитива
 }
 
 fn srand(u64 seed) {

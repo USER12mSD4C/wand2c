@@ -1,5 +1,8 @@
 sc.true
 
+fn print_char(u8 c) -> void;
+fn read_char() -> u8;
+fn read_string(u8* buf, u64 max_size) -> void;
 fn print_string(u8* s) -> void;
 fn print_number(u64 num) -> void;
 fn print_signed_number(i64 num) -> void;
