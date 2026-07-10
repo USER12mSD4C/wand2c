@@ -20,13 +20,10 @@ pub struct NativeGenerator {
     string_constants: HashMap<String, u32>,
     global_data_start_offset: usize,
 
-    // Таблица бэкпатчинга абсолютных адресов памяти
     address_patches: Vec<(usize, String)>,
 
-    // Таблица сигнатур функций для контекстного разыменования аргументов
     function_signatures: HashMap<String, Vec<DataType>>,
 
-    // Таблица типов полей структур для точного определения размера при записи по точке/стрелочке
     struct_fields: HashMap<String, HashMap<String, DataType>>,
 }
 
@@ -53,7 +50,6 @@ impl NativeGenerator {
     }
 
     pub fn compile_program(&mut self, program: &Program) -> Vec<u8> {
-        // Очистка состояния генератора для предотвращения накопления мусора между сборками
         self.code.clear();
         self.local_offsets.clear();
         self.local_access.clear();
@@ -68,12 +64,10 @@ impl NativeGenerator {
         self.struct_layouts.clear();
         self.typedefs_map.clear();
 
-        // Наполнение карты typedefs
         for (name, dt) in &program.typedefs {
             self.typedefs_map.insert(name.clone(), dt.clone());
         }
 
-        // Сбор сигнатур всех функций (как локальных, так и импортированных из хедеров)
         self.function_signatures.clear();
         for func in &program.functions {
             let param_types = func.params.iter().map(|(dt, _, _)| dt.clone()).collect();
@@ -81,7 +75,6 @@ impl NativeGenerator {
                 .insert(func.name.clone(), param_types);
         }
 
-        // Сбор типов полей всех структур для точного определения размеров
         self.struct_fields.clear();
         for s in &program.structs {
             let mut fields_types = HashMap::new();
@@ -91,7 +84,6 @@ impl NativeGenerator {
             self.struct_fields.insert(s.name.clone(), fields_types);
         }
 
-        // Расчет смещения полей для всех структур
         for s in &program.structs {
             let mut fields_offsets = HashMap::new();
             let mut current_offset = 0;
@@ -119,7 +111,6 @@ impl NativeGenerator {
                 .insert(s.name.clone(), (current_offset, fields_offsets));
         }
 
-        // Предварительный сбор всех строковых констант и jmpto-констант
         self.collect_string_constants_from_program(program);
 
         let mut global_data_bytes = Vec::new();
@@ -510,11 +501,9 @@ impl NativeGenerator {
         self.local_types.clear();
         self.next_offset = 8;
 
-        // Пролог кадра стека
         self.code.push(0x55);
         self.code.extend_from_slice(&[0x48, 0x89, 0xE5]);
 
-        // sub rsp, 512 (Задаем безопасный размер кадра стека для массивов)
         self.code
             .extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00]);
 
@@ -703,8 +692,6 @@ impl NativeGenerator {
                 self.call_patches
                     .push((patch_pos_call, "sld_jmpto".to_string()));
 
-                // АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ И ЗАПИСЬ ВОЗВРАЩАЕМОЙ ПЕРЕМЕННОЙ ИЗ ИСХОДНИКА!
-                // Пытаемся прочитать исходный код по имени модуля напрямую (.wexp) или по его копии (.w)
                 let mut source_code = None;
                 if let Ok(code) = std::fs::read_to_string(&module_name) {
                     source_code = Some(code);
@@ -722,20 +709,16 @@ impl NativeGenerator {
                     if let Ok(parsed_program) = parser.parse_program() {
                         if let Some(_) = parsed_program.functions.iter().find(|f| f.name == "main")
                         {
-                            // Ищем и парсим тело функции main, как это делает main.rs!
                             let local_lexer = crate::lexer::Lexer::new(&code);
                             let mut local_parser = crate::parser::Parser::new(local_lexer);
                             if local_parser.seek_to_function("main").is_ok() {
                                 if let Ok(body) = local_parser.parse_function_body() {
-                                    // Компилируем стейтменты тела main модуля ИНЛАЙН!
                                     for stmt in body {
                                         if let Stmt::Return(values) = stmt {
                                             if let Some((dt, Expr::Variable(ref var_name))) =
                                                 values.first()
                                             {
-                                                // Если переменная еще не задекларирована локально на стеке
                                                 if !self.local_offsets.contains_key(var_name) {
-                                                    // Проверяем, есть ли разделяемая переменная в секциях (например, args:z)
                                                     let mut is_global = false;
                                                     for key in self.global_offsets.keys() {
                                                         if key.ends_with(&format!(":{}", var_name))
@@ -744,7 +727,6 @@ impl NativeGenerator {
                                                             break;
                                                         }
                                                     }
-                                                    // Если это чисто локальная переменная, выделяем под нее место
                                                     if !is_global {
                                                         let var_size =
                                                             self.get_type_size_internal(dt);
@@ -760,7 +742,6 @@ impl NativeGenerator {
                                                             .insert(var_name.clone(), dt.clone());
                                                     }
                                                 }
-                                                // Сохраняем RAX в эту переменную на стеке текущей функции
                                                 if let Some(&offset) =
                                                     self.local_offsets.get(var_name)
                                                 {
@@ -780,7 +761,6 @@ impl NativeGenerator {
                 }
 
                 if !compiled_inline {
-                    // Если инлайн не удался (файла нет), оставляем классический вызов динамического sld
                     self.code.extend_from_slice(&[0x48, 0xBF]);
                     let patch_pos = self.code.len();
                     self.code.extend_from_slice(&[0; 8]);
@@ -1661,7 +1641,7 @@ pub fn generate_elf64_binary(
     let p46_hdr_offset = text_offset + text_size;
     let p46_hdr_size = 24usize;
 
-    let p46_types_offset = p46_hdr_offset + p46_hdr_size; // Фикс: p46_hdr_size вместо p46_types_size
+    let p46_types_offset = p46_hdr_offset + p46_hdr_size;
     let p46_types_size = p46_types.len();
 
     let p46_exp_offset = p46_types_offset + p46_types_size;
