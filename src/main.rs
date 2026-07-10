@@ -257,9 +257,14 @@ fn main() {
     println!("  \x1b[34;1mStage 3:\x1b[0m Type Checking & Safety Analysis");
     let mut checker = TypeChecker::new();
     checker.populate_symbols(&program);
+    if let Err(e) = checker.verify_calls(&program) {
+        eprintln!("\n  \x1b[31;1m[checker error]\x1b[0m {}", e);
+        std::process::exit(1);
+    }
+
     for s in &program.structs {
         if let Err(e) = checker.calculate_struct_layout(&s.name) {
-            eprintln!("  [checker error] {}", e);
+            eprintln!("    [checker error] {}", e);
             std::process::exit(1);
         }
     }
@@ -353,7 +358,6 @@ fn main() {
     );
 }
 
-/// Метод разрешения путей импортов (поддерживает стандартные `<>` библиотеки)
 fn resolve_import_path(imp_name: &str) -> (String, String) {
     if imp_name.starts_with('<') && imp_name.ends_with('>') {
         let lib_name = &imp_name[1..imp_name.len() - 1];
@@ -370,7 +374,6 @@ fn resolve_import_path(imp_name: &str) -> (String, String) {
     }
 }
 
-/// Валидация файла библиотеки через Лексер и Парсер перед установкой (с проверкой тел функций)
 fn validate_file(filename: &str) -> Result<(), String> {
     if !std::path::Path::new(filename).exists() {
         return Ok(());
@@ -388,12 +391,10 @@ fn validate_file(filename: &str) -> Result<(), String> {
         )
     })?;
 
-    // Если это заголовочный файл (.wh), у него нет тел функций — пропускаем валидацию тел!
     if filename.ends_with(".wh") {
         return Ok(());
     }
 
-    // ВАЛИДИРУЕМ ТЕЛА ВСЕХ НАЙДЕННЫХ ФУНКЦИЙ!
     for func in &program.functions {
         let local_lexer = Lexer::new(&source_code);
         let mut local_parser = Parser::new(local_lexer);

@@ -66,8 +66,9 @@ impl Parser {
             | Token::TypeI16
             | Token::TypeI32
             | Token::TypeI64
+            | Token::TypeF64
             | Token::TypeVoid => true,
-            Token::Ident(_) => match &self.peek_token {
+            Token::Ident(name) => match &self.peek_token {
                 Token::Ident(_)
                 | Token::PtrInputModifier(_)
                 | Token::PtrOutputModifier(_)
@@ -124,9 +125,9 @@ impl Parser {
 
                     if import_path.contains('.') {
                         return Err(self.err(
-                                            "Import path must not contain file extensions (such as .h, .w or .wlib). \
-                                            WandC expects logical module names."
-                                        ));
+                                                    "Import path must not contain file extensions (such as .h, .w or .wlib). \
+                                                    WandC expects logical module names."
+                                                ));
                     }
 
                     program.imports.push(import_path);
@@ -134,6 +135,115 @@ impl Parser {
                     if self.current_token == Token::Semicolon {
                         self.step();
                     }
+                }
+                Token::Union => {
+                    self.step(); // consume 'union'
+                    let name = match &self.current_token {
+                        Token::Ident(n) => n.clone(),
+                        _ => return Err(self.err("Expected union name")),
+                    };
+                    self.step();
+
+                    let mut version = 1;
+                    if self.current_token == Token::Version {
+                        self.step();
+                        if let Token::Number(v) = self.current_token {
+                            version = v as u32;
+                            self.step();
+                        }
+                    }
+
+                    if self.current_token != Token::LBrace {
+                        return Err(self.err("Expected '{' after union declaration"));
+                    }
+                    self.step();
+
+                    let mut fields = Vec::new();
+                    while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                        let field_type = self.parse_data_type()?;
+                        let field_name = match &self.current_token {
+                            Token::Ident(n) => n.clone(),
+                            _ => return Err(self.err("Expected field name")),
+                        };
+                        self.step();
+
+                        let mut f_version_added = 1;
+                        let f_version_removed = 0xFFFFFFFF;
+
+                        if self.current_token == Token::Version {
+                            self.step();
+                            if let Token::Number(v) = self.current_token {
+                                f_version_added = v as u32;
+                                self.step();
+                            }
+                        }
+
+                        fields.push(FieldDecl {
+                            name: field_name,
+                            data_type: field_type,
+                            version_added: f_version_added,
+                            version_removed: f_version_removed,
+                        });
+
+                        if self.current_token == Token::Semicolon {
+                            self.step();
+                        }
+                    }
+                    self.step();
+
+                    program.structs.push(StructDecl {
+                        name,
+                        version,
+                        fields,
+                        is_union: true, // Указываем, что это объединение
+                    });
+                }
+                Token::Enum => {
+                    self.step(); // consume 'enum'
+                    let _name = match &self.current_token {
+                        Token::Ident(n) => n.clone(),
+                        _ => return Err(self.err("Expected enum name")),
+                    };
+                    self.step();
+
+                    if self.current_token == Token::Version {
+                        self.step();
+                        if let Token::Number(_) = self.current_token {
+                            self.step();
+                        }
+                    }
+
+                    if self.current_token != Token::LBrace {
+                        return Err(self.err("Expected '{' after enum name"));
+                    }
+                    self.step();
+
+                    while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                        let _val_name = match &self.current_token {
+                            Token::Ident(n) => n.clone(),
+                            _ => return Err(self.err("Expected enum value identifier")),
+                        };
+                        self.step();
+
+                        if self.current_token == Token::OpAssign {
+                            self.step();
+                            if let Token::Number(_) = self.current_token {
+                                self.step();
+                            }
+                        }
+
+                        if self.current_token == Token::Version {
+                            self.step();
+                            if let Token::Number(_) = self.current_token {
+                                self.step();
+                            }
+                        }
+
+                        if self.current_token == Token::Comma {
+                            self.step();
+                        }
+                    }
+                    self.step();
                 }
                 Token::Typedef => {
                     self.step();
@@ -463,8 +573,8 @@ impl Parser {
 
         let mut post = None;
         if self.current_token != Token::RParen {
-            let expr = self.parse_expr()?;
-            post = Some(Box::new(Stmt::Expr(expr)));
+            let stmt = self.parse_expr_statement()?;
+            post = Some(Box::new(stmt));
         }
         if self.current_token != Token::RParen {
             return Err(self.err("Expected ')' at the end of 'for' clause"));
@@ -601,6 +711,7 @@ impl Parser {
             name,
             version,
             fields,
+            is_union: false,
         })
     }
 
@@ -755,6 +866,7 @@ impl Parser {
             Token::TypeI16 => DataType::I16,
             Token::TypeI32 => DataType::I32,
             Token::TypeI64 => DataType::I64,
+            Token::TypeF64 => DataType::F64,
             Token::TypeVoid => DataType::Void,
             Token::Ident(ref name) => DataType::Struct(name.clone()),
             _ => return Err(self.err("Unexpected token for data type")),
@@ -809,6 +921,15 @@ impl Parser {
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
         match &self.current_token {
+            Token::OpBitNot => {
+                self.step();
+                let expr = self.parse_primary_expr()?;
+                Ok(Expr::Binary {
+                    left: Box::new(expr),
+                    op: "OpBitNot".to_string(),
+                    right: Box::new(Expr::Number(0)),
+                })
+            }
             Token::Number(val) => {
                 let v = *val;
                 self.step();
@@ -821,6 +942,22 @@ impl Parser {
             }
             Token::LParen => {
                 self.step(); // consume '('
+
+                // Проверяем явное приведение типов: (Type)value
+                if self.is_current_token_type() {
+                    let cast_type = self.parse_data_type()?;
+                    if self.current_token != Token::RParen {
+                        return Err(self.err("Expected ')' after cast type"));
+                    }
+                    self.step(); // consume ')'
+                    let inner_expr = self.parse_primary_expr()?;
+                    return Ok(Expr::Binary {
+                        left: Box::new(inner_expr),
+                        op: "OpCast".to_string(),
+                        right: Box::new(Expr::Number(0)),
+                    });
+                }
+
                 let expr = self.parse_expr()?;
                 if self.current_token != Token::RParen {
                     return Err(self.err("Expected ')' after parenthesized expression"));
@@ -899,6 +1036,11 @@ impl Parser {
                 self.step();
                 Ok(Expr::AddrOf(name_val))
             }
+            Token::FloatLiteral(s) => {
+                let s_val = s.clone();
+                self.step();
+                Ok(Expr::FloatLit(s_val))
+            }
             Token::Null => {
                 self.step();
                 Ok(Expr::Null)
@@ -911,10 +1053,14 @@ impl Parser {
         match self.current_token {
             Token::OpMul | Token::OpDiv | Token::OpMod => Some(4),
             Token::OpAdd | Token::OpSub => Some(5),
+            Token::OpShl | Token::OpShr => Some(5),
             Token::OpLt | Token::OpLtEq | Token::OpGt | Token::OpGtEq => Some(6),
             Token::OpEq | Token::OpNotEq => Some(7),
-            Token::OpAnd => Some(8),
-            Token::OpOr => Some(9),
+            Token::OpBitAnd => Some(8),
+            Token::OpBitXor => Some(9),
+            Token::OpBitOr => Some(10),
+            Token::OpAnd => Some(11),
+            Token::OpOr => Some(12),
             _ => None,
         }
     }

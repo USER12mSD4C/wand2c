@@ -18,6 +18,7 @@ pub enum DataType {
     I16,
     I32,
     I64,
+    F64,
     Void,
     Pointer(Box<DataType>),
     Struct(String),
@@ -45,6 +46,7 @@ pub struct StructDecl {
     pub name: String,
     pub version: u32,
     pub fields: Vec<FieldDecl>,
+    pub is_union: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,7 @@ pub enum Expr {
         expr: Box<Expr>,
         index: Box<Expr>,
     },
+    FloatLit(String),
     Null,
 }
 

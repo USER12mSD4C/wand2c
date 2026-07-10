@@ -109,7 +109,7 @@ impl Lexer {
         }
 
         if ch.is_ascii_digit() {
-            let tok = self.read_number();
+            let tok = self.read_number_or_float();
             let span = Span {
                 line: start_line,
                 col: start_col,
@@ -173,6 +173,8 @@ impl Lexer {
             ')' => Token::RParen,
             ':' => Token::Colon,
             '.' => Token::Dot,
+            '~' => Token::OpBitNot,
+            '^' => Token::OpBitXor,
             '!' => {
                 if self.current() == '=' {
                     self.step();
@@ -193,6 +195,9 @@ impl Lexer {
                 if self.current() == '=' {
                     self.step();
                     Token::OpLtEq
+                } else if self.current() == '<' {
+                    self.step();
+                    Token::OpShl
                 } else {
                     Token::OpLt
                 }
@@ -201,6 +206,9 @@ impl Lexer {
                 if self.current() == '=' {
                     self.step();
                     Token::OpGtEq
+                } else if self.current() == '>' {
+                    self.step();
+                    Token::OpShr
                 } else {
                     Token::OpGt
                 }
@@ -227,13 +235,21 @@ impl Lexer {
             '*' => Token::OpMul,
             '/' => Token::OpDiv,
             '%' => Token::OpMod,
-            '&' if self.current() == '&' => {
-                self.step();
-                Token::OpAnd
+            '&' => {
+                if self.current() == '&' {
+                    self.step();
+                    Token::OpAnd
+                } else {
+                    Token::OpBitAnd
+                }
             }
-            '|' if self.current() == '|' => {
-                self.step();
-                Token::OpOr
+            '|' => {
+                if self.current() == '|' {
+                    self.step();
+                    Token::OpOr
+                } else {
+                    Token::OpBitOr
+                }
             }
             _ => Token::Ident(ch.to_string()),
         };
@@ -310,6 +326,37 @@ impl Lexer {
         Token::Number(val)
     }
 
+    fn read_number_or_float(&mut self) -> Token {
+        let mut num_str = String::new();
+        let mut is_float = false;
+        while self.pos < self.input.len()
+            && (self.current().is_ascii_digit()
+                || self.current() == '.'
+                || self.current() == 'x'
+                || (self.current().is_ascii_hexdigit() && num_str.starts_with("0x")))
+        {
+            if self.current() == '.' {
+                if self.peek(1).is_ascii_digit() {
+                    is_float = true;
+                } else {
+                    break; // Это точка доступа к полю (например, struct.field), а не дробная часть
+                }
+            }
+            num_str.push(self.current());
+            self.step();
+        }
+        if is_float {
+            Token::FloatLiteral(num_str)
+        } else {
+            let val = if num_str.starts_with("0x") {
+                u64::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+            } else {
+                num_str.parse::<u64>().unwrap_or(0)
+            };
+            Token::Number(val)
+        }
+    }
+
     fn read_string_literal(&mut self) -> Token {
         self.step();
         let mut s = String::new();
@@ -348,6 +395,8 @@ impl Lexer {
             "sc.false" => Token::ScFalse,
             "fn" => Token::Fn,
             "struct" => Token::Struct,
+            "union" => Token::Union,
+            "enum" => Token::Enum,
             "version" => Token::Version,
             "sect" => Token::Sect,
             "EOS" => Token::Eos,
@@ -367,6 +416,7 @@ impl Lexer {
             "i16" => Token::TypeI16,
             "i32" => Token::TypeI32,
             "i64" => Token::TypeI64,
+            "f64" => Token::TypeF64,
             "void" => Token::TypeVoid,
             _ => Token::Ident(name),
         }

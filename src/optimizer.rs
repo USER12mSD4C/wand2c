@@ -89,6 +89,43 @@ impl Optimizer {
                 count += Self::optimize_expr(left);
                 count += Self::optimize_expr(right);
 
+                // Оптимизация алгебраических выражений (убирает лишние регистровые/стековые команды)
+                if op == "OpAdd" {
+                    if let Expr::Number(0) = &**left {
+                        *expr = *right.clone();
+                        return count + 1;
+                    }
+                    if let Expr::Number(0) = &**right {
+                        *expr = *left.clone();
+                        return count + 1;
+                    }
+                }
+                if op == "OpSub" {
+                    if let Expr::Number(0) = &**right {
+                        *expr = *left.clone();
+                        return count + 1;
+                    }
+                }
+                if op == "OpMul" {
+                    if let Expr::Number(1) = &**left {
+                        *expr = *right.clone();
+                        return count + 1;
+                    }
+                    if let Expr::Number(1) = &**right {
+                        *expr = *left.clone();
+                        return count + 1;
+                    }
+                    if let Expr::Number(0) = &**left {
+                        *expr = Expr::Number(0);
+                        return count + 1;
+                    }
+                    if let Expr::Number(0) = &**right {
+                        *expr = Expr::Number(0);
+                        return count + 1;
+                    }
+                }
+
+                // Сворачивание числовых констант
                 if let (Expr::Number(a), Expr::Number(b)) = (&**left, &**right) {
                     let val_a = *a;
                     let val_b = *b;

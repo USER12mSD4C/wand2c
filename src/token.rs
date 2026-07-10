@@ -75,6 +75,18 @@ pub enum Token {
     Semicolon, // ;
     Comma,     // ,
 
+    //euo токены
+    Enum,
+    Union,
+    OpBitAnd, // &
+    OpBitOr,  // |
+    OpBitXor, // ^
+    OpBitNot, // ~
+    OpShl,    // <<
+    OpShr,    // >>
+    TypeF64,
+    FloatLiteral(String),
+
     // Ассемблерные блоки
     NasmBlock(String),
 

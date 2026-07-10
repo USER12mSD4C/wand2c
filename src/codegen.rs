@@ -18,6 +18,7 @@ pub struct NativeGenerator {
     typedefs_map: HashMap<String, DataType>,
 
     string_constants: HashMap<String, u32>,
+    float_constants: HashMap<String, u32>,
     global_data_start_offset: usize,
 
     address_patches: Vec<(usize, String)>,
@@ -42,6 +43,7 @@ impl NativeGenerator {
             struct_layouts: HashMap::new(),
             typedefs_map: HashMap::new(),
             string_constants: HashMap::new(),
+            float_constants: HashMap::new(),
             global_data_start_offset: 0,
             address_patches: Vec::new(),
             function_signatures: HashMap::new(),
@@ -60,6 +62,7 @@ impl NativeGenerator {
         self.global_offsets.clear();
         self.global_data_size = 0;
         self.string_constants.clear();
+        self.float_constants.clear();
         self.address_patches.clear();
         self.struct_layouts.clear();
         self.typedefs_map.clear();
@@ -88,6 +91,21 @@ impl NativeGenerator {
             let mut fields_offsets = HashMap::new();
             let mut current_offset = 0;
             let mut max_alignment = 1;
+
+            if s.is_union {
+                let mut max_size = 0;
+                for field in &s.fields {
+                    fields_offsets.insert(field.name.clone(), 0);
+                    let size = self.get_type_size_internal(&field.data_type);
+                    if size > max_size {
+                        max_size = size;
+                    }
+                }
+                self.struct_layouts
+                    .insert(s.name.clone(), (max_size, fields_offsets));
+                continue;
+            }
+
             for field in &s.fields {
                 let size = self.get_type_size_internal(&field.data_type);
                 let mut alignment = size;
@@ -149,6 +167,19 @@ impl NativeGenerator {
         for (str_const, off) in &string_offsets {
             self.global_offsets
                 .insert(format!("str:{}", str_const), *off);
+        }
+
+        self.collect_float_constants_from_program(program);
+        let mut float_offsets = HashMap::new();
+        for (f_const, _) in &self.float_constants {
+            let off = global_data_bytes.len() as u32;
+            let val = f_const.parse::<f64>().unwrap_or(0.0);
+            global_data_bytes.extend_from_slice(&val.to_bits().to_le_bytes());
+            float_offsets.insert(f_const.clone(), off);
+        }
+        for (f_const, off) in &float_offsets {
+            self.global_offsets
+                .insert(format!("float:{}", f_const), *off);
         }
 
         self.global_data_size = global_data_bytes.len() as u32;
@@ -318,12 +349,129 @@ impl NativeGenerator {
         }
     }
 
+    fn is_float_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::FloatLit(_) => true,
+            Expr::Variable(name) => {
+                if let Some(dt) = self.local_types.get(name) {
+                    matches!(dt, DataType::F64)
+                } else {
+                    false
+                }
+            }
+            Expr::Binary { left, .. } => self.is_float_expr(left),
+            Expr::Call { name, .. } => {
+                name == "sin" || name == "cos" || name == "tan" || name == "sqrt"
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_float_constants_from_program(&mut self, program: &Program) {
+        for func in &program.functions {
+            if let Some(body) = &func.body {
+                for stmt in body {
+                    self.collect_float_constants_from_stmt(stmt);
+                }
+            }
+        }
+    }
+
+    fn collect_float_constants_from_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::VarDefinition(decl) => {
+                if let Some(ref init) = decl.initial_value {
+                    self.collect_float_constants_from_expr(init);
+                }
+            }
+            Stmt::Assignment { targets, value } => {
+                for target in targets {
+                    self.collect_float_constants_from_expr(target);
+                }
+                self.collect_float_constants_from_expr(value);
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_float_constants_from_expr(cond);
+                for s in then_branch {
+                    self.collect_float_constants_from_stmt(s);
+                }
+                if let Some(else_stmts) = else_branch {
+                    for s in else_stmts {
+                        self.collect_float_constants_from_stmt(s);
+                    }
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.collect_float_constants_from_expr(cond);
+                for s in body {
+                    self.collect_float_constants_from_stmt(s);
+                }
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
+                if let Some(i) = init {
+                    self.collect_float_constants_from_stmt(i);
+                }
+                self.collect_float_constants_from_expr(cond);
+                if let Some(p) = post {
+                    self.collect_float_constants_from_stmt(p);
+                }
+                for s in body {
+                    self.collect_float_constants_from_stmt(s);
+                }
+            }
+            Stmt::Return(values) => {
+                for (_, expr) in values {
+                    self.collect_float_constants_from_expr(expr);
+                }
+            }
+            Stmt::Expr(expr) => {
+                self.collect_float_constants_from_expr(expr);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_float_constants_from_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::FloatLit(s) => {
+                self.float_constants.insert(s.clone(), 0);
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_float_constants_from_expr(left);
+                self.collect_float_constants_from_expr(right);
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.collect_float_constants_from_expr(arg);
+                }
+            }
+            Expr::Index { expr: base, index } => {
+                self.collect_float_constants_from_expr(base);
+                self.collect_float_constants_from_expr(index);
+            }
+            Expr::MemberAccess { expr: base, .. } => {
+                self.collect_float_constants_from_expr(base);
+            }
+            _ => {}
+        }
+    }
+
     fn get_type_size_internal(&self, dt: &DataType) -> u32 {
         match dt {
             DataType::U8 | DataType::I8 => 1,
             DataType::U16 | DataType::I16 => 2,
             DataType::U32 | DataType::I32 => 4,
             DataType::U64 | DataType::I64 => 8,
+            DataType::F64 => 8,
             DataType::Pointer(_) => 8,
             DataType::Array(elem, count) => self.get_type_size_internal(elem) * (*count as u32),
             DataType::Typedef(_, underlying) => self.get_type_size_internal(underlying),
@@ -430,19 +578,15 @@ impl NativeGenerator {
 
         match size {
             1 => {
-                // movzx r64, byte ptr [rbp - offset] -> 48 0F B6 modrm disp
                 self.code.extend_from_slice(&[0x48, 0x0F, 0xB6, modrm]);
             }
             2 => {
-                // movzx r64, word ptr [rbp - offset] -> 48 0F B7 modrm disp
                 self.code.extend_from_slice(&[0x48, 0x0F, 0xB7, modrm]);
             }
             4 => {
-                // mov r32, dword ptr [rbp - offset] -> 8B modrm disp (автоматическое zero-extend в 64-бит)
                 self.code.extend_from_slice(&[0x8B, modrm]);
             }
             _ => {
-                // mov r64, qword ptr [rbp - offset] -> 48 8B modrm disp
                 self.code.extend_from_slice(&[0x48, 0x8B, modrm]);
             }
         }
@@ -469,19 +613,15 @@ impl NativeGenerator {
                 if reg_code >= 4 {
                     self.code.push(0x40);
                 }
-                // mov byte ptr [rbp - offset], reg_8 -> 88 modrm disp
                 self.code.extend_from_slice(&[0x88, modrm]);
             }
             2 => {
-                // mov word ptr [rbp - offset], reg_16 -> 66 89 modrm disp
                 self.code.extend_from_slice(&[0x66, 0x89, modrm]);
             }
             4 => {
-                // mov dword ptr [rbp - offset], reg_32 -> 89 modrm disp
                 self.code.extend_from_slice(&[0x89, modrm]);
             }
             _ => {
-                // mov qword ptr [rbp - offset], reg_64 -> 48 89 modrm disp
                 self.code.extend_from_slice(&[0x48, 0x89, modrm]);
             }
         }
@@ -509,8 +649,8 @@ impl NativeGenerator {
 
         for (idx, (dt, name, access)) in func.params.iter().enumerate() {
             let var_size = self.get_type_size_internal(dt);
-            self.next_offset += var_size; // Сначала увеличиваем смещение
-            let offset = self.next_offset; // Затем берем базовый адрес
+            self.next_offset += var_size;
+            let offset = self.next_offset;
             self.local_offsets.insert(name.clone(), offset);
             self.local_access.insert(name.clone(), *access);
             self.local_types.insert(name.clone(), dt.clone());
@@ -522,7 +662,7 @@ impl NativeGenerator {
                     2 => 2, // RDX
                     _ => 1, // RCX
                 };
-                self.emit_mem_store(reg_code, offset, var_size); // mov [rbp - offset], reg
+                self.emit_mem_store(reg_code, offset, var_size);
             }
         }
 
@@ -532,7 +672,6 @@ impl NativeGenerator {
             }
         }
 
-        // Эпилог
         self.code.extend_from_slice(&[0x48, 0x89, 0xEC]);
         self.code.push(0x5D);
         self.code.push(0xC3);
@@ -542,8 +681,8 @@ impl NativeGenerator {
         match stmt {
             Stmt::VarDefinition(decl) => {
                 let var_size = self.get_type_size_internal(&decl.data_type);
-                self.next_offset += var_size; // Сначала увеличиваем смещение
-                let offset = self.next_offset; // Затем берем базовый адрес
+                self.next_offset += var_size;
+                let offset = self.next_offset;
                 self.local_offsets.insert(decl.name.clone(), offset);
                 self.local_access.insert(decl.name.clone(), decl.modifier);
                 self.local_types
@@ -556,31 +695,26 @@ impl NativeGenerator {
             }
             Stmt::Assignment { targets, value } => {
                 if let Some(target_expr) = targets.first() {
-                    // Вычисляем правое значение (оно возвращается в rax)
                     self.compile_expr(value, 0, true);
-                    // Записываем его в первый приемник
                     self.store_assignment_target_from_rax(target_expr);
 
-                    // Для 2-го значения (в rdx)
                     if targets.len() > 1 {
                         if let Some(target_expr2) = targets.get(1) {
-                            self.code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+                            self.code.extend_from_slice(&[0x48, 0x89, 0xD0]);
                             self.store_assignment_target_from_rax(target_expr2);
                         }
                     }
 
-                    // Для 3-го значения (в rcx)
                     if targets.len() > 2 {
                         if let Some(target_expr3) = targets.get(2) {
-                            self.code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+                            self.code.extend_from_slice(&[0x48, 0x89, 0xC8]);
                             self.store_assignment_target_from_rax(target_expr3);
                         }
                     }
 
-                    // Для 4-го значения (в r8)
                     if targets.len() > 3 {
                         if let Some(target_expr4) = targets.get(3) {
-                            self.code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8 (4C 89 C0)
+                            self.code.extend_from_slice(&[0x4C, 0x89, 0xC0]);
                             self.store_assignment_target_from_rax(target_expr4);
                         }
                     }
@@ -678,14 +812,12 @@ impl NativeGenerator {
                     self.compile_stmt(arg);
                 }
 
-                // mov rdi, abs_addr (0x48, 0xBF, 8 байт пустого адреса)
                 self.code.extend_from_slice(&[0x48, 0xBF]);
                 let patch_pos = self.code.len();
-                self.code.extend_from_slice(&[0; 8]); // заглушка
+                self.code.extend_from_slice(&[0; 8]);
                 self.address_patches
                     .push((patch_pos, format!("str:{}", module_name)));
 
-                // call sld_jmpto
                 self.code.push(0xE8);
                 let patch_pos_call = self.code.len();
                 self.code.extend_from_slice(&[0, 0, 0, 0]);
@@ -707,8 +839,7 @@ impl NativeGenerator {
                     let lexer = crate::lexer::Lexer::new(&code);
                     let mut parser = crate::parser::Parser::new(lexer);
                     if let Ok(parsed_program) = parser.parse_program() {
-                        if let Some(_) = parsed_program.functions.iter().find(|f| f.name == "main")
-                        {
+                        if parsed_program.functions.iter().any(|f| f.name == "main") {
                             let local_lexer = crate::lexer::Lexer::new(&code);
                             let mut local_parser = crate::parser::Parser::new(local_lexer);
                             if local_parser.seek_to_function("main").is_ok() {
@@ -776,19 +907,19 @@ impl NativeGenerator {
             }
             Stmt::Return(values) => {
                 if let Some((_, ref expr)) = values.first() {
-                    self.compile_expr(expr, 0, true); // RAX (1-й результат)
+                    self.compile_expr(expr, 0, true);
                 }
                 if let Some((_, ref expr)) = values.get(1) {
-                    self.compile_expr(expr, 0, true); // Вычисляем в RAX
-                    self.code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax (2-й результат)
+                    self.compile_expr(expr, 0, true);
+                    self.code.extend_from_slice(&[0x48, 0x89, 0xC2]);
                 }
                 if let Some((_, ref expr)) = values.get(2) {
-                    self.compile_expr(expr, 0, true); // Вычисляем в RAX
-                    self.code.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax (3-й результат)
+                    self.compile_expr(expr, 0, true);
+                    self.code.extend_from_slice(&[0x48, 0x89, 0xC1]);
                 }
                 if let Some((_, ref expr)) = values.get(3) {
-                    self.compile_expr(expr, 0, true); // Вычисляем в RAX
-                    self.code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax (4-й результат)
+                    self.compile_expr(expr, 0, true);
+                    self.code.extend_from_slice(&[0x49, 0x89, 0xC0]);
                 }
                 self.code.extend_from_slice(&[0x48, 0x89, 0xEC]);
                 self.code.push(0x5D);
@@ -828,7 +959,6 @@ impl NativeGenerator {
                                 _ => None,
                             };
 
-                            // Добавлена поддержка сохранения регистра в локальную переменную (mov [var], reg)
                             if dest.starts_with('[') && dest.ends_with(']') {
                                 let var_name = dest[1..dest.len() - 1].trim();
                                 if let Some(&offset) = self.local_offsets.get(var_name) {
@@ -852,7 +982,6 @@ impl NativeGenerator {
                                         self.emit_mem_load(dest_code, offset, 8);
                                     }
                                 } else if let Ok(num) = src.parse::<i32>() {
-                                    // mov reg, imm32 -> 48 C7 C(dest_code) imm32
                                     let modrm = 0xC0 | dest_code;
                                     self.code.extend_from_slice(&[0x48, 0xC7, modrm]);
                                     self.code.extend_from_slice(&num.to_le_bytes());
@@ -867,7 +996,6 @@ impl NativeGenerator {
                                         _ => None,
                                     };
                                     if let Some(src_code) = src_reg_code {
-                                        // mov dest, src -> 48 89 modrm
                                         let modrm = 0xC0 | (src_code << 3) | dest_code;
                                         self.code.extend_from_slice(&[0x48, 0x89, modrm]);
                                     }
@@ -890,6 +1018,20 @@ impl NativeGenerator {
                 let opcode = 0xB8 + reg;
                 self.code.extend_from_slice(&[0x48, opcode]);
                 self.code.extend_from_slice(&val.to_le_bytes());
+            }
+            Expr::FloatLit(s) => {
+                let opcode = 0xB8 + reg;
+                self.code.extend_from_slice(&[0x48, opcode]);
+                let patch_pos = self.code.len();
+                self.code.extend_from_slice(&[0; 8]);
+                self.address_patches
+                    .push((patch_pos, format!("float:{}", s)));
+
+                if reg == 0 {
+                    self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
+                } else {
+                    self.code.extend_from_slice(&[0x48, 0x8B, 0x1B]);
+                }
             }
             Expr::StringLit(s) => {
                 let opcode = 0xB8 + reg;
@@ -934,7 +1076,6 @@ impl NativeGenerator {
                         self.code.extend_from_slice(deref_op);
                     }
                 } else {
-                    // ФОЛБЕК НА ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ СЕКЦИЙ (args:x_val и т.д.)
                     let mut found_key = None;
                     for key in self.global_offsets.keys() {
                         if key.ends_with(&format!(":{}", name)) || key == name {
@@ -981,19 +1122,40 @@ impl NativeGenerator {
             Expr::SectionAccess { section, variable } => {
                 let key = format!("{}:{}", section, variable);
                 let opcode = if reg == 0 { 0xB8 } else { 0xBB };
-                self.code.extend_from_slice(&[0x48, opcode]); // mov reg, imm64
+                self.code.extend_from_slice(&[0x48, opcode]);
                 let patch_pos = self.code.len();
-                self.code.extend_from_slice(&[0; 8]); // 8-байтовая заглушка
+                self.code.extend_from_slice(&[0; 8]);
                 self.address_patches.push((patch_pos, key));
 
                 if reg == 0 {
-                    self.code.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+                    self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
                 } else {
-                    self.code.extend_from_slice(&[0x48, 0x8B, 0x1B]); // mov rbx, [rbx]
+                    self.code.extend_from_slice(&[0x48, 0x8B, 0x1B]);
                 }
             }
             Expr::Binary { left, op, right } => {
-                // ПРОВЕРКА НА *adr (Взятие адреса элемента или переменной)
+                if op == "OpCast" {
+                    self.compile_expr(left, reg, _deref_ptr);
+                    let is_left_float = self.is_float_expr(left);
+
+                    if is_left_float {
+                        self.code.extend_from_slice(&[
+                            0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF3, 0x48, 0x0F, 0x2C, 0xC0,
+                        ]);
+                    } else {
+                        self.code.extend_from_slice(&[
+                            0xF2, 0x48, 0x0F, 0x2A, 0xC0, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                        ]);
+                    }
+                    return;
+                }
+
+                if op == "OpBitNot" {
+                    self.compile_expr(left, 0, false);
+                    self.code.extend_from_slice(&[0x48, 0xF7, 0xD0]);
+                    return;
+                }
+
                 if op == "OpMul" {
                     if let Expr::Variable(ref name) = &**right {
                         if name == "adr" {
@@ -1009,36 +1171,77 @@ impl NativeGenerator {
                 self.code.extend_from_slice(&[0x48, 0x89, 0xC3]);
                 self.code.push(0x58);
 
+                let is_float_op = self.is_float_expr(left) || self.is_float_expr(right);
+
                 match op.as_str() {
                     "OpAdd" => {
-                        self.code.extend_from_slice(&[0x48, 0x01, 0xD8]);
+                        if is_float_op {
+                            self.code.extend_from_slice(&[
+                                0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x66, 0x48, 0x0F, 0x6E, 0xCB, 0xF2,
+                                0x0F, 0x58, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                            ]);
+                        } else {
+                            self.code.extend_from_slice(&[0x48, 0x01, 0xD8]);
+                        }
                     }
                     "OpSub" => {
-                        self.code.extend_from_slice(&[0x48, 0x29, 0xD8]);
+                        if is_float_op {
+                            self.code.extend_from_slice(&[
+                                0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x66, 0x48, 0x0F, 0x6E, 0xCB, 0xF2,
+                                0x0F, 0x5C, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                            ]);
+                        } else {
+                            self.code.extend_from_slice(&[0x48, 0x29, 0xD8]);
+                        }
                     }
                     "OpMul" => {
-                        self.code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC3]);
+                        if is_float_op {
+                            self.code.extend_from_slice(&[
+                                0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x66, 0x48, 0x0F, 0x6E, 0xCB, 0xF2,
+                                0x0F, 0x59, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                            ]);
+                        } else {
+                            self.code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC3]);
+                        }
                     }
                     "OpDiv" => {
-                        // xor rdx, rdx (48 31 D2)
-                        // div rbx (48 F7 F3) -> частное в rax
-                        self.code
-                            .extend_from_slice(&[0x48, 0x31, 0xD2, 0x48, 0xF7, 0xF3]);
+                        if is_float_op {
+                            self.code.extend_from_slice(&[
+                                0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x66, 0x48, 0x0F, 0x6E, 0xCB, 0xF2,
+                                0x0F, 0x5E, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                            ]);
+                        } else {
+                            self.code
+                                .extend_from_slice(&[0x48, 0x31, 0xD2, 0x48, 0xF7, 0xF3]);
+                        }
                     }
                     "OpMod" => {
-                        // xor rdx, rdx (48 31 D2)
-                        // div rbx (48 F7 F3) -> остаток в rdx
-                        // mov rax, rdx (48 89 D0) -> переносим остаток в rax
                         self.code.extend_from_slice(&[
                             0x48, 0x31, 0xD2, 0x48, 0xF7, 0xF3, 0x48, 0x89, 0xD0,
                         ]);
+                    }
+                    "OpBitAnd" => {
+                        self.code.extend_from_slice(&[0x48, 0x21, 0xD8]);
+                    }
+                    "OpBitOr" => {
+                        self.code.extend_from_slice(&[0x48, 0x09, 0xD8]);
+                    }
+                    "OpBitXor" => {
+                        self.code.extend_from_slice(&[0x48, 0x31, 0xD8]);
+                    }
+                    "OpShl" => {
+                        self.code
+                            .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xE0]);
+                    }
+                    "OpShr" => {
+                        self.code
+                            .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xE8]);
                     }
                     _ => {}
                 }
             }
             Expr::Call { name, args } => {
                 if name == "mloc" {
-                    // Поддержка как mloc(owner, size), так и mloc(size)
                     let size_expr_opt = if args.len() >= 2 {
                         args.get(1)
                     } else {
@@ -1046,7 +1249,7 @@ impl NativeGenerator {
                     };
 
                     if let Some(size_expr) = size_expr_opt {
-                        self.compile_expr(size_expr, 0, true); // ...
+                        self.compile_expr(size_expr, 0, true);
                         self.code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]);
                         self.code.extend_from_slice(&[0x48, 0x89, 0xC6]);
                     } else {
@@ -1082,122 +1285,107 @@ impl NativeGenerator {
                 } else if name == "sys_write" {
                     if let Some(fd_expr) = args.first() {
                         self.compile_expr(fd_expr, 7, true);
-                    } // rdi (7)
+                    }
                     if let Some(buf_expr) = args.get(1) {
                         self.compile_expr(buf_expr, 6, true);
-                    } // rsi (6)
+                    }
                     if let Some(size_expr) = args.get(2) {
                         self.compile_expr(size_expr, 2, true);
-                    } // rdx (2)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (sys_write)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "sys_read" {
                     if let Some(fd_expr) = args.first() {
                         self.compile_expr(fd_expr, 7, true);
-                    } // rdi (7)
+                    }
                     if let Some(buf_expr) = args.get(1) {
                         self.compile_expr(buf_expr, 6, true);
-                    } // rsi (6)
+                    }
                     if let Some(size_expr) = args.get(2) {
                         self.compile_expr(size_expr, 2, true);
-                    } // rdx (2)
-                    self.code.extend_from_slice(&[
-                        0x48, 0x31, 0xC0, // xor rax, rax (sys_read)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code.extend_from_slice(&[0x48, 0x31, 0xC0, 0x0F, 0x05]);
                 } else if name == "sys_open" {
                     if let Some(path_expr) = args.first() {
                         self.compile_expr(path_expr, 7, true);
-                    } // rdi (7)
+                    }
                     if let Some(flags_expr) = args.get(1) {
                         self.compile_expr(flags_expr, 6, true);
-                    } // rsi (6)
+                    }
                     if let Some(mode_expr) = args.get(2) {
                         self.compile_expr(mode_expr, 2, true);
-                    } // rdx (2)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2 (sys_open)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "sys_close" {
                     if let Some(fd_expr) = args.first() {
                         self.compile_expr(fd_expr, 7, true);
-                    } // rdi (7)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3 (sys_close)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "sys_unlink" {
                     if let Some(path_expr) = args.first() {
                         self.compile_expr(path_expr, 7, true);
-                    } // rdi (7)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 87 (sys_unlink)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "sys_ioctl" {
                     if let Some(fd_expr) = args.first() {
                         self.compile_expr(fd_expr, 7, true);
-                    } // rdi (7)
+                    }
                     if let Some(req_expr) = args.get(1) {
                         self.compile_expr(req_expr, 6, true);
-                    } // rsi (6)
+                    }
                     if let Some(arg_expr) = args.get(2) {
                         self.compile_expr(arg_expr, 2, true);
-                    } // rdx (2)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x10, 0x00, 0x00, 0x00, // mov rax, 16 (sys_ioctl)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x10, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "sys_exit" {
                     if let Some(code_expr) = args.first() {
                         self.compile_expr(code_expr, 7, true);
-                    } // rdi (7)
-                    self.code.extend_from_slice(&[
-                        0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60 (sys_exit)
-                        0x0F, 0x05, // syscall
-                    ]);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "inb" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     self.code
                         .extend_from_slice(&[0x66, 0x89, 0xCA, 0xEC, 0x48, 0x0F, 0xB6, 0xC0]);
                 } else if name == "outb" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     if let Some(val_expr) = args.get(1) {
-                        self.compile_expr(val_expr, 0, true); // RAX
+                        self.compile_expr(val_expr, 0, true);
                     }
                     self.code.extend_from_slice(&[0x66, 0x89, 0xCA, 0xEE]);
                 } else if name == "inw" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     self.code
                         .extend_from_slice(&[0x66, 0x89, 0xCA, 0x66, 0xED, 0x48, 0x0F, 0xB7, 0xC0]);
                 } else if name == "outw" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     if let Some(val_expr) = args.get(1) {
-                        self.compile_expr(val_expr, 0, true); // RAX
+                        self.compile_expr(val_expr, 0, true);
                     }
                     self.code.extend_from_slice(&[0x66, 0x89, 0xCA, 0x66, 0xEF]);
                 } else if name == "inl" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     self.code.extend_from_slice(&[0x66, 0x89, 0xCA, 0xED]);
                 } else if name == "outl" {
                     if let Some(port_expr) = args.first() {
-                        self.compile_expr(port_expr, 1, true); // RCX
+                        self.compile_expr(port_expr, 1, true);
                     }
                     if let Some(val_expr) = args.get(1) {
-                        self.compile_expr(val_expr, 0, true); // RAX
+                        self.compile_expr(val_expr, 0, true);
                     }
                     self.code.extend_from_slice(&[0x66, 0x89, 0xCA, 0xEF]);
                 } else {
@@ -1235,31 +1423,29 @@ impl NativeGenerator {
             _ => {}
         }
 
-        // Пост-обработка: гарантируем, что результат находится в требуемом `reg`
         if reg != 0 {
             match expr {
-                Expr::Variable(_) | Expr::Number(_) | Expr::StringLit(_) | Expr::AddrOf(_) => {
-                    // Эти выражения уже генерируют код напрямую в `reg`, ничего делать не нужно
-                }
+                Expr::Variable(_)
+                | Expr::Number(_)
+                | Expr::StringLit(_)
+                | Expr::AddrOf(_)
+                | Expr::FloatLit(_) => {}
                 Expr::MemberAccess { .. } | Expr::Index { .. } | Expr::SectionAccess { .. } => {
-                    // Они вычисляются в RBX (3). Переносим в reg, если reg != 3
                     if reg != 3 {
                         let modrm = 0xC0 | (3 << 3) | reg;
-                        self.code.extend_from_slice(&[0x48, 0x89, modrm]); // mov reg, rbx
+                        self.code.extend_from_slice(&[0x48, 0x89, modrm]);
                     }
                 }
                 Expr::Binary { .. } | Expr::Call { .. } => {
-                    // Они вычисляются в RAX (0). Переносим в reg
                     let modrm = 0xC0 | (0 << 3) | reg;
-                    self.code.extend_from_slice(&[0x48, 0x89, modrm]); // mov reg, rax
+                    self.code.extend_from_slice(&[0x48, 0x89, modrm]);
                 }
-                _ => {} // Catch-all для всех остальных выражений, не генерирующих код (например, Null)
+                _ => {}
             }
         }
     }
 
     fn compile_address(&mut self, expr: &Expr, reg: u8) {
-        // Промежуточные шаги компиляции адреса принудительно направляем на RAX (0) или RBX (3)
         let internal_reg = if reg == 0 { 0 } else { 3 };
 
         match expr {
@@ -1273,9 +1459,6 @@ impl NativeGenerator {
                         .cloned()
                         .unwrap_or(PtrAccess::Normal);
 
-                    // Фикс: Если тип переменной является указателем (Pointer),
-                    // то ее базовым адресом является значение, хранящееся в ней (mov),
-                    // а не адрес ячейки на стеке (lea).
                     let mut is_pointer = false;
                     if let Some(dt) = self.local_types.get(name) {
                         match dt {
@@ -1287,12 +1470,11 @@ impl NativeGenerator {
                     }
 
                     if modifier == PtrAccess::Input || modifier == PtrAccess::Output || is_pointer {
-                        self.emit_mem_op(0x8B, reg_opcode, offset); // mov (0x8B)
+                        self.emit_mem_op(0x8B, reg_opcode, offset);
                     } else {
-                        self.emit_mem_op(0x8D, reg_opcode, offset); // lea (0x8D)
+                        self.emit_mem_op(0x8D, reg_opcode, offset);
                     }
                 } else {
-                    // ФОЛБЕК НА ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ СЕКЦИЙ (args:x_val и т.д.)
                     let mut found_key = None;
                     for key in self.global_offsets.keys() {
                         if key.ends_with(&format!(":{}", name)) || key == name {
@@ -1337,24 +1519,24 @@ impl NativeGenerator {
                     }
                 }
 
-                self.compile_address(base_expr, 3); // Принудительно вычисляем базу в RBX
-                self.code.push(0x53); // push rbx
+                self.compile_address(base_expr, 3);
+                self.code.push(0x53);
 
                 self.compile_expr(index, 0, true);
 
                 if elem_size == 8 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // shl rax, 3 (умножение на 8)
+                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]);
                 } else if elem_size == 4 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x02]); // shl rax, 2 (умножение на 4)
+                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x02]);
                 } else if elem_size == 2 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x01]); // shl rax, 1 (умножение на 2)
+                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x01]);
                 }
 
-                self.code.push(0x5B); // pop rbx
+                self.code.push(0x5B);
                 self.code.extend_from_slice(&[0x48, 0x01, 0xC3]);
 
                 if internal_reg == 0 {
-                    self.code.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+                    self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
                 }
             }
             Expr::MemberAccess {
@@ -1398,10 +1580,9 @@ impl NativeGenerator {
             _ => {}
         }
 
-        // Копируем итоговый вычисленный адрес в запрашиваемый целевой регистр
         if reg != 0 && reg != 3 {
             let modrm = 0xC0 | (3 << 3) | reg;
-            self.code.extend_from_slice(&[0x48, 0x89, modrm]); // mov reg, rbx
+            self.code.extend_from_slice(&[0x48, 0x89, modrm]);
         }
     }
 
@@ -1452,17 +1633,16 @@ impl NativeGenerator {
                         self.emit_mem_load(3, offset, 8);
                     }
 
-                    // Вычисляем размер базового типа указателя для предотвращения перезаписи памяти
                     let mut elem_size = 8;
                     if let Some(DataType::Pointer(ref boxed)) = self.local_types.get(name) {
                         elem_size = self.get_type_size_internal(boxed);
                     }
 
                     match elem_size {
-                        1 => self.code.extend_from_slice(&[0x88, 0x03]), // mov [rbx], al
-                        2 => self.code.extend_from_slice(&[0x66, 0x89, 0x03]), // mov [rbx], ax
-                        4 => self.code.extend_from_slice(&[0x89, 0x03]), // mov [rbx], eax
-                        _ => self.code.extend_from_slice(&[0x48, 0x89, 0x03]), // mov [rbx], rax
+                        1 => self.code.extend_from_slice(&[0x88, 0x03]),
+                        2 => self.code.extend_from_slice(&[0x66, 0x89, 0x03]),
+                        4 => self.code.extend_from_slice(&[0x89, 0x03]),
+                        _ => self.code.extend_from_slice(&[0x48, 0x89, 0x03]),
                     }
                 } else if let Some(&offset) = self.local_offsets.get(name) {
                     let var_size = self.get_type_size_internal(
@@ -1490,31 +1670,31 @@ impl NativeGenerator {
             }
             Expr::SectionAccess { section, variable } => {
                 let key = format!("{}:{}", section, variable);
-                self.code.extend_from_slice(&[0x48, 0xBB]); // mov rbx, imm64
+                self.code.extend_from_slice(&[0x48, 0xBB]);
                 let patch_pos = self.code.len();
                 self.code.extend_from_slice(&[0; 8]);
                 self.address_patches.push((patch_pos, key));
 
-                self.code.extend_from_slice(&[0x48, 0x89, 0x03]); // mov [rbx], rax
+                self.code.extend_from_slice(&[0x48, 0x89, 0x03]);
             }
             Expr::MemberAccess { .. } | Expr::Index { .. } => {
-                self.code.push(0x50); // push rax
-                self.compile_address(target, 1); // вычисляем адрес в RBX
-                self.code.push(0x58); // pop rax
+                self.code.push(0x50);
+                self.compile_address(target, 1);
+                self.code.push(0x58);
 
                 let target_size = self.get_expr_type_size(target);
                 match target_size {
                     1 => {
-                        self.code.extend_from_slice(&[0x88, 0x03]); // mov [rbx], al
+                        self.code.extend_from_slice(&[0x88, 0x03]);
                     }
                     2 => {
-                        self.code.extend_from_slice(&[0x66, 0x89, 0x03]); // mov [rbx], ax
+                        self.code.extend_from_slice(&[0x66, 0x89, 0x03]);
                     }
                     4 => {
-                        self.code.extend_from_slice(&[0x89, 0x03]); // mov [rbx], eax
+                        self.code.extend_from_slice(&[0x89, 0x03]);
                     }
                     _ => {
-                        self.code.extend_from_slice(&[0x48, 0x89, 0x03]); // mov [rbx], rax
+                        self.code.extend_from_slice(&[0x48, 0x89, 0x03]);
                     }
                 }
             }
@@ -1556,6 +1736,7 @@ pub fn generate_elf64_binary(
             let type_id = match &field.data_type {
                 DataType::U64 => 4u32,
                 DataType::U32 => 3u32,
+                DataType::F64 => 4u32,
                 DataType::Array(..) => 6u32,
                 DataType::Typedef(..) => 9u32,
                 _ => 11u32,
@@ -1584,6 +1765,7 @@ pub fn generate_elf64_binary(
         let underlying_id = match dt {
             DataType::Array(..) => 6u32,
             DataType::U64 => 4u32,
+            DataType::F64 => 4u32,
             _ => 11u32,
         };
 
@@ -1618,8 +1800,31 @@ pub fn generate_elf64_binary(
         }
     }
 
+    let mut unresolved_calls = Vec::new();
+    for (_, target_name) in &gen.call_patches {
+        if !gen.function_offsets.contains_key(target_name) {
+            if !unresolved_calls.contains(target_name) {
+                unresolved_calls.push(target_name.clone());
+            }
+        }
+    }
+
+    let module_name = program
+        .imports
+        .first()
+        .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
+        .unwrap_or_else(|| "libc.ko".to_string());
+
     let mut p46_imports = Vec::new();
-    p46_imports.extend_from_slice(&0u32.to_le_bytes());
+    p46_imports.extend_from_slice(&(unresolved_calls.len() as u32).to_le_bytes());
+    for name in &unresolved_calls {
+        let name_off = add_str(name);
+        let mod_off = add_str(&module_name);
+        p46_imports.extend_from_slice(&name_off.to_le_bytes());
+        p46_imports.extend_from_slice(&mod_off.to_le_bytes());
+        p46_imports.extend_from_slice(&1u32.to_le_bytes());
+        p46_imports.extend_from_slice(&0u32.to_le_bytes());
+    }
 
     let mut p46_deps = Vec::new();
     p46_deps.extend_from_slice(&(program.imports.len() as u32).to_le_bytes());
@@ -1639,7 +1844,7 @@ pub fn generate_elf64_binary(
     let text_size = payload_bytes.len();
 
     let p46_hdr_offset = text_offset + text_size;
-    let p46_hdr_size = 24usize;
+    let p46_hdr_size = 24 + 12 * 5;
 
     let p46_types_offset = p46_hdr_offset + p46_hdr_size;
     let p46_types_size = p46_types.len();
@@ -1647,16 +1852,16 @@ pub fn generate_elf64_binary(
     let p46_exp_offset = p46_types_offset + p46_types_size;
     let p46_exp_size = p46_exports.len();
 
-    let p46_imp_offset = p46_exp_offset + p46_exp_size;
+    let p46_refl_offset = p46_exp_offset + p46_exp_size;
+    let p46_refl_size = p46_reflect.len();
+
+    let p46_imp_offset = p46_refl_offset + p46_refl_size;
     let p46_imp_size = p46_imports.len();
 
     let p46_deps_offset = p46_imp_offset + p46_imp_size;
     let p46_deps_size = p46_deps.len();
 
-    let p46_refl_offset = p46_deps_offset + p46_deps_size;
-    let p46_refl_size = p46_reflect.len();
-
-    let p46_strtab_offset = p46_refl_offset + p46_refl_size;
+    let p46_strtab_offset = p46_deps_offset + p46_deps_size;
     let p46_strtab_size = p46_strtab.len();
 
     let mut shstrtab = Vec::new();
@@ -1697,6 +1902,26 @@ pub fn generate_elf64_binary(
     p46_header.extend_from_slice(&(p46_strtab_offset as u32).to_le_bytes());
     p46_header.extend_from_slice(&(p46_strtab_size as u32).to_le_bytes());
 
+    p46_header.extend_from_slice(&(p46_types_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_types_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&1u32.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_exp_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_exp_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&2u32.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_refl_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_refl_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&3u32.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_imp_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_imp_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&4u32.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_deps_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_deps_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&5u32.to_le_bytes());
+
     let mut elf = Vec::new();
 
     elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
@@ -1734,9 +1959,9 @@ pub fn generate_elf64_binary(
     elf.extend_from_slice(&p46_header);
     elf.extend_from_slice(&p46_types);
     elf.extend_from_slice(&p46_exports);
+    elf.extend_from_slice(&p46_reflect);
     elf.extend_from_slice(&p46_imports);
     elf.extend_from_slice(&p46_deps);
-    elf.extend_from_slice(&p46_reflect);
     elf.extend_from_slice(&p46_strtab);
     elf.extend_from_slice(&shstrtab);
 

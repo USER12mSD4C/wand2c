@@ -1,0 +1,9 @@
+sc.true
+
+fn abs(i64 x) -> i64;
+fn pow(i64 base, u64 exp) -> i64;
+fn sqrt(i64 x) -> i64;
+fn sin(i64 rad) -> i64;
+fn cos(i64 rad) -> i64;
+fn tan(i64 rad) -> i64;
+fn print_fixed(i64 x);
