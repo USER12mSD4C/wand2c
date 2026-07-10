@@ -5,7 +5,7 @@ sect.rand_state
 EOS
 
 fn exit(u64 code) {
-    sys_exit(code); // Прямой вызов платформенного примитива
+    sys_exit(code);
 }
 
 fn srand(u64 seed) {

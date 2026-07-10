@@ -1,0 +1,18 @@
+sc.true
+
+sect.tui_state
+    u8* screen_buf = null;
+    u8* prev_buf = null;
+    u64 cols = 80;
+    u64 rows = 24;
+EOS
+
+fn get_terminal_size(u64* out_rows*o, u64* out_cols*o) void;
+fn tui_init() void;
+fn tui_clear_physical() void;
+fn tui_move_cursor_physical(u64 row, u64 col) void;
+fn tui_clear() void;
+fn tui_draw_char(u64 r, u64 c, u8 ch) void;
+fn tui_draw_string(u64 r, u64 c, u8* s) void;
+fn tui_set_cursor(u64 r, u64 c) void;
+fn tui_render() void;

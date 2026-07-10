@@ -1,0 +1,53 @@
+sc.true
+
+sect.keys
+    u64 arrow_up = 1000;
+    u64 arrow_down = 1001;
+    u64 arrow_right = 1002;
+    u64 arrow_left = 1003;
+    u64 key_delete = 1004;
+    u64 page_up = 1005;
+    u64 page_down = 1006;
+    u64 key_home = 1010;
+    u64 key_end = 1011;
+
+    u64 key_f1 = 1101;
+    u64 key_f2 = 1102;
+    u64 key_f3 = 1103;
+    u64 key_f4 = 1104;
+
+    u64 key_esc = 27;
+    u64 key_backspace = 127;
+    u64 key_enter = 10;
+    u64 key_tab = 9;
+    u64 key_space = 32;
+
+    u64 ctrl_a = 1;
+    u64 ctrl_b = 2;
+    u64 ctrl_c = 3;
+    u64 ctrl_d = 4;
+    u64 ctrl_e = 5;
+    u64 ctrl_f = 6;
+    u64 ctrl_g = 7;
+    u64 ctrl_h = 8;
+    u64 ctrl_i = 9;
+    u64 ctrl_j = 10;
+    u64 ctrl_k = 11;
+    u64 ctrl_l = 12;
+    u64 ctrl_m = 13;
+    u64 ctrl_n = 14;
+    u64 ctrl_o = 15;
+    u64 ctrl_p = 16;
+    u64 ctrl_q = 17;
+    u64 ctrl_r = 18;
+    u64 ctrl_s = 19;
+    u64 ctrl_t = 20;
+    u64 ctrl_u = 21;
+    u64 ctrl_v = 22;
+    u64 ctrl_w = 23;
+    u64 ctrl_x = 24;
+    u64 ctrl_y = 25;
+    u64 ctrl_z = 26;
+EOS
+
+fn read_key() u64;

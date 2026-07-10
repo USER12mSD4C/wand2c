@@ -1066,53 +1066,38 @@ impl NativeGenerator {
                     };
 
                     if let Some(size_expr) = size_expr_opt {
-                        self.compile_expr(size_expr, 0, true); // Компилируем выражение размера в RAX
-                                                               // Добавляем 8 байт для заголовка размера: add rax, 8
+                        self.compile_expr(size_expr, 0, true); // ...
                         self.code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]);
-                        // Копируем размер в rsi: mov rsi, rax (rsi = размер + 8)
                         self.code.extend_from_slice(&[0x48, 0x89, 0xC6]);
                     } else {
-                        // Дефолтный размер: 4096 + 8 байт под заголовок = 4104 (0x1008)
                         self.code
                             .extend_from_slice(&[0x48, 0xC7, 0xC6, 0x08, 0x10, 0x00, 0x00]);
                     }
 
-                    self.code.push(0x56); // push rsi (сохраняем размер на стеке перед сисколлом)
+                    self.code.push(0x56);
 
                     self.code.extend_from_slice(&[
-                        0x48, 0x31, 0xFF, // xor rdi, rdi
-                        0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00,
-                        0x00, // mov rdx, 3 (PROT_READ | PROT_WRITE)
-                        0x49, 0xC7, 0xC2, 0x22, 0x00, 0x00,
-                        0x00, // mov r10, 0x22 (MAP_PRIVATE | MAP_ANONYMOUS)
-                        0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov r8, -1 (fd)
-                        0x4D, 0x31, 0xC9, // xor r9, r9 (offset)
-                        0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00, // mov rax, 9 (sys_mmap)
-                        0x0F, 0x05, // syscall
+                        0x48, 0x31, 0xFF, 0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00, 0x49, 0xC7,
+                        0xC2, 0x22, 0x00, 0x00, 0x00, 0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,
+                        0x4D, 0x31, 0xC9, 0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00, 0x0F, 0x05,
                     ]);
 
-                    self.code.push(0x59); // pop rcx (достаем сохраненный размер в rcx)
-                    self.code.extend_from_slice(&[0x48, 0x89, 0x08]); // mov [rax], rcx (сохраняем размер в начале выделенного блока)
-                    self.code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8 (возвращаем указатель на область после заголовка)
+                    self.code.push(0x59);
+                    self.code.extend_from_slice(&[0x48, 0x89, 0x08]);
+                    self.code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]);
                 } else if name == "bmloc" {
-                    // Возвращает физический адрес без системных аллокаций
                     if let Some(addr_expr) = args.first() {
                         self.compile_expr(addr_expr, 0, true);
                     } else {
-                        self.code.extend_from_slice(&[0x48, 0x31, 0xC0]); // xor rax, rax
+                        self.code.extend_from_slice(&[0x48, 0x31, 0xC0]);
                     }
                 } else if name == "mfree" {
                     if let Some(ptr_expr) = args.first() {
-                        self.compile_expr(ptr_expr, 0, true); // RAX содержит ptr
+                        self.compile_expr(ptr_expr, 0, true);
                     }
                     self.code.extend_from_slice(&[
-                        0x48, 0x83, 0xE8,
-                        0x08, // sub rax, 8 (смещаемся к началу заголовка)
-                        0x48, 0x8B,
-                        0x30, // mov rsi, [rax] (загружаем сохраненный размер в rsi)
-                        0x48, 0x89, 0xC7, // mov rdi, rax (rdi = ptr - 8)
-                        0x48, 0xC7, 0xC0, 0x0B, 0x00, 0x00, 0x00, // mov rax, 11 (sys_munmap)
-                        0x0F, 0x05, // syscall
+                        0x48, 0x83, 0xE8, 0x08, 0x48, 0x8B, 0x30, 0x48, 0x89, 0xC7, 0x48, 0xC7,
+                        0xC0, 0x0B, 0x00, 0x00, 0x00, 0x0F, 0x05,
                     ]);
                 } else if name == "sys_write" {
                     if let Some(fd_expr) = args.first() {
@@ -1140,6 +1125,36 @@ impl NativeGenerator {
                     } // rdx (2)
                     self.code.extend_from_slice(&[
                         0x48, 0x31, 0xC0, // xor rax, rax (sys_read)
+                        0x0F, 0x05, // syscall
+                    ]);
+                } else if name == "sys_open" {
+                    if let Some(path_expr) = args.first() {
+                        self.compile_expr(path_expr, 7, true);
+                    } // rdi (7)
+                    if let Some(flags_expr) = args.get(1) {
+                        self.compile_expr(flags_expr, 6, true);
+                    } // rsi (6)
+                    if let Some(mode_expr) = args.get(2) {
+                        self.compile_expr(mode_expr, 2, true);
+                    } // rdx (2)
+                    self.code.extend_from_slice(&[
+                        0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2 (sys_open)
+                        0x0F, 0x05, // syscall
+                    ]);
+                } else if name == "sys_close" {
+                    if let Some(fd_expr) = args.first() {
+                        self.compile_expr(fd_expr, 7, true);
+                    } // rdi (7)
+                    self.code.extend_from_slice(&[
+                        0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3 (sys_close)
+                        0x0F, 0x05, // syscall
+                    ]);
+                } else if name == "sys_unlink" {
+                    if let Some(path_expr) = args.first() {
+                        self.compile_expr(path_expr, 7, true);
+                    } // rdi (7)
+                    self.code.extend_from_slice(&[
+                        0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 87 (sys_unlink)
                         0x0F, 0x05, // syscall
                     ]);
                 } else if name == "sys_ioctl" {

@@ -93,46 +93,62 @@ fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) {
     while (active_char != 0) {
         active_char = p;
         if (active_char != 0) {
-            u8 is_format = 0;
             if (active_char == 37) { // '%'
-                is_format = 1;
-            }
-
-            if (is_format == 1) {
                 p++;
                 active_char = p;
-                u8 known = 0;
+
                 if (active_char == 118) { // 'v'
-                    known = 1;
                     if (arg_idx == 1) { print_number(arg1); }
                     if (arg_idx == 2) { print_number(arg2); }
                     if (arg_idx == 3) { print_number(arg3); }
                     arg_idx = arg_idx + 1;
+                } else {
+                    if (active_char == 100) { // 'd'
+                        if (arg_idx == 1) { print_signed_number(arg1); }
+                        if (arg_idx == 2) { print_signed_number(arg2); }
+                        if (arg_idx == 3) { print_signed_number(arg3); }
+                        arg_idx = arg_idx + 1;
+                    } else {
+                        if (active_char == 115) { // 's'
+                            if (arg_idx == 1) { print_string(arg1); }
+                            if (arg_idx == 2) { print_string(arg2); }
+                            if (arg_idx == 3) { print_string(arg3); }
+                            arg_idx = arg_idx + 1;
+                        } else {
+                            print_char(37); // '%'
+                            print_char(active_char);
+                        }
+                    }
                 }
-                if (active_char == 100) { // 'd'
-                    known = 1;
-                    if (arg_idx == 1) { print_signed_number(arg1); }
-                    if (arg_idx == 2) { print_signed_number(arg2); }
-                    if (arg_idx == 3) { print_signed_number(arg3); }
-                    arg_idx = arg_idx + 1;
-                }
-                if (active_char == 115) { // 's'
-                    known = 1;
-                    if (arg_idx == 1) { print_string(arg1); }
-                    if (arg_idx == 2) { print_string(arg2); }
-                    if (arg_idx == 3) { print_string(arg3); }
-                    arg_idx = arg_idx + 1;
-                }
-                if (known == 0) {
-                    print_char(37); // '%'
-                    print_char(active_char);
-                }
-            }
-
-            if (is_format == 0) {
+            } else {
                 print_char(active_char);
             }
             p++;
         }
     }
+}
+
+fn file_open(u8* path, u64 flags, u64 mode) -> i64 {
+    i64 fd = sys_open(path, flags, mode);
+    return(fd);
+}
+
+fn file_close(u64 fd) -> i64 {
+    i64 res = sys_close(fd);
+    return(res);
+}
+
+fn file_remove(u8* path) -> i64 {
+    i64 res = sys_unlink(path);
+    return(res);
+}
+
+fn file_read(u64 fd, u8* buf, u64 size) -> i64 {
+    i64 res = sys_read(fd, buf, size);
+    return(res);
+}
+
+fn file_write(u64 fd, u8* buf, u64 size) -> i64 {
+    i64 res = sys_write(fd, buf, size);
+    return(res);
 }

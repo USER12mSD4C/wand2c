@@ -21,13 +21,50 @@ fn malloc(u64 size) {
     if (rem != 0) {
         aligned_size = size + (8 - rem);
     }
+    u64 total_block_size = aligned_size + 16;
 
-    if ((heap:offset + aligned_size) <= heap:arena_size) {
-        u8* res = heap:arena_start + heap:offset;
-        heap:offset = heap:offset + aligned_size;
-        return(res);
+    // 1. Поиск свободного блока в списке (First-Fit)
+    u8* current = heap:arena_start;
+    u8* end = heap:arena_start + heap:offset;
+    while (current < end) {
+        u64* p_size*i = current;
+        u64 b_size = p_size;
+        u64* p_free*i = current + 8;
+        u64 b_free = p_free;
+
+        if (b_free == 1) {
+            if (b_size >= total_block_size) {
+                u64* p_free_out*o = current + 8;
+                p_free_out = 0;
+                return(current + 16);
+            }
+        }
+        current = current + b_size;
+    }
+
+    if ((heap:offset + total_block_size) <= heap:arena_size) {
+        u8* block = heap:arena_start + heap:offset;
+
+        // Записываем заголовок: размер блока
+        u64* p_size_out*o = block;
+        p_size_out = total_block_size;
+
+        // Записываем заголовок: флаг свободы (0 = занят)
+        u64* p_free_out*o = block + 8;
+        p_free_out = 0;
+
+        heap:offset = heap:offset + total_block_size;
+        return(block + 16);
     }
     return(null);
+}
+
+fn mfree(u8* ptr) {
+    if (ptr != null) {
+        u8* block = ptr - 16;
+        u64* p_free*o = block + 8;
+        p_free = 1;
+    }
 }
 
 fn calloc(u64 num, u64 size) {

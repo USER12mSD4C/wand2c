@@ -131,7 +131,6 @@ fn itoa(i64 num, u8* buf) {
         temp_num = num;
     }
 
-    // Временный реверсивный буфер на стеке
     u8[32] rev_buf;
     u64 pos = 0;
     while (temp_num > 0) {

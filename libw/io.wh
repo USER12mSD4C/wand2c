@@ -1,9 +1,14 @@
 sc.true
 
-fn print_char(u8 c) -> void;
-fn read_char() -> u8;
-fn read_string(u8* buf, u64 max_size) -> void;
-fn print_string(u8* s) -> void;
-fn print_number(u64 num) -> void;
-fn print_signed_number(i64 num) -> void;
-fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) -> void;
+fn print_char(u8 c) void;
+fn read_char() u8;
+fn read_string(u8* buf, u64 max_size) void;
+fn print_string(u8* s) void;
+fn print_number(u64 num) void;
+fn print_signed_number(i64 num) void;
+fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) void;
+
+fn file_open(u8* path, u64 flags, u64 mode) i64;
+fn file_close(u64 fd) i64;
+fn file_read(u64 fd, u8* buf, u64 size) i64;
+fn file_write(u64 fd, u8* buf, u64 size) i64;

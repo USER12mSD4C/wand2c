@@ -248,9 +248,9 @@ system_state:uptime_ticks = system_state:uptime_ticks + 1;
 
 ---
 
-## 8. Allocation Built-ins and Port I/O
+## 8. Allocation Built-ins, System Calls, and Port I/O
 
-WandC incorporates hardware operations and kernel memory interfaces as compiler primitives.
+WandC incorporates hardware operations, kernel memory interfaces, and native kernel system calls as compiler primitives.
 
 ### 8.1 Memory Allocations (`mloc`, `mfree`, `bmloc`)
 *   `mloc(owner, size)`: Allocates `size + 8` bytes of virtual memory via `sys_mmap`. The compiler writes the total allocation size to the first 8 bytes of the block as metadata and returns the pointer offset by 8 bytes (`ptr + 8`) to prevent memory leaks during freeing.
@@ -274,6 +274,35 @@ outw(0x1F0, val16);      // out dx, ax
 
 u32 val32 = inl(0xCF8);  // in eax, dx
 outl(0xCF8, val32);      // out dx, eax
+```
+
+### 8.3 Compiler System Call Built-ins
+When compiled under hosted mode (`sc.true`), WandC supports direct low-level kernel system call wrappers as first-class primitives. These are compiled directly into raw `syscall` instructions without any external runtime dependencies:
+
+*   `sys_read(u64 fd, u8* buf, u64 size)`: Invokes the read system call (RAX = 0) with arguments mapped to RDI, RSI, RDX.
+*   `sys_write(u64 fd, u8* buf, u64 size)`: Invokes the write system call (RAX = 1) with arguments mapped to RDI, RSI, RDX.
+*   `sys_open(u8* path, u64 flags, u64 mode)`: Invokes the open system call (RAX = 2) with arguments mapped to RDI, RSI, RDX.
+*   `sys_close(u64 fd)`: Invokes the close system call (RAX = 3) with the argument mapped to RDI.
+*   `sys_unlink(u8* path)`: Invokes the unlink system call (RAX = 87) with the argument mapped to RDI.
+*   `sys_ioctl(u64 fd, u64 req, u64 arg)`: Invokes the ioctl system call (RAX = 16) with arguments mapped to RDI, RSI, RDX.
+*   `sys_exit(u64 code)`: Invokes the exit system call (RAX = 60) with the argument mapped to RDI.
+
+Example usage for library-level file handlers:
+```c
+fn file_open(u8* path, u64 flags, u64 mode) -> i64 {
+    i64 fd = sys_open(path, flags, mode);
+    return(fd);
+}
+
+fn file_close(u64 fd) -> i64 {
+    i64 res = sys_close(fd);
+    return(res);
+}
+
+fn file_remove(u8* path) -> i64 {
+    i64 res = sys_unlink(path);
+    return(res);
+}
 ```
 
 ---
