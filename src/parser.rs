@@ -68,11 +68,8 @@ impl Parser {
             | Token::TypeI64
             | Token::TypeF64
             | Token::TypeVoid => true,
-            Token::Ident(name) => match &self.peek_token {
-                Token::Ident(_)
-                | Token::PtrInputModifier(_)
-                | Token::PtrOutputModifier(_)
-                | Token::OpMul => true,
+            Token::Ident(_) => match &self.peek_token {
+                Token::Ident(_) | Token::PtrInputModifier(_) | Token::PtrOutputModifier(_) => true,
                 _ => false,
             },
             _ => false,
@@ -330,6 +327,7 @@ impl Parser {
             | Token::TypeI16
             | Token::TypeI32
             | Token::TypeI64
+            | Token::TypeF64
             | Token::TypeVoid => {
                 let dt = self.parse_data_type()?;
                 let var_decl = self.parse_var_decl_tail(dt)?;
@@ -941,19 +939,23 @@ impl Parser {
                 Ok(Expr::StringLit(s_val))
             }
             Token::LParen => {
-                self.step(); // consume '('
-
-                // Проверяем явное приведение типов: (Type)value
+                self.step();
                 if self.is_current_token_type() {
                     let cast_type = self.parse_data_type()?;
                     if self.current_token != Token::RParen {
                         return Err(self.err("Expected ')' after cast type"));
                     }
-                    self.step(); // consume ')'
+                    self.step();
                     let inner_expr = self.parse_primary_expr()?;
+
+                    let op_str = match cast_type {
+                        DataType::F64 => "OpCastF64".to_string(),
+                        _ => "OpCastInt".to_string(),
+                    };
+
                     return Ok(Expr::Binary {
                         left: Box::new(inner_expr),
-                        op: "OpCast".to_string(),
+                        op: op_str,
                         right: Box::new(Expr::Number(0)),
                     });
                 }
@@ -962,7 +964,7 @@ impl Parser {
                 if self.current_token != Token::RParen {
                     return Err(self.err("Expected ')' after parenthesized expression"));
                 }
-                self.step(); // consume ')'
+                self.step();
                 Ok(expr)
             }
             Token::Ident(name) => {

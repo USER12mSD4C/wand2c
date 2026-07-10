@@ -28,9 +28,9 @@ fn main() {
     }
 
     // Обработка команды установки библиотеки в системный каталог
-    if args[1] == "--install" || args[1] == "install" {
+    if args[1] == "--install-library" || args[1] == "-il" {
         if args.len() < 3 {
-            eprintln!("\x1b[31;1merror\x1b[0m: --install requires a library path (e.g. 'libw' or 'libw/io').");
+            eprintln!("\x1b[31;1merror\x1b[0m: --install-library requires a library path (e.g. 'libw' or 'libw/io').");
             std::process::exit(1);
         }
         install_library(&args[2]);
@@ -593,8 +593,9 @@ fn report_parse_error(filename: &str, source: &str, message: &str, span: &Span) 
 fn print_usage() {
     println!("wand2c - Wand Version 2 Compiler");
     println!("Usage:");
-    println!("  wand2c <input_files.w> [options]         Compile programs");
-    println!("  wand2c --install <lib_path>             Install single library or directory (e.g., 'libw')");
+    println!("  wand2c <input_files.w> [options]            Compile programs");
+    println!("  wand2c --install-library <lib_path>         Install single library or directory (e.g., 'libw')");
+    println!("  wand2c -il <lib_path>                       same as --install-library");
     println!("\nOptions:");
-    println!("  -o <filename>    Specify the output binary filepath");
+    println!("  -o <filename>                               Specify the output binary filepath");
 }

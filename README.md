@@ -6,31 +6,6 @@ The compiler translates WandC source code directly into native x86_64 machine co
 
 ---
 
-## Directory Structure
-
-```
-.
-├── src/                  # Rust Compiler Source Code
-│   ├── ast.rs            # AST Nodes and Core Enums
-│   ├── token.rs          # Lexer Token definitions
-│   ├── lexer.rs          # Lexical Analyzer
-│   ├── parser.rs         # Recursive-descent AST Parser
-│   ├── checker.rs        # Type Checker and Struct Layout Calculator
-│   ├── optimizer.rs      # AST Constant Folder
-│   ├── safety.rs         # Static Memory Leak Detector
-│   ├── abi.rs            # Standard 4/6 Metadata Builder
-│   ├── codegen.rs        # x86_64 Machine Code Gen & ELF64 Packager
-│   └── main.rs           # Driver and Multi-file Linker
-├── libw/                 # Standard Library Modules
-│   ├── std.w / std.wh    # Base runtime and wrappers
-│   ├── io.w / io.wh      # Port & system-call based I/O formatting
-│   ├── mem.w / mem.wh    # Arena-based dynamic memory allocations
-│   └── string.w / string.wh # String operations and conversions
-└── main.w                # Application Entry File
-```
-
----
-
 ## Codebase Architecture
 
 The compiler is organized as a modular, multi-pass pipeline. The core components of the system include:

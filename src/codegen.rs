@@ -1134,19 +1134,36 @@ impl NativeGenerator {
                 }
             }
             Expr::Binary { left, op, right } => {
-                if op == "OpCast" {
+                if op == "OpCastF64" {
                     self.compile_expr(left, reg, _deref_ptr);
-                    let is_left_float = self.is_float_expr(left);
-
-                    if is_left_float {
+                    if !self.is_float_expr(left) {
                         self.code.extend_from_slice(&[
-                            0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF3, 0x48, 0x0F, 0x2C, 0xC0,
-                        ]);
-                    } else {
-                        self.code.extend_from_slice(&[
-                            0xF2, 0x48, 0x0F, 0x2A, 0xC0, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
+                            0xF2, 0x48, 0x0F, 0x2A, 0xC0, // cvtsi2sd xmm0, rax
+                            0x66, 0x48, 0x0F, 0x7E, 0xC0, // movq rax, xmm0
                         ]);
                     }
+                    return;
+                }
+
+                if op == "OpCastInt" {
+                    self.compile_expr(left, reg, _deref_ptr);
+                    if self.is_float_expr(left) {
+                        self.code.extend_from_slice(&[
+                            0x66, 0x48, 0x0F, 0x6E, 0xC0, // movq xmm0, rax
+                            0xF3, 0x48, 0x0F, 0x2C, 0xC0, // cvttsd2si rax, xmm0
+                        ]);
+                    }
+                    return;
+                }
+
+                if op == "OpCast" {
+                    self.compile_expr(left, reg, _deref_ptr);
+                    return;
+                }
+
+                if op == "OpBitNot" {
+                    self.compile_expr(left, 0, false);
+                    self.code.extend_from_slice(&[0x48, 0xF7, 0xD0]); // not rax
                     return;
                 }
 
