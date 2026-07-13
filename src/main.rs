@@ -8,9 +8,10 @@ mod parser;
 mod safety;
 mod token;
 
+use abi::generate_elf64_binary;
 use ast::Span;
 use checker::TypeChecker;
-use codegen::{generate_elf64_binary, NativeGenerator};
+use codegen::NativeGenerator;
 use lexer::Lexer;
 use optimizer::Optimizer;
 use parser::Parser;
@@ -27,7 +28,6 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Обработка команды установки библиотеки в системный каталог
     if args[1] == "--install-library" || args[1] == "-il" {
         if args.len() < 3 {
             eprintln!("\x1b[31;1merror\x1b[0m: --install-library requires a library path (e.g. 'libw' or 'libw/io').");
@@ -144,7 +144,6 @@ fn main() {
         let mut resolved = false;
         let (wh_filename, w_filename) = resolve_import_path(&imp_name);
 
-        // 1. Попытка разрешить интерфейсный заголовок .wh
         if std::path::Path::new(&wh_filename).exists() {
             resolved = true;
             println!(
@@ -174,7 +173,6 @@ fn main() {
             }
         }
 
-        // 2. Автоматический импорт исходников .w
         if std::path::Path::new(&w_filename).exists() {
             resolved = true;
             println!(
@@ -245,7 +243,6 @@ fn main() {
         program.typedefs.len()
     );
 
-    // 1. Оптимизация AST перед компиляцией (Constant Folding)
     println!("  \x1b[34;1mStage 2:\x1b[0m AST Optimization Pass");
     let folded_count = Optimizer::optimize_program(&mut program);
     println!(
@@ -253,7 +250,6 @@ fn main() {
         folded_count
     );
 
-    // 2. Проверка типов и безопасности
     println!("  \x1b[34;1mStage 3:\x1b[0m Type Checking & Safety Analysis");
     let mut checker = TypeChecker::new();
     checker.populate_symbols(&program);
@@ -274,12 +270,10 @@ fn main() {
         leak_detector.analyze_function(func);
     }
 
-    // 3. Компиляция AST напрямую в машинный код x86_64
     println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");
     let mut generator = NativeGenerator::new();
     let raw_machine_code = generator.compile_program(&program);
 
-    // 4. Ручная сборка исполняемого бинарного файла ELF64 со всеми секциями Standard 4/6
     println!("  \x1b[34;1mStage 5:\x1b[0m Binary Packaging & ABI Linking");
 
     println!("    \x1b[37;1mLinking functions from source files:\x1b[0m");
@@ -298,7 +292,6 @@ fn main() {
         );
     }
 
-    // Сборка неразрешенных внешних символов (импорты) из call_patches
     let mut unresolved_calls = Vec::new();
     for (_, target_name) in &generator.call_patches {
         if !generator.function_offsets.contains_key(target_name) {
@@ -317,6 +310,7 @@ fn main() {
         }
     }
 
+    // Вызываем упаковочную ELF-функцию, теперь перенесенную в модуль abi
     let executable_image = generate_elf64_binary(&raw_machine_code, &program, &generator);
 
     println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
@@ -327,7 +321,6 @@ fn main() {
     println!("      .p46_deps      (Standard 4/6 dependencies)");
     println!("      .p46_strtab    (Symbol names String Table)");
 
-    // Сохраняем в указанный файл
     if let Err(e) = fs::write(&final_output, &executable_image) {
         eprintln!(
             "\x1b[31;1merror\x1b[0m: writing binary to '{}': {}",
@@ -411,11 +404,9 @@ fn validate_file(filename: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Метод установки библиотеки в глобальную директорию системы (с предварительной валидацией)
 fn install_library(lib_path: &str) {
     let path = std::path::Path::new(lib_path);
 
-    // Если передан путь к директории (например, "libw")
     if path.is_dir() {
         println!(
             "    \x1b[36mMulti-Install:\x1b[0m Scanning directory '{}'...",
@@ -438,7 +429,6 @@ fn install_library(lib_path: &str) {
                 let fpath = entry.path();
                 if fpath.is_file() {
                     let ext = fpath.extension().and_then(|s| s.to_str()).unwrap_or("");
-                    // Ищем файлы реализации .w (парный хедер .wh подтянется автоматически)
                     if ext == "w" {
                         let file_stem_path = fpath.with_extension("");
                         let stem_str = file_stem_path.to_str().unwrap_or("");
@@ -465,11 +455,9 @@ fn install_library(lib_path: &str) {
         return;
     }
 
-    // Иначе устанавливаем одиночную библиотеку
     install_single_file(lib_path);
 }
 
-/// Вспомогательный метод установки одиночной библиотеки
 fn install_single_file(lib_path: &str) {
     let path = std::path::Path::new(lib_path);
     let stem = match path.file_stem() {
@@ -487,7 +475,6 @@ fn install_single_file(lib_path: &str) {
     let source_w = format!("{}.w", lib_path);
     let source_wh = format!("{}.wh", lib_path);
 
-    // Валидация файлов перед копированием
     if std::path::Path::new(&source_w).exists() {
         println!("    Validating library code '{}'...", source_w);
         if let Err(err) = validate_file(&source_w) {

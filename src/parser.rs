@@ -919,6 +919,16 @@ impl Parser {
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
         match &self.current_token {
+            // Поддержка унарного минуса: преобразуем `-expr` в `0 - expr`
+            Token::OpSub => {
+                self.step(); // Потребляем '-'
+                let expr = self.parse_primary_expr()?;
+                Ok(Expr::Binary {
+                    left: Box::new(Expr::Number(0)),
+                    op: "OpSub".to_string(),
+                    right: Box::new(expr),
+                })
+            }
             Token::OpBitNot => {
                 self.step();
                 let expr = self.parse_primary_expr()?;
@@ -980,6 +990,10 @@ impl Parser {
                             section: name_val,
                             variable: var_name,
                         });
+                    } else if let Token::AddrOf(var) = &self.current_token {
+                        let var_name = var.clone();
+                        self.step();
+                        return Ok(Expr::AddrOf(format!("{}:{}", name_val, var_name)));
                     }
                 }
 

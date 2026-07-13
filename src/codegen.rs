@@ -51,6 +51,101 @@ impl NativeGenerator {
         }
     }
 
+    /// Рекурсивное вычисление типа любого сложного выражения
+    fn resolve_expr_type(&self, expr: &Expr) -> Option<DataType> {
+        match expr {
+            Expr::Variable(name) => self.local_types.get(name).cloned(),
+            Expr::MemberAccess {
+                expr: base_expr,
+                member,
+                ..
+            } => {
+                let base_type = self.resolve_expr_type(base_expr)?;
+                let struct_name = match base_type {
+                    DataType::Struct(n) => n,
+                    DataType::Pointer(boxed) => match *boxed {
+                        DataType::Struct(n) => n,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                self.struct_fields.get(&struct_name)?.get(member).cloned()
+            }
+            Expr::Index {
+                expr: base_expr, ..
+            } => {
+                let base_type = self.resolve_expr_type(base_expr)?;
+                match base_type {
+                    DataType::Array(elem, _) => Some(*elem),
+                    DataType::Pointer(elem) => Some(*elem),
+                    DataType::Typedef(name, _) => {
+                        if let Some(DataType::Array(elem, _)) = self.typedefs_map.get(&name) {
+                            Some(*elem.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn can_resolve_type(&self, dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(name) => {
+                self.struct_layouts.contains_key(name) || self.typedefs_map.contains_key(name)
+            }
+            DataType::Array(elem, _) => self.can_resolve_type(elem),
+            DataType::Pointer(_) => true,
+            DataType::Typedef(_, underlying) => self.can_resolve_type(underlying),
+            _ => true,
+        }
+    }
+
+    fn calculate_and_insert_layout(&mut self, s: &StructDecl) {
+        let mut fields_offsets = HashMap::new();
+        let mut current_offset = 0;
+        let mut max_alignment = 1;
+
+        if s.is_union {
+            let mut max_size = 0;
+            for field in &s.fields {
+                fields_offsets.insert(field.name.clone(), 0);
+                let size = self.get_type_size_internal(&field.data_type);
+                if size > max_size {
+                    max_size = size;
+                }
+            }
+            self.struct_layouts
+                .insert(s.name.clone(), (max_size, fields_offsets));
+            return;
+        }
+
+        for field in &s.fields {
+            let size = self.get_type_size_internal(&field.data_type);
+            let mut alignment = size;
+            if alignment > 8 {
+                alignment = 8;
+            }
+            if alignment > max_alignment {
+                max_alignment = alignment;
+            }
+
+            if current_offset % alignment != 0 {
+                current_offset += alignment - (current_offset % alignment);
+            }
+            fields_offsets.insert(field.name.clone(), current_offset);
+            current_offset += size;
+        }
+        if current_offset % max_alignment != 0 {
+            current_offset += max_alignment - (current_offset % max_alignment);
+        }
+        self.struct_layouts
+            .insert(s.name.clone(), (current_offset, fields_offsets));
+    }
+
     pub fn compile_program(&mut self, program: &Program) -> Vec<u8> {
         self.code.clear();
         self.local_offsets.clear();
@@ -87,46 +182,33 @@ impl NativeGenerator {
             self.struct_fields.insert(s.name.clone(), fields_types);
         }
 
-        for s in &program.structs {
-            let mut fields_offsets = HashMap::new();
-            let mut current_offset = 0;
-            let mut max_alignment = 1;
+        let mut resolved_any = true;
+        while resolved_any {
+            resolved_any = false;
+            for s in &program.structs {
+                if self.struct_layouts.contains_key(&s.name) {
+                    continue;
+                }
 
-            if s.is_union {
-                let mut max_size = 0;
+                let mut can_resolve = true;
                 for field in &s.fields {
-                    fields_offsets.insert(field.name.clone(), 0);
-                    let size = self.get_type_size_internal(&field.data_type);
-                    if size > max_size {
-                        max_size = size;
+                    if !self.can_resolve_type(&field.data_type) {
+                        can_resolve = false;
+                        break;
                     }
                 }
-                self.struct_layouts
-                    .insert(s.name.clone(), (max_size, fields_offsets));
-                continue;
-            }
 
-            for field in &s.fields {
-                let size = self.get_type_size_internal(&field.data_type);
-                let mut alignment = size;
-                if alignment > 8 {
-                    alignment = 8;
+                if can_resolve {
+                    self.calculate_and_insert_layout(s);
+                    resolved_any = true;
                 }
-                if alignment > max_alignment {
-                    max_alignment = alignment;
-                }
+            }
+        }
 
-                if current_offset % alignment != 0 {
-                    current_offset += alignment - (current_offset % alignment);
-                }
-                fields_offsets.insert(field.name.clone(), current_offset);
-                current_offset += size;
+        for s in &program.structs {
+            if !self.struct_layouts.contains_key(&s.name) {
+                self.calculate_and_insert_layout(s);
             }
-            if current_offset % max_alignment != 0 {
-                current_offset += max_alignment - (current_offset % max_alignment);
-            }
-            self.struct_layouts
-                .insert(s.name.clone(), (current_offset, fields_offsets));
         }
 
         self.collect_string_constants_from_program(program);
@@ -138,6 +220,8 @@ impl NativeGenerator {
                 self.global_offsets
                     .insert(key, global_data_bytes.len() as u32);
 
+                let var_size = self.get_type_size_internal(&var.data_type);
+
                 let init_val = match &var.initial_value {
                     Some(expr) => match &**expr {
                         Expr::Number(n) => *n,
@@ -145,7 +229,15 @@ impl NativeGenerator {
                     },
                     None => 0,
                 };
-                global_data_bytes.extend_from_slice(&init_val.to_le_bytes());
+
+                let init_bytes = init_val.to_le_bytes();
+                for i in 0..(var_size as usize) {
+                    if i < init_bytes.len() {
+                        global_data_bytes.push(init_bytes[i]);
+                    } else {
+                        global_data_bytes.push(0);
+                    }
+                }
             }
         }
 
@@ -489,68 +581,10 @@ impl NativeGenerator {
     }
 
     fn get_expr_type_size(&self, expr: &Expr) -> u32 {
-        match expr {
-            Expr::Variable(name) => {
-                if let Some(dt) = self.local_types.get(name) {
-                    self.get_type_size_internal(dt)
-                } else {
-                    8
-                }
-            }
-            Expr::Index {
-                expr: base_expr, ..
-            } => {
-                if let Expr::Variable(ref name) = &**base_expr {
-                    if let Some(dt) = self.local_types.get(name) {
-                        match dt {
-                            DataType::Array(elem, _) => {
-                                return self.get_type_size_internal(elem);
-                            }
-                            DataType::Pointer(elem) => {
-                                return self.get_type_size_internal(elem);
-                            }
-                            DataType::Struct(struct_name) => {
-                                if let Some(DataType::Array(elem, _)) =
-                                    self.typedefs_map.get(struct_name)
-                                {
-                                    return self.get_type_size_internal(elem);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                8
-            }
-            Expr::MemberAccess {
-                expr: base_expr,
-                member,
-                ..
-            } => {
-                let mut struct_name = String::new();
-                if let Expr::Variable(base_var) = &**base_expr {
-                    if let Some(dt) = self.local_types.get(base_var) {
-                        struct_name = match dt {
-                            DataType::Struct(n) => n.clone(),
-                            DataType::Pointer(boxed) => match &**boxed {
-                                DataType::Struct(n) => n.clone(),
-                                _ => String::new(),
-                            },
-                            _ => String::new(),
-                        };
-                    }
-                }
-
-                if !struct_name.is_empty() {
-                    if let Some(fields) = self.struct_fields.get(&struct_name) {
-                        if let Some(dt) = fields.get(member) {
-                            return self.get_type_size_internal(dt);
-                        }
-                    }
-                }
-                8
-            }
-            _ => 8,
+        if let Some(dt) = self.resolve_expr_type(expr) {
+            self.get_type_size_internal(&dt)
+        } else {
+            8
         }
     }
 
@@ -644,11 +678,17 @@ impl NativeGenerator {
         self.code.push(0x55);
         self.code.extend_from_slice(&[0x48, 0x89, 0xE5]);
 
+        let sub_rsp_offset = self.code.len();
         self.code
-            .extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00]);
+            .extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x00, 0x00]);
 
         for (idx, (dt, name, access)) in func.params.iter().enumerate() {
-            let var_size = self.get_type_size_internal(dt);
+            let is_ptr_modifier = *access == PtrAccess::Input || *access == PtrAccess::Output;
+            let var_size = if is_ptr_modifier {
+                8
+            } else {
+                self.get_type_size_internal(dt)
+            };
             self.next_offset += var_size;
             let offset = self.next_offset;
             self.local_offsets.insert(name.clone(), offset);
@@ -672,6 +712,13 @@ impl NativeGenerator {
             }
         }
 
+        let final_stack_size = (self.next_offset + 15) & !15;
+        let bytes = final_stack_size.to_le_bytes();
+        self.code[sub_rsp_offset + 3] = bytes[0];
+        self.code[sub_rsp_offset + 4] = bytes[1];
+        self.code[sub_rsp_offset + 5] = bytes[2];
+        self.code[sub_rsp_offset + 6] = bytes[3];
+
         self.code.extend_from_slice(&[0x48, 0x89, 0xEC]);
         self.code.push(0x5D);
         self.code.push(0xC3);
@@ -680,7 +727,13 @@ impl NativeGenerator {
     fn compile_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::VarDefinition(decl) => {
-                let var_size = self.get_type_size_internal(&decl.data_type);
+                let is_ptr_modifier =
+                    decl.modifier == PtrAccess::Input || decl.modifier == PtrAccess::Output;
+                let var_size = if is_ptr_modifier {
+                    8
+                } else {
+                    self.get_type_size_internal(&decl.data_type)
+                };
                 self.next_offset += var_size;
                 let offset = self.next_offset;
                 self.local_offsets.insert(decl.name.clone(), offset);
@@ -927,7 +980,15 @@ impl NativeGenerator {
             }
             Stmt::Nasm(asm_code) => {
                 for line in asm_code.lines() {
-                    let trimmed = line.trim();
+                    let mut trimmed = line.trim();
+
+                    if let Some(idx) = trimmed.find("//") {
+                        trimmed = trimmed[..idx].trim();
+                    }
+                    if let Some(idx) = trimmed.find(';') {
+                        trimmed = trimmed[..idx].trim();
+                    }
+
                     if trimmed.is_empty() {
                         continue;
                     }
@@ -1042,23 +1103,31 @@ impl NativeGenerator {
             }
             Expr::Variable(name) => {
                 if let Some(&offset) = self.local_offsets.get(name) {
-                    let var_size = self.get_type_size_internal(
-                        self.local_types.get(name).unwrap_or(&DataType::U64),
-                    );
-                    self.emit_mem_load(reg, offset, var_size);
-
                     let modifier = self
                         .local_access
                         .get(name)
                         .cloned()
                         .unwrap_or(PtrAccess::Normal);
+
+                    let is_ptr_modifier =
+                        modifier == PtrAccess::Input || modifier == PtrAccess::Output;
+
+                    let var_size = if is_ptr_modifier {
+                        8
+                    } else {
+                        self.get_type_size_internal(
+                            self.local_types.get(name).unwrap_or(&DataType::U64),
+                        )
+                    };
+
+                    self.emit_mem_load(reg, offset, var_size);
+
                     if modifier == PtrAccess::Input && _deref_ptr {
-                        let mut is_byte = false;
-                        if let Some(DataType::Pointer(ref boxed)) = self.local_types.get(name) {
-                            if **boxed == DataType::U8 || **boxed == DataType::I8 {
-                                is_byte = true;
-                            }
-                        }
+                        let is_byte = if let Some(dt) = self.local_types.get(name) {
+                            *dt == DataType::U8 || *dt == DataType::I8
+                        } else {
+                            false
+                        };
 
                         let deref_op = if reg == 0 {
                             if is_byte {
@@ -1098,6 +1167,20 @@ impl NativeGenerator {
             Expr::AddrOf(name) => {
                 if let Some(&offset) = self.local_offsets.get(name) {
                     self.emit_mem_op(0x8D, reg, offset);
+                } else {
+                    let mut found_key = None;
+                    for key in self.global_offsets.keys() {
+                        if key.ends_with(&format!(":{}", name)) || key == name {
+                            found_key = Some(key.clone());
+                            break;
+                        }
+                    }
+                    if let Some(key) = found_key {
+                        let parts: Vec<&str> = key.split(':').collect();
+                        let section = parts[0].to_string();
+                        let variable = parts[1].to_string();
+                        self.compile_address(&Expr::SectionAccess { section, variable }, reg);
+                    }
                 }
             }
             Expr::MemberAccess { .. } | Expr::Index { .. } => {
@@ -1118,6 +1201,11 @@ impl NativeGenerator {
                         _ => self.code.extend_from_slice(&[0x48, 0x8B, 0x1B]),
                     }
                 }
+            }
+            Expr::Null => {
+                let opcode = 0xB8 + reg;
+                self.code.extend_from_slice(&[0x48, opcode]);
+                self.code.extend_from_slice(&0u64.to_le_bytes());
             }
             Expr::SectionAccess { section, variable } => {
                 let key = format!("{}:{}", section, variable);
@@ -1164,12 +1252,6 @@ impl NativeGenerator {
                 if op == "OpBitNot" {
                     self.compile_expr(left, 0, false);
                     self.code.extend_from_slice(&[0x48, 0xF7, 0xD0]); // not rax
-                    return;
-                }
-
-                if op == "OpBitNot" {
-                    self.compile_expr(left, 0, false);
-                    self.code.extend_from_slice(&[0x48, 0xF7, 0xD0]);
                     return;
                 }
 
@@ -1364,6 +1446,36 @@ impl NativeGenerator {
                     }
                     self.code
                         .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05]);
+                } else if name == "sys_fork" {
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00, 0x0F, 0x05]);
+                } else if name == "sys_execve" {
+                    if let Some(path_expr) = args.first() {
+                        self.compile_expr(path_expr, 7, true);
+                    }
+                    if let Some(argv_expr) = args.get(1) {
+                        self.compile_expr(argv_expr, 6, true);
+                    }
+                    if let Some(envp_expr) = args.get(2) {
+                        self.compile_expr(envp_expr, 2, true);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3B, 0x00, 0x00, 0x00, 0x0F, 0x05]);
+                } else if name == "sys_wait4" {
+                    if let Some(pid_expr) = args.first() {
+                        self.compile_expr(pid_expr, 7, true);
+                    }
+                    if let Some(status_expr) = args.get(1) {
+                        self.compile_expr(status_expr, 6, true);
+                    }
+                    if let Some(options_expr) = args.get(2) {
+                        self.compile_expr(options_expr, 2, true);
+                    }
+                    if let Some(ru_expr) = args.get(3) {
+                        self.compile_expr(ru_expr, 1, true);
+                    }
+                    self.code
+                        .extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00, 0x0F, 0x05]);
                 } else if name == "inb" {
                     if let Some(port_expr) = args.first() {
                         self.compile_expr(port_expr, 1, true);
@@ -1573,17 +1685,15 @@ impl NativeGenerator {
                 }
 
                 let mut struct_name = String::new();
-                if let Expr::Variable(base_var) = &**base_expr {
-                    if let Some(dt) = self.local_types.get(base_var) {
-                        struct_name = match dt {
-                            DataType::Struct(n) => n.clone(),
-                            DataType::Pointer(boxed) => match &**boxed {
-                                DataType::Struct(n) => n.clone(),
-                                _ => String::new(),
-                            },
+                if let Some(base_type) = self.resolve_expr_type(base_expr) {
+                    struct_name = match base_type {
+                        DataType::Struct(n) => n,
+                        DataType::Pointer(boxed) => match *boxed {
+                            DataType::Struct(n) => n,
                             _ => String::new(),
-                        };
-                    }
+                        },
+                        _ => String::new(),
+                    };
                 }
 
                 if let Some((_, fields)) = self.struct_layouts.get(&struct_name) {
@@ -1593,6 +1703,14 @@ impl NativeGenerator {
                         self.code.extend_from_slice(&field_offset.to_le_bytes());
                     }
                 }
+            }
+            Expr::SectionAccess { section, variable } => {
+                let key = format!("{}:{}", section, variable);
+                let reg_opcode = if internal_reg == 0 { 0xB8 } else { 0xBB };
+                self.code.extend_from_slice(&[0x48, reg_opcode]);
+                let patch_pos = self.code.len();
+                self.code.extend_from_slice(&[0; 8]);
+                self.address_patches.push((patch_pos, key));
             }
             _ => {}
         }
@@ -1650,10 +1768,9 @@ impl NativeGenerator {
                         self.emit_mem_load(3, offset, 8);
                     }
 
-                    let mut elem_size = 8;
-                    if let Some(DataType::Pointer(ref boxed)) = self.local_types.get(name) {
-                        elem_size = self.get_type_size_internal(boxed);
-                    }
+                    let elem_size = self.get_type_size_internal(
+                        self.local_types.get(name).unwrap_or(&DataType::U64),
+                    );
 
                     match elem_size {
                         1 => self.code.extend_from_slice(&[0x88, 0x03]),
@@ -1662,9 +1779,13 @@ impl NativeGenerator {
                         _ => self.code.extend_from_slice(&[0x48, 0x89, 0x03]),
                     }
                 } else if let Some(&offset) = self.local_offsets.get(name) {
-                    let var_size = self.get_type_size_internal(
-                        self.local_types.get(name).unwrap_or(&DataType::U64),
-                    );
+                    let var_size = if modifier == PtrAccess::Input {
+                        8
+                    } else {
+                        self.get_type_size_internal(
+                            self.local_types.get(name).unwrap_or(&DataType::U64),
+                        )
+                    };
                     self.emit_mem_store(0, offset, var_size);
                 } else {
                     let mut found_key = None;
@@ -1718,363 +1839,4 @@ impl NativeGenerator {
             _ => {}
         }
     }
-}
-
-pub fn generate_elf64_binary(
-    payload_bytes: &[u8],
-    program: &Program,
-    gen: &NativeGenerator,
-) -> Vec<u8> {
-    let mut p46_strtab = Vec::new();
-    p46_strtab.push(0);
-    let mut str_offsets = HashMap::new();
-
-    let mut add_str = |s: &str| -> u32 {
-        if let Some(&off) = str_offsets.get(s) {
-            return off;
-        }
-        let off = p46_strtab.len() as u32;
-        p46_strtab.extend_from_slice(s.as_bytes());
-        p46_strtab.push(0);
-        str_offsets.insert(s.to_string(), off);
-        off
-    };
-
-    let mut p46_types = Vec::new();
-
-    for s in &program.structs {
-        let name_off = add_str(&s.name);
-
-        let mut fields_data = Vec::new();
-        for field in &s.fields {
-            let f_name_off = add_str(&field.name);
-            fields_data.extend_from_slice(&f_name_off.to_le_bytes());
-
-            let type_id = match &field.data_type {
-                DataType::U64 => 4u32,
-                DataType::U32 => 3u32,
-                DataType::F64 => 4u32,
-                DataType::Array(..) => 6u32,
-                DataType::Typedef(..) => 9u32,
-                _ => 11u32,
-            };
-            fields_data.extend_from_slice(&type_id.to_le_bytes());
-            fields_data.extend_from_slice(&0u32.to_le_bytes());
-            fields_data.extend_from_slice(&field.version_added.to_le_bytes());
-            fields_data.extend_from_slice(&field.version_removed.to_le_bytes());
-        }
-
-        let mut val = Vec::new();
-        val.extend_from_slice(&name_off.to_le_bytes());
-        val.extend_from_slice(&s.version.to_le_bytes());
-        val.extend_from_slice(&16u32.to_le_bytes());
-        val.extend_from_slice(&(s.fields.len() as u32).to_le_bytes());
-        val.extend(fields_data);
-
-        p46_types.extend_from_slice(&1u16.to_le_bytes());
-        p46_types.extend_from_slice(&(val.len() as u32).to_le_bytes());
-        p46_types.extend(val);
-    }
-
-    for (name, dt) in &program.typedefs {
-        let alias_off = add_str(name);
-
-        let underlying_id = match dt {
-            DataType::Array(..) => 6u32,
-            DataType::U64 => 4u32,
-            DataType::F64 => 4u32,
-            _ => 11u32,
-        };
-
-        let mut val = Vec::new();
-        val.extend_from_slice(&alias_off.to_le_bytes());
-        val.extend_from_slice(&underlying_id.to_le_bytes());
-
-        p46_types.extend_from_slice(&9u16.to_le_bytes());
-        p46_types.extend_from_slice(&(val.len() as u32).to_le_bytes());
-        p46_types.extend(val);
-    }
-
-    let mut p46_exports = Vec::new();
-    p46_exports.extend_from_slice(&(program.functions.len() as u32).to_le_bytes());
-    for (idx, func) in program.functions.iter().enumerate() {
-        let name_off = add_str(&func.name);
-        let mod_off = add_str("main_module");
-        p46_exports.extend_from_slice(&name_off.to_le_bytes());
-        p46_exports.extend_from_slice(&mod_off.to_le_bytes());
-        p46_exports.extend_from_slice(&1u32.to_le_bytes());
-        p46_exports.push(1);
-
-        let local_offset = gen.function_offsets.get(&func.name).cloned().unwrap_or(0);
-        let abs_addr = 0x400078u64 + (local_offset as u64);
-        p46_exports.extend_from_slice(&abs_addr.to_le_bytes());
-        p46_exports.extend_from_slice(&(idx as u32).to_le_bytes());
-
-        p46_exports.extend_from_slice(&(func.params.len() as u32).to_le_bytes());
-        p46_exports.extend_from_slice(&4u32.to_le_bytes());
-        for _ in &func.params {
-            p46_exports.extend_from_slice(&4u32.to_le_bytes());
-        }
-    }
-
-    let mut unresolved_calls = Vec::new();
-    for (_, target_name) in &gen.call_patches {
-        if !gen.function_offsets.contains_key(target_name) {
-            if !unresolved_calls.contains(target_name) {
-                unresolved_calls.push(target_name.clone());
-            }
-        }
-    }
-
-    let module_name = program
-        .imports
-        .first()
-        .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
-        .unwrap_or_else(|| "libc.ko".to_string());
-
-    let mut p46_imports = Vec::new();
-    p46_imports.extend_from_slice(&(unresolved_calls.len() as u32).to_le_bytes());
-    for name in &unresolved_calls {
-        let name_off = add_str(name);
-        let mod_off = add_str(&module_name);
-        p46_imports.extend_from_slice(&name_off.to_le_bytes());
-        p46_imports.extend_from_slice(&mod_off.to_le_bytes());
-        p46_imports.extend_from_slice(&1u32.to_le_bytes());
-        p46_imports.extend_from_slice(&0u32.to_le_bytes());
-    }
-
-    let mut p46_deps = Vec::new();
-    p46_deps.extend_from_slice(&(program.imports.len() as u32).to_le_bytes());
-    for imp in &program.imports {
-        let name_off = add_str(imp);
-        p46_deps.extend_from_slice(&name_off.to_le_bytes());
-        p46_deps.extend_from_slice(&1u32.to_le_bytes());
-        p46_deps.extend_from_slice(&0u32.to_le_bytes());
-        p46_deps.extend_from_slice(&0u32.to_le_bytes());
-        p46_deps.extend_from_slice(&0u32.to_le_bytes());
-    }
-
-    let mut p46_reflect = Vec::new();
-    p46_reflect.extend_from_slice(&0u32.to_le_bytes());
-
-    let text_offset = 120usize;
-    let text_size = payload_bytes.len();
-
-    let p46_hdr_offset = text_offset + text_size;
-    let p46_hdr_size = 24 + 12 * 5;
-
-    let p46_types_offset = p46_hdr_offset + p46_hdr_size;
-    let p46_types_size = p46_types.len();
-
-    let p46_exp_offset = p46_types_offset + p46_types_size;
-    let p46_exp_size = p46_exports.len();
-
-    let p46_refl_offset = p46_exp_offset + p46_exp_size;
-    let p46_refl_size = p46_reflect.len();
-
-    let p46_imp_offset = p46_refl_offset + p46_refl_size;
-    let p46_imp_size = p46_imports.len();
-
-    let p46_deps_offset = p46_imp_offset + p46_imp_size;
-    let p46_deps_size = p46_deps.len();
-
-    let p46_strtab_offset = p46_deps_offset + p46_deps_size;
-    let p46_strtab_size = p46_strtab.len();
-
-    let mut shstrtab = Vec::new();
-    shstrtab.push(0);
-    let n_text = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".text\0");
-    let n_p46_hdr = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_header\0");
-    let n_p46_typ = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_types\0");
-    let n_p46_exp = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_exports\0");
-    let n_p46_imp = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_imports\0");
-    let n_p46_dep = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_deps\0");
-    let n_p46_ref = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_reflect\0");
-    let n_shstr = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".shstrtab\0");
-    let n_p46_str = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".p46_strtab\0");
-
-    let shstrtab_offset = p46_strtab_offset + p46_strtab_size;
-    let shstrtab_size = shstrtab.len();
-
-    let sht_offset = shstrtab_offset + shstrtab_size;
-
-    let mut p46_header = Vec::new();
-    p46_header.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]);
-    p46_header.push(1);
-    p46_header.push(5);
-    p46_header.push(0);
-    p46_header.push(1);
-    p46_header.push(8);
-    p46_header.extend_from_slice(&[0, 0, 0]);
-    p46_header.extend_from_slice(&5u32.to_le_bytes());
-    p46_header.extend_from_slice(&(p46_strtab_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_strtab_size as u32).to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_types_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_types_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&1u32.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_exp_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_exp_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&2u32.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_refl_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_refl_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&3u32.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_imp_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_imp_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&4u32.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_deps_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_deps_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&5u32.to_le_bytes());
-
-    let mut elf = Vec::new();
-
-    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
-    elf.push(2);
-    elf.push(1);
-    elf.push(1);
-    elf.push(0);
-    elf.extend_from_slice(&[0; 8]);
-
-    elf.extend_from_slice(&2u16.to_le_bytes());
-    elf.extend_from_slice(&62u16.to_le_bytes());
-    elf.extend_from_slice(&1u32.to_le_bytes());
-    elf.extend_from_slice(&0x400078u64.to_le_bytes());
-    elf.extend_from_slice(&64u64.to_le_bytes());
-    elf.extend_from_slice(&(sht_offset as u64).to_le_bytes());
-    elf.extend_from_slice(&0u32.to_le_bytes());
-    elf.extend_from_slice(&64u16.to_le_bytes());
-    elf.extend_from_slice(&56u16.to_le_bytes());
-    elf.extend_from_slice(&1u16.to_le_bytes());
-    elf.extend_from_slice(&64u16.to_le_bytes());
-    elf.extend_from_slice(&10u16.to_le_bytes());
-    elf.extend_from_slice(&8u16.to_le_bytes());
-
-    let total_file_size = (sht_offset + 10 * 64) as u64;
-    elf.extend_from_slice(&1u32.to_le_bytes());
-    elf.extend_from_slice(&7u32.to_le_bytes());
-    elf.extend_from_slice(&0u64.to_le_bytes());
-    elf.extend_from_slice(&0x400000u64.to_le_bytes());
-    elf.extend_from_slice(&0x400000u64.to_le_bytes());
-    elf.extend_from_slice(&total_file_size.to_le_bytes());
-    elf.extend_from_slice(&total_file_size.to_le_bytes());
-    elf.extend_from_slice(&0x1000u64.to_le_bytes());
-
-    elf.extend_from_slice(payload_bytes);
-    elf.extend_from_slice(&p46_header);
-    elf.extend_from_slice(&p46_types);
-    elf.extend_from_slice(&p46_exports);
-    elf.extend_from_slice(&p46_reflect);
-    elf.extend_from_slice(&p46_imports);
-    elf.extend_from_slice(&p46_deps);
-    elf.extend_from_slice(&p46_strtab);
-    elf.extend_from_slice(&shstrtab);
-
-    let build_shdr =
-        |name: u32, ty: u32, flags: u64, addr: u64, offset: u64, size: u64| -> Vec<u8> {
-            let mut shdr = Vec::new();
-            shdr.extend_from_slice(&name.to_le_bytes());
-            shdr.extend_from_slice(&type_id_helper(ty).to_le_bytes());
-            shdr.extend_from_slice(&flags.to_le_bytes());
-            shdr.extend_from_slice(&addr.to_le_bytes());
-            shdr.extend_from_slice(&offset.to_le_bytes());
-            shdr.extend_from_slice(&size.to_le_bytes());
-            shdr.extend_from_slice(&0u32.to_le_bytes());
-            shdr.extend_from_slice(&0u32.to_le_bytes());
-            shdr.extend_from_slice(&8u64.to_le_bytes());
-            shdr.extend_from_slice(&0u64.to_le_bytes());
-            shdr
-        };
-
-    fn type_id_helper(ty: u32) -> u32 {
-        ty
-    }
-
-    elf.extend(build_shdr(0, 0, 0, 0, 0, 0));
-    elf.extend(build_shdr(
-        n_text,
-        1,
-        7,
-        0x400078,
-        text_offset as u64,
-        text_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_hdr,
-        1,
-        2,
-        0,
-        p46_hdr_offset as u64,
-        p46_hdr_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_typ,
-        1,
-        2,
-        0,
-        p46_types_offset as u64,
-        p46_types_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_exp,
-        1,
-        2,
-        0,
-        p46_exp_offset as u64,
-        p46_exp_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_imp,
-        1,
-        2,
-        0,
-        p46_imp_offset as u64,
-        p46_imp_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_dep,
-        1,
-        2,
-        0,
-        p46_deps_offset as u64,
-        p46_deps_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_ref,
-        1,
-        2,
-        0,
-        p46_refl_offset as u64,
-        p46_refl_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_shstr,
-        3,
-        0,
-        0,
-        shstrtab_offset as u64,
-        shstrtab_size as u64,
-    ));
-    elf.extend(build_shdr(
-        n_p46_str,
-        3,
-        0,
-        0,
-        p46_strtab_offset as u64,
-        p46_strtab_size as u64,
-    ));
-
-    elf
 }

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use crate::ast::{DataType, Program};
+use crate::codegen::NativeGenerator;
 use std::collections::HashMap;
 
 pub const P46_SECTION_TYPES: u32 = 1;
@@ -43,15 +45,15 @@ impl Strtab {
 
 pub struct BinaryBuilder {
     pub strtab: Strtab,
-    types_section: Vec<u8>,
-    exports_section: Vec<u8>,
-    exports_count: u32,
-    imports_section: Vec<u8>,
-    imports_count: u32,
-    deps_section: Vec<u8>,
-    deps_count: u32,
-    reflect_section: Vec<u8>,
-    reflect_count: u32,
+    pub types_section: Vec<u8>,
+    pub exports_section: Vec<u8>,
+    pub exports_count: u32,
+    pub imports_section: Vec<u8>,
+    pub imports_count: u32,
+    pub deps_section: Vec<u8>,
+    pub deps_count: u32,
+    pub reflect_section: Vec<u8>,
+    pub reflect_count: u32,
 }
 
 impl BinaryBuilder {
@@ -264,4 +266,363 @@ impl BinaryBuilder {
 
         image
     }
+}
+
+/// Централизованная генерация исполняемого файла ELF64 со всеми секциями Standard 4/6
+pub fn generate_elf64_binary(
+    payload_bytes: &[u8],
+    program: &Program,
+    gen: &NativeGenerator,
+) -> Vec<u8> {
+    let mut builder = BinaryBuilder::new();
+
+    // 1. Сборка секции зависимостей (.p46_deps)
+    for imp in &program.imports {
+        builder.add_dependency(imp, 1, 0);
+    }
+
+    // 2. Сборка деклараций типов (.p46_types)
+    for s in &program.structs {
+        let name_off = builder.strtab.insert(&s.name);
+
+        let mut fields_data = Vec::new();
+        for field in &s.fields {
+            let f_name_off = builder.strtab.insert(&field.name);
+            fields_data.extend_from_slice(&f_name_off.to_le_bytes());
+
+            let type_id = match &field.data_type {
+                DataType::U64 => 4u32,
+                DataType::U32 => 3u32,
+                DataType::F64 => 4u32,
+                DataType::Array(..) => 6u32,
+                DataType::Typedef(..) => 9u32,
+                _ => 11u32,
+            };
+            fields_data.extend_from_slice(&type_id.to_le_bytes());
+            fields_data.extend_from_slice(&0u32.to_le_bytes());
+            fields_data.extend_from_slice(&field.version_added.to_le_bytes());
+            fields_data.extend_from_slice(&field.version_removed.to_le_bytes());
+        }
+
+        let mut val = Vec::new();
+        val.extend_from_slice(&name_off.to_le_bytes());
+        val.extend_from_slice(&s.version.to_le_bytes());
+        val.extend_from_slice(&16u32.to_le_bytes());
+        val.extend_from_slice(&(s.fields.len() as u32).to_le_bytes());
+        val.extend(fields_data);
+
+        builder.add_type_record(1, &val); // Struct ID
+    }
+
+    for (name, dt) in &program.typedefs {
+        let alias_off = builder.strtab.insert(name);
+
+        let underlying_id = match dt {
+            DataType::Array(..) => 6u32,
+            DataType::U64 => 4u32,
+            DataType::F64 => 4u32,
+            _ => 11u32,
+        };
+
+        let mut val = Vec::new();
+        val.extend_from_slice(&alias_off.to_le_bytes());
+        val.extend_from_slice(&underlying_id.to_le_bytes());
+
+        builder.add_type_record(9, &val); // Typedef ID
+    }
+
+    // 3. Сборка таблицы экспорта (.p46_exports)
+    for func in &program.functions {
+        let local_offset = gen.function_offsets.get(&func.name).cloned().unwrap_or(0);
+        let abs_addr = 0x400078u64 + (local_offset as u64);
+
+        let mut param_types = Vec::new();
+        for _ in &func.params {
+            param_types.push(4u32);
+        }
+
+        builder.add_export(
+            &func.name,
+            "main_module",
+            1,
+            P46_EXPORT_KIND_FUNCTION,
+            abs_addr,
+            4,
+            &param_types,
+            4,
+        );
+    }
+
+    // 4. Сборка таблицы импорта (.p46_imports)
+    let mut unresolved_calls = Vec::new();
+    for (_, target_name) in &gen.call_patches {
+        if !gen.function_offsets.contains_key(target_name) {
+            if !unresolved_calls.contains(target_name) {
+                unresolved_calls.push(target_name.clone());
+            }
+        }
+    }
+
+    let module_name = program
+        .imports
+        .first()
+        .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
+        .unwrap_or_else(|| "libc.ko".to_string());
+
+    for name in &unresolved_calls {
+        builder.add_import(name, &module_name, 1, 0);
+    }
+
+    // Инициализация пустой секции рефлексии в случае отсутствия записей
+    if builder.reflect_count == 0 {
+        builder
+            .reflect_section
+            .extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    // Патчинг счетчиков в собранных секциях
+    if builder.deps_count > 0 {
+        let count_bytes = builder.deps_count.to_le_bytes();
+        builder.deps_section[0..4].copy_from_slice(&count_bytes);
+    }
+    if builder.exports_count > 0 {
+        let count_bytes = builder.exports_count.to_le_bytes();
+        builder.exports_section[0..4].copy_from_slice(&count_bytes);
+    }
+    if builder.imports_count > 0 {
+        let count_bytes = builder.imports_count.to_le_bytes();
+        builder.imports_section[0..4].copy_from_slice(&count_bytes);
+    }
+    if builder.reflect_count > 0 {
+        let count_bytes = builder.reflect_count.to_le_bytes();
+        builder.reflect_section[0..4].copy_from_slice(&count_bytes);
+    }
+
+    // Извлечение байтов готовых секций
+    let p46_types = &builder.types_section;
+    let p46_exports = &builder.exports_section;
+    let p46_reflect = &builder.reflect_section;
+    let p46_imports = &builder.imports_section;
+    let p46_deps = &builder.deps_section;
+    let p46_strtab = builder.strtab.as_bytes();
+
+    // 5. Расчет смещений в бинарном файле ELF64
+    let text_offset = 120usize;
+    let text_size = payload_bytes.len();
+
+    let p46_hdr_offset = text_offset + text_size;
+    let p46_hdr_size = 24 + 12 * 5;
+
+    let p46_types_offset = p46_hdr_offset + p46_hdr_size;
+    let p46_types_size = p46_types.len();
+
+    let p46_exp_offset = p46_types_offset + p46_types_size;
+    let p46_exp_size = p46_exports.len();
+
+    let p46_refl_offset = p46_exp_offset + p46_exp_size;
+    let p46_refl_size = p46_reflect.len();
+
+    let p46_imp_offset = p46_refl_offset + p46_refl_size;
+    let p46_imp_size = p46_imports.len();
+
+    let p46_deps_offset = p46_imp_offset + p46_imp_size;
+    let p46_deps_size = p46_deps.len();
+
+    let p46_strtab_offset = p46_deps_offset + p46_deps_size;
+    let p46_strtab_size = p46_strtab.len();
+
+    let mut shstrtab = Vec::new();
+    shstrtab.push(0);
+    let n_text = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".text\0");
+    let n_p46_hdr = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_header\0");
+    let n_p46_typ = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_types\0");
+    let n_p46_exp = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_exports\0");
+    let n_p46_imp = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_imports\0");
+    let n_p46_dep = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_deps\0");
+    let n_p46_ref = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_reflect\0");
+    let n_shstr = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".shstrtab\0");
+    let n_p46_str = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".p46_strtab\0");
+
+    let shstrtab_offset = p46_strtab_offset + p46_strtab_size;
+    let shstrtab_size = shstrtab.len();
+
+    let sht_offset = shstrtab_offset + shstrtab_size;
+
+    // Сборка заголовка .p46_header
+    let mut p46_header = Vec::new();
+    p46_header.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]);
+    p46_header.push(1);
+    p46_header.push(5);
+    p46_header.push(0);
+    p46_header.push(1);
+    p46_header.push(8);
+    p46_header.extend_from_slice(&[0, 0, 0]);
+    p46_header.extend_from_slice(&5u32.to_le_bytes());
+    p46_header.extend_from_slice(&(p46_strtab_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_strtab_size as u32).to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_types_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_types_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&P46_SECTION_TYPES.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_exp_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_exp_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&P46_SECTION_EXPORTS.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_refl_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_refl_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&P46_SECTION_REFLECT.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_imp_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_imp_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&P46_SECTION_IMPORTS.to_le_bytes());
+
+    p46_header.extend_from_slice(&(p46_deps_offset as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_deps_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&P46_SECTION_DEPENDENCIES.to_le_bytes());
+
+    // Формирование итогового ELF-файла
+    let mut elf = Vec::new();
+
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf.push(2);
+    elf.push(1);
+    elf.push(1);
+    elf.push(0);
+    elf.extend_from_slice(&[0; 8]);
+
+    elf.extend_from_slice(&2u16.to_le_bytes());
+    elf.extend_from_slice(&62u16.to_le_bytes());
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&0x400078u64.to_le_bytes());
+    elf.extend_from_slice(&64u64.to_le_bytes());
+    elf.extend_from_slice(&(sht_offset as u64).to_le_bytes());
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    elf.extend_from_slice(&64u16.to_le_bytes());
+    elf.extend_from_slice(&56u16.to_le_bytes());
+    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&64u16.to_le_bytes());
+    elf.extend_from_slice(&10u16.to_le_bytes());
+    elf.extend_from_slice(&8u16.to_le_bytes());
+
+    let total_file_size = (sht_offset + 10 * 64) as u64;
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&7u32.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes());
+    elf.extend_from_slice(&0x400000u64.to_le_bytes());
+    elf.extend_from_slice(&0x400000u64.to_le_bytes());
+    elf.extend_from_slice(&total_file_size.to_le_bytes());
+    elf.extend_from_slice(&total_file_size.to_le_bytes());
+    elf.extend_from_slice(&0x1000u64.to_le_bytes());
+
+    elf.extend_from_slice(payload_bytes);
+    elf.extend_from_slice(&p46_header);
+    elf.extend_from_slice(p46_types);
+    elf.extend_from_slice(p46_exports);
+    elf.extend_from_slice(p46_reflect);
+    elf.extend_from_slice(p46_imports);
+    elf.extend_from_slice(p46_deps);
+    elf.extend_from_slice(p46_strtab);
+    elf.extend_from_slice(&shstrtab);
+
+    let build_shdr =
+        |name: u32, ty: u32, flags: u64, addr: u64, offset: u64, size: u64| -> Vec<u8> {
+            let mut shdr = Vec::new();
+            shdr.extend_from_slice(&name.to_le_bytes());
+            shdr.extend_from_slice(&ty.to_le_bytes());
+            shdr.extend_from_slice(&flags.to_le_bytes());
+            shdr.extend_from_slice(&addr.to_le_bytes());
+            shdr.extend_from_slice(&offset.to_le_bytes());
+            shdr.extend_from_slice(&size.to_le_bytes());
+            shdr.extend_from_slice(&0u32.to_le_bytes());
+            shdr.extend_from_slice(&0u32.to_le_bytes());
+            shdr.extend_from_slice(&8u64.to_le_bytes());
+            shdr.extend_from_slice(&0u64.to_le_bytes());
+            shdr
+        };
+
+    elf.extend(build_shdr(0, 0, 0, 0, 0, 0));
+    elf.extend(build_shdr(
+        n_text,
+        1,
+        7,
+        0x400078,
+        text_offset as u64,
+        text_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_hdr,
+        1,
+        2,
+        0,
+        p46_hdr_offset as u64,
+        p46_hdr_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_typ,
+        1,
+        2,
+        0,
+        p46_types_offset as u64,
+        p46_types_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_exp,
+        1,
+        2,
+        0,
+        p46_exp_offset as u64,
+        p46_exp_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_imp,
+        1,
+        2,
+        0,
+        p46_imp_offset as u64,
+        p46_imp_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_dep,
+        1,
+        2,
+        0,
+        p46_deps_offset as u64,
+        p46_deps_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_ref,
+        1,
+        2,
+        0,
+        p46_refl_offset as u64,
+        p46_refl_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_shstr,
+        3,
+        0,
+        0,
+        shstrtab_offset as u64,
+        shstrtab_size as u64,
+    ));
+    elf.extend(build_shdr(
+        n_p46_str,
+        3,
+        0,
+        0,
+        p46_strtab_offset as u64,
+        p46_strtab_size as u64,
+    ));
+
+    elf
 }

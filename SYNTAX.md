@@ -286,6 +286,9 @@ When compiled under hosted mode (`sc.true`), WandC supports direct low-level ker
 *   `sys_unlink(u8* path)`: Invokes the unlink system call (RAX = 87) with the argument mapped to RDI.
 *   `sys_ioctl(u64 fd, u64 req, u64 arg)`: Invokes the ioctl system call (RAX = 16) with arguments mapped to RDI, RSI, RDX.
 *   `sys_exit(u64 code)`: Invokes the exit system call (RAX = 60) with the argument mapped to RDI.
+*   `sys_fork()`: Invokes the fork system call (RAX = 57). Returns the child process PID in the parent process and 0 in the child process.
+*   `sys_execve(u8* path, u64* argv, u64* envp)`: Invokes the execve system call (RAX = 59) with arguments mapped to RDI, RSI, RDX.
+*   `sys_wait4(i64 pid, u32* wstatus, u64 options, u64* rusage)`: Invokes the wait4 system call (RAX = 61) with arguments mapped to RDI, RSI, RDX, RCX.
 
 Example usage for library-level file handlers:
 ```c
