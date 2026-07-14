@@ -68,13 +68,13 @@ fn verify_abi_dependencies(u8* filepath) {
 
     if (bytes_read <= 0) {
         print_str("  Error: Reading binary file failed.\n", 37);
-        return(); // Возврат void со скобками
+        return();
     }
 
     i64 hdr_offset = find_p46_header(bin_ptr, (u64)bytes_read);
     if (hdr_offset < 0) {
         print_str("  Standard 4/6 metadata signature not found in binary.\n", 54);
-        return(); // Возврат void со скобками
+        return();
     }
 
     print_str("  Analyzing Standard 4/6 Binary Metadata...\n", 44);

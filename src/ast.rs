@@ -47,6 +47,7 @@ pub struct StructDecl {
     pub version: u32,
     pub fields: Vec<FieldDecl>,
     pub is_union: bool,
+    pub is_packed: bool,
 }
 
 #[derive(Debug, Clone)]

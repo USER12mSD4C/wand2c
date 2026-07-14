@@ -15,7 +15,6 @@ use codegen::NativeGenerator;
 use lexer::Lexer;
 use optimizer::Optimizer;
 use parser::Parser;
-use safety::MemoryLeakDetector;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -159,6 +158,7 @@ fn main() {
                     program.typedefs.extend(wh_program.typedefs);
                     program.structs.extend(wh_program.structs);
                     program.functions.extend(wh_program.functions);
+                    program.sections.extend(wh_program.sections);
 
                     for sub_imp in wh_program.imports {
                         if !resolved_imports.contains(&sub_imp) {
@@ -265,9 +265,31 @@ fn main() {
         }
     }
 
-    let mut leak_detector = MemoryLeakDetector::new();
+    let mut structs_map = HashMap::new();
+    for s in &program.structs {
+        structs_map.insert(s.name.clone(), s.clone());
+    }
+
+    let mut safety_analyzer = safety::MemorySafetyAnalyzer::new();
+    let mut safety_errors = 0;
+
     for func in &program.functions {
-        leak_detector.analyze_function(func);
+        if let Err(errors) = safety_analyzer.analyze_function(func, &structs_map) {
+            for err in errors {
+                eprintln!("{}", err);
+                if err.contains("error") {
+                    safety_errors += 1;
+                }
+            }
+        }
+    }
+
+    if safety_errors > 0 {
+        eprintln!(
+            "\n\x1b[31;1merror\x1b[0m: compilation aborted due to {} safety violation(s).",
+            safety_errors
+        );
+        std::process::exit(1);
     }
 
     println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");

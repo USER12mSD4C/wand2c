@@ -6,8 +6,8 @@ WandC is a systems programming language designed for bare-metal applications, cu
 
 ## 1. Lexical and Grammar Fundamentals
 
-### 1.1 Source Files and Execution Preambles
-Every WandC file (`.w` or `.wexp`) must begin with an environment assertion token on its first non-comment line. This tells the parser whether hosted operating system interfaces are accessible:
+### 1.1 Source Files, Headers and Execution Preambles
+Every WandC file (including source files `.w`, dynamic execution modules `.wexp`, and library header files `.wh`) must begin with an environment assertion token on its first non-comment line. This tells the parser whether hosted operating system interfaces are accessible:
 
 *   `sc.true` — **Hosted Mode**: Enables high-level virtual allocations via system calls (`sys_mmap`, `sys_munmap`) and sets the runtime entry wrapper to pass arguments and collect exit codes.
 *   `sc.false` — **Bare-Metal Mode**: Disables kernel system calls. Built-in functions like `mloc` and `mfree` are disabled or act as direct physical address mapping wrappers.
@@ -194,6 +194,18 @@ u64 max_val;
 [min_val, mid_val, max_val] = get_limits();
 ```
 
+### 5.4 Library and Dependency Imports (`#import`)
+To load globally or locally installed Standard 4/6 compliant library headers, use the `#import` compiler directive.
+The directive references the package/library name **without** its `.wh` extension wrapper. The compiler automatically searches standard locations (such as `/usr/lib/libw/`, `/local/lib/libw/` or `~/.local/lib/libw/`) to resolve both the header `.wh` declarations and the source `.w` implementations during the Stage 1 compilation and merging pipeline.
+
+```c
+sc.true
+
+#import <sfa_rx570> // Resolves to sfa_rx570.wh and auto-loads sfa_rx570.w
+
+fn main() {
+    // Application Logic
+}
 ---
 
 ## 6. Structures and Memory Layout Rules
@@ -227,6 +239,7 @@ The compiler implements strict, architecture-independent layout calculation rule
     Vector* ptr = v*adr;
     ptr->z = 100;
     ```
+    *Note for Compiler Target Integrations:* If the architecture-specific codegen features pointer-dereference anomalies under nested frames, it is idiomatic to read or write structure values using qualified inline `::nasm::` byte offset instructions instead of the `->` operator.
 
 ---
 

@@ -125,7 +125,8 @@ impl NativeGenerator {
 
         for field in &s.fields {
             let size = self.get_type_size_internal(&field.data_type);
-            let mut alignment = size;
+            // Если структура упакована, выравнивание равно 1
+            let mut alignment = if s.is_packed { 1 } else { size }; // <--- Изменено!
             if alignment > 8 {
                 alignment = 8;
             }
@@ -689,6 +690,19 @@ impl NativeGenerator {
             } else {
                 self.get_type_size_internal(dt)
             };
+
+            // Выравнивание смещения параметра на стеке
+            let align_mask = if var_size >= 8 {
+                7
+            } else if var_size >= 4 {
+                3
+            } else if var_size >= 2 {
+                1
+            } else {
+                0
+            };
+            self.next_offset = (self.next_offset + align_mask) & !align_mask;
+
             self.next_offset += var_size;
             let offset = self.next_offset;
             self.local_offsets.insert(name.clone(), offset);
@@ -734,6 +748,19 @@ impl NativeGenerator {
                 } else {
                     self.get_type_size_internal(&decl.data_type)
                 };
+
+                // Выравнивание смещения локальной переменной на стеке
+                let align_mask = if var_size >= 8 {
+                    7
+                } else if var_size >= 4 {
+                    3
+                } else if var_size >= 2 {
+                    1
+                } else {
+                    0
+                };
+                self.next_offset = (self.next_offset + align_mask) & !align_mask;
+
                 self.next_offset += var_size;
                 let offset = self.next_offset;
                 self.local_offsets.insert(decl.name.clone(), offset);
@@ -820,6 +847,7 @@ impl NativeGenerator {
                     self.compile_stmt(body_stmt);
                 }
 
+                // Смещение рассчитывается ДО добавления опкода 0xE9
                 let jmp_offset = (loop_start_pos as i32) - ((self.code.len() + 5) as i32);
                 self.code.push(0xE9);
                 self.code.extend_from_slice(&jmp_offset.to_le_bytes());
@@ -853,6 +881,7 @@ impl NativeGenerator {
                     self.compile_stmt(post_stmt);
                 }
 
+                // Смещение рассчитывается ДО добавления опкода 0xE9
                 let jmp_offset = (loop_start_pos as i32) - ((self.code.len() + 5) as i32);
                 self.code.push(0xE9);
                 self.code.extend_from_slice(&jmp_offset.to_le_bytes());
@@ -1124,7 +1153,14 @@ impl NativeGenerator {
 
                     if modifier == PtrAccess::Input && _deref_ptr {
                         let is_byte = if let Some(dt) = self.local_types.get(name) {
-                            *dt == DataType::U8 || *dt == DataType::I8
+                            match dt {
+                                DataType::Pointer(inner) => match &**inner {
+                                    DataType::U8 | DataType::I8 => true,
+                                    _ => false,
+                                },
+                                DataType::U8 | DataType::I8 => true,
+                                _ => false,
+                            }
                         } else {
                             false
                         };
@@ -1549,7 +1585,6 @@ impl NativeGenerator {
                     self.call_patches.push((patch_pos, name.clone()));
                 }
             }
-            _ => {}
         }
 
         if reg != 0 {
@@ -1676,12 +1711,21 @@ impl NativeGenerator {
                 self.compile_address(base_expr, internal_reg);
 
                 if *is_arrow {
-                    let deref_op = if internal_reg == 0 {
-                        &[0x48, 0x8B, 0x00][..]
-                    } else {
-                        &[0x48, 0x8B, 0x1B][..]
-                    };
-                    self.code.extend_from_slice(deref_op);
+                    let mut is_base_pointer = false;
+                    if let Some(base_type) = self.resolve_expr_type(base_expr) {
+                        if let DataType::Pointer(_) = base_type {
+                            is_base_pointer = true;
+                        }
+                    }
+
+                    if !is_base_pointer {
+                        let deref_op = if internal_reg == 0 {
+                            &[0x48, 0x8B, 0x00][..]
+                        } else {
+                            &[0x48, 0x8B, 0x1B][..]
+                        };
+                        self.code.extend_from_slice(deref_op);
+                    }
                 }
 
                 let mut struct_name = String::new();
@@ -1768,9 +1812,14 @@ impl NativeGenerator {
                         self.emit_mem_load(3, offset, 8);
                     }
 
-                    let elem_size = self.get_type_size_internal(
-                        self.local_types.get(name).unwrap_or(&DataType::U64),
-                    );
+                    let elem_size = if let Some(dt) = self.local_types.get(name) {
+                        match dt {
+                            DataType::Pointer(inner) => self.get_type_size_internal(inner),
+                            _ => 8,
+                        }
+                    } else {
+                        8
+                    };
 
                     match elem_size {
                         1 => self.code.extend_from_slice(&[0x88, 0x03]),
@@ -1787,6 +1836,28 @@ impl NativeGenerator {
                         )
                     };
                     self.emit_mem_store(0, offset, var_size);
+                } else {
+                    let mut found_key = None;
+                    for key in self.global_offsets.keys() {
+                        if key.ends_with(&format!(":{}", name)) || key == name {
+                            found_key = Some(key.clone());
+                            break;
+                        }
+                    }
+                    if let Some(key) = found_key {
+                        let parts: Vec<&str> = key.split(':').collect();
+                        let section = parts[0].to_string();
+                        let variable = parts[1].to_string();
+                        self.store_assignment_target_from_rax(&Expr::SectionAccess {
+                            section,
+                            variable,
+                        });
+                    }
+                }
+            }
+            Expr::AddrOf(name) => {
+                if let Some(&offset) = self.local_offsets.get(name) {
+                    self.emit_mem_store(0, offset, 8);
                 } else {
                     let mut found_key = None;
                     for key in self.global_offsets.keys() {

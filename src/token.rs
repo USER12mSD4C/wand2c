@@ -21,6 +21,7 @@ pub enum Token {
     Null,
     Typedef,
     Jmpto,
+    Packed,
 
     // Примитивные типы данных
     TypeU8,

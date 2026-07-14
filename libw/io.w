@@ -201,9 +201,9 @@ fn read_float() -> f64 {
     return(parse_float(p_buf));
 }
 
-fn read_integer() -> i64 {
-    u8[64] buf;
-    u8* p_buf = buf[0]*adr; // Обычный указатель без *i
+fn read_integer() {
+    u8 buf[64];
+    u8* p_buf = buf*adr;
     read_string(p_buf, 64);
 
     i64 res = 0;

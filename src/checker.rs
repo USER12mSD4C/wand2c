@@ -43,7 +43,6 @@ impl TypeChecker {
 
         let mut offsets = Vec::new();
 
-        // Расчет для объединений (Unions)
         if s.is_union {
             let mut max_size = 0;
             for field in &s.fields {
@@ -61,7 +60,7 @@ impl TypeChecker {
 
         for field in &s.fields {
             let size = self.get_type_size(&field.data_type)?;
-            let mut alignment = size;
+            let mut alignment = if s.is_packed { 1 } else { size };
             if alignment > 8 {
                 alignment = 8;
             }

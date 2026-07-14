@@ -69,10 +69,14 @@ To validate and install libraries (e.g., `io`, `mem`, `string`, `std`) into the 
 
 ```bash
 # Install all libraries in the libw directory
-wand2c --install libw
+- wand2c --install-library libw
+
+or you can just:
+
+- wand2c -il libw
 
 # Install a single library module
-wand2c --install libw/io
+- wand2c --install-library libw/io
 ```
 *Before copying, the compiler validates the source code and headers of the target libraries.*
 

@@ -100,7 +100,6 @@ impl Parser {
             match &self.current_token {
                 Token::Import => {
                     self.step(); // consume 'import'
-
                     let mut import_path = String::new();
                     while self.current_token != Token::Semicolon && self.current_token != Token::EOF
                     {
@@ -122,9 +121,9 @@ impl Parser {
 
                     if import_path.contains('.') {
                         return Err(self.err(
-                                                    "Import path must not contain file extensions (such as .h, .w or .wlib). \
-                                                    WandC expects logical module names."
-                                                ));
+                                "Import path must not contain file extensions (such as .h, .w or .wlib). \
+                                 WandC expects logical module names."
+                            ));
                     }
 
                     program.imports.push(import_path);
@@ -192,7 +191,8 @@ impl Parser {
                         name,
                         version,
                         fields,
-                        is_union: true, // Указываем, что это объединение
+                        is_union: true,
+                        is_packed: false, // Объединения не упаковываются по умолчанию
                     });
                 }
                 Token::Enum => {
@@ -254,6 +254,16 @@ impl Parser {
                         self.step();
                     }
                     program.typedefs.push((alias_name, underlying));
+                }
+                Token::Packed => {
+                    self.step(); // consume 'packed'
+                    if self.current_token == Token::Struct {
+                        let mut s_decl = self.parse_struct_decl()?;
+                        s_decl.is_packed = true;
+                        program.structs.push(s_decl);
+                    } else {
+                        return Err(self.err("Expected 'struct' after 'packed'"));
+                    }
                 }
                 Token::Struct => {
                     let s_decl = self.parse_struct_decl()?;
@@ -651,7 +661,7 @@ impl Parser {
     }
 
     fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
-        self.step();
+        self.step(); // consume 'struct'
         let name = match &self.current_token {
             Token::Ident(n) => n.clone(),
             _ => return Err(self.err("Expected struct name")),
@@ -665,6 +675,12 @@ impl Parser {
                 version = v as u32;
                 self.step();
             }
+        }
+
+        let mut is_packed = false;
+        if self.current_token == Token::Packed {
+            is_packed = true;
+            self.step();
         }
 
         if self.current_token != Token::LBrace {
@@ -710,6 +726,7 @@ impl Parser {
             version,
             fields,
             is_union: false,
+            is_packed,
         })
     }
 
@@ -809,7 +826,7 @@ impl Parser {
         })
     }
 
-    fn parse_var_decl_tail(&mut self, base_type: DataType) -> Result<VarDecl, ParseError> {
+    fn parse_var_decl_tail(&mut self, mut base_type: DataType) -> Result<VarDecl, ParseError> {
         let (name, modifier) = match &self.current_token {
             Token::Ident(n) => (n.clone(), PtrAccess::Normal),
             Token::PtrInputModifier(n) => (n.clone(), PtrAccess::Input),
@@ -817,6 +834,19 @@ impl Parser {
             _ => return Err(self.err("Expected variable name")),
         };
         self.step();
+        if self.current_token == Token::LBracket {
+            self.step(); // [
+            let count = match self.current_token {
+                Token::Number(n) => n as usize,
+                _ => return Err(self.err("Expected array size number")),
+            };
+            self.step();
+            if self.current_token != Token::RBracket {
+                return Err(self.err("Expected ']' after array size"));
+            }
+            self.step();
+            base_type = DataType::Array(Box::new(base_type), count);
+        }
 
         let mut initial_value = None;
         if self.current_token == Token::OpAssign {

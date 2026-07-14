@@ -308,24 +308,6 @@ impl Lexer {
         result
     }
 
-    fn read_number(&mut self) -> Token {
-        let mut num_str = String::new();
-        while self.pos < self.input.len()
-            && (self.current().is_ascii_digit()
-                || self.current() == 'x'
-                || (self.current().is_ascii_hexdigit() && num_str.starts_with("0x")))
-        {
-            num_str.push(self.current());
-            self.step();
-        }
-        let val = if num_str.starts_with("0x") {
-            u64::from_str_radix(&num_str[2..], 16).unwrap_or(0)
-        } else {
-            num_str.parse::<u64>().unwrap_or(0)
-        };
-        Token::Number(val)
-    }
-
     fn read_number_or_float(&mut self) -> Token {
         let mut num_str = String::new();
         let mut is_float = false;
@@ -408,6 +390,7 @@ impl Lexer {
             "null" => Token::Null,
             "typedef" => Token::Typedef,
             "jmpto" => Token::Jmpto,
+            "packed" => Token::Packed,
             "u8" => Token::TypeU8,
             "u16" => Token::TypeU16,
             "u32" => Token::TypeU32,
