@@ -572,7 +572,9 @@ impl Parser {
 
         let cond = if self.current_token != Token::Semicolon {
             let e = self.parse_expr()?;
-            self.step();
+            if self.current_token == Token::Semicolon {
+                self.step();
+            }
             e
         } else {
             self.step();
@@ -1097,9 +1099,9 @@ impl Parser {
 
     fn get_tok_precedence(&self) -> Option<u8> {
         match self.current_token {
-            Token::OpMul | Token::OpDiv | Token::OpMod => Some(4),
-            Token::OpAdd | Token::OpSub => Some(5),
-            Token::OpShl | Token::OpShr => Some(5),
+            Token::OpMul | Token::OpDiv | Token::OpMod => Some(6), // was 4
+            Token::OpAdd | Token::OpSub => Some(5),                // was 5
+            Token::OpShl | Token::OpShr => Some(4),                // was 5, now lower than +/-
             Token::OpLt | Token::OpLtEq | Token::OpGt | Token::OpGtEq => Some(6),
             Token::OpEq | Token::OpNotEq => Some(7),
             Token::OpBitAnd => Some(8),

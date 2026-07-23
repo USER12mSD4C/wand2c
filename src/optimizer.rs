@@ -1042,7 +1042,7 @@ fn optimize_statements(
                 collect_assigned_expr(&cond, &mut loop_assigned);
 
                 let opt_init = if let Some(i) = init {
-                    let mut init_wrapper = vec![*i];
+                    let init_wrapper = vec![*i];
                     let mut opt_init_vec = optimize_statements(
                         init_wrapper,
                         consts,
@@ -1074,7 +1074,7 @@ fn optimize_statements(
                 *count += optimize_expr_recursive(&mut cond, consts, escaped);
 
                 let opt_post = if let Some(p) = post {
-                    let mut post_wrapper = vec![*p];
+                    let post_wrapper = vec![*p];
                     let mut opt_post_vec = optimize_statements(
                         post_wrapper,
                         consts,

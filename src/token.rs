@@ -76,6 +76,8 @@ pub enum Token {
     Semicolon, // ;
     Comma,     // ,
 
+    OpAddrOf, // унарный оператор adr (для *adr)
+
     //euo токены
     Enum,
     Union,

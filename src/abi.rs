@@ -381,14 +381,6 @@ pub fn generate_elf64_binary(
     }
 
     // Патчинг счетчиков в собранных секциях
-    if builder.deps_count > 0 {
-        let count_bytes = builder.deps_count.to_le_bytes();
-        builder.deps_section[0..4].copy_from_slice(&count_bytes);
-    }
-    if builder.exports_count > 0 {
-        let count_bytes = builder.exports_count.to_le_bytes();
-        builder.exports_section[0..4].copy_from_slice(&count_bytes);
-    }
     if builder.imports_count > 0 {
         let count_bytes = builder.imports_count.to_le_bytes();
         builder.imports_section[0..4].copy_from_slice(&count_bytes);
@@ -459,13 +451,15 @@ pub fn generate_elf64_binary(
 
     // Сборка заголовка .p46_header
     let mut p46_header = Vec::new();
-    p46_header.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]);
+
     p46_header.push(1);
-    p46_header.push(5);
+    p46_header.push(6);
     p46_header.push(0);
     p46_header.push(1);
     p46_header.push(8);
-    p46_header.extend_from_slice(&[0, 0, 0]);
+    p46_header.push(8);
+    p46_header.extend_from_slice(&[0, 0]);
+    p46_header.extend_from_slice(&0x01000000u32.to_le_bytes());
     p46_header.extend_from_slice(&5u32.to_le_bytes());
     p46_header.extend_from_slice(&(p46_strtab_offset as u32).to_le_bytes());
     p46_header.extend_from_slice(&(p46_strtab_size as u32).to_le_bytes());

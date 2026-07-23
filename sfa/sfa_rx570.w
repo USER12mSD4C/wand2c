@@ -33,14 +33,16 @@ fn sfa_peek_u8(u8* ptr, u64 offset) {
 }
 
 fn sfa_write_reg(u64 base, u32 offset, u32 value) {
-    u32* addr = (u32*)(base + offset);
-    u32 val*o = addr;
+    u64 addr = base + offset;
+    u32* ptr = (u32*)addr;
+    u32 val*o = ptr;
     val = value;
 }
 
 fn sfa_read_reg(u64 base, u32 offset) {
-    u32* addr = (u32*)(base + offset);
-    u32 val*i = addr;
+    u64 addr = base + offset;
+    u32* ptr = (u32*)addr;
+    u32 val*i = ptr;
     return(val);
 }
 
@@ -61,16 +63,16 @@ fn sfa_init_device(SfaDevice* dev, u32 is_hosted) {
 
     if (is_hosted == 1) {
         u8 path[64];
-        path[0] = 47;  // '/'
-        path[1] = 100; // 'd'
-        path[2] = 101; // 'e'
-        path[3] = 118; // 'v'
-        path[4] = 47;  // '/'
-        path[5] = 100; // 'd'
-        path[6] = 114; // 'r'
-        path[7] = 105; // 'i'
-        path[8] = 47;  // '/'
-        path[9] = 114; // 'r'
+        path[0] = 47;   // '/'
+        path[1] = 100;  // 'd'
+        path[2] = 101;  // 'e'
+        path[3] = 118;  // 'v'
+        path[4] = 47;   // '/'
+        path[5] = 100;  // 'd'
+        path[6] = 114;  // 'r'
+        path[7] = 105;  // 'i'
+        path[8] = 47;   // '/'
+        path[9] = 114;  // 'r'
         path[10] = 101; // 'e'
         path[11] = 110; // 'n'
         path[12] = 100; // 'd'
@@ -82,7 +84,7 @@ fn sfa_init_device(SfaDevice* dev, u32 is_hosted) {
         path[18] = 56;  // '8'
         path[19] = 0;   // '\0'
 
-        dev->fd = sys_open(path*adr, 2, 0); // O_RDWR
+        dev->fd = sys_open(path*adr, 2, 0);
         dev->mmio_base = mloc(null, 4096);
         dev->vram_base = mloc(null, 65536);
         dev->gart_base = mloc(null, 65536);
@@ -93,7 +95,7 @@ fn sfa_init_device(SfaDevice* dev, u32 is_hosted) {
         dev->gart_base = 0;
     }
 
-    dev->device_id = 26591; // ID Polaris 20 XL (RX 570 - 0x67DF)
+    dev->device_id = 26591;
 }
 
 fn sfa_create_queue(SfaDevice* dev, SfaQueue* q, u32 ring_size) {
@@ -130,7 +132,6 @@ fn sfa_ring_write(SfaQueue* q, u32 dword) {
 }
 
 fn make_pm4_header(u32 opcode, u32 body_count) {
-    // Используем встроенные в язык битовые сдвиги и ИЛИ
     u32 header = (3 << 30) | (opcode << 16) | (1 << 8) | body_count;
     return(header);
 }
@@ -154,13 +155,14 @@ fn sfa_load_kernel(SfaDevice* dev, GpuKernel* kern, u8* raw_code, u32 code_size,
     u64 dev_code_ptr = sfa_alloc_vram(dev, code_size);
 
     u8* code_out_ptr = (u8*)dev_code_ptr;
-    u8 code_in*i = raw_code;
-    u8 code_out*o = code_out_ptr;
+    u8* code_in_ptr = raw_code;
 
     for (u32 i = 0; i < code_size; i = i + 1) {
-        code_out = code_in;
-        code_in = code_in + 1;
-        code_out*adr = code_out + 1;
+        u8 val*i = code_in_ptr;
+        u8 out*o = code_out_ptr;
+        out = val;
+        code_in_ptr = code_in_ptr + 1;
+        code_out_ptr = code_out_ptr + 1;
     }
 
     kern->code_ptr = dev_code_ptr;

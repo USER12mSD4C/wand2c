@@ -113,9 +113,10 @@ fn main() {
 
         match parser.parse_program() {
             Ok(parsed) => {
-                for func in &parsed.functions {
-                    function_sources
-                        .insert(func.name.clone(), (filename.clone(), source_code.clone()));
+                if program.functions.is_empty() && program.structs.is_empty() {
+                    program.use_os = parsed.use_os;
+                } else if program.use_os != parsed.use_os {
+                    eprintln!("\x1b[33;1mwarning\x1b[0m: conflicting sc.true/sc.false settings across files");
                 }
 
                 program.imports.extend(parsed.imports);

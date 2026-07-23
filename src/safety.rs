@@ -180,6 +180,31 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    fn mark_expr_as_freed(&mut self, expr: &Expr, line: usize) {
+        match expr {
+            Expr::Variable(name) => {
+                self.states
+                    .insert(name.clone(), VarState::Freed { freed_line: line });
+            }
+            Expr::Binary { left, right, .. } => {
+                self.mark_expr_as_freed(left, line);
+                self.mark_expr_as_freed(right, line);
+            }
+            Expr::Index { expr: base, .. } => {
+                self.mark_expr_as_freed(base, line);
+            }
+            Expr::MemberAccess { expr: base, .. } => {
+                self.mark_expr_as_freed(base, line);
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.mark_expr_as_freed(arg, line);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn analyze_statements(&mut self, stmts: &[Stmt], structs: &HashMap<String, StructDecl>) {
         for (idx, stmt) in stmts.iter().enumerate() {
             let current_line = idx + 1;
@@ -379,6 +404,8 @@ impl MemorySafetyAnalyzer {
                                             freed_line: current_line,
                                         },
                                     );
+                                } else {
+                                    self.mark_expr_as_freed(arg, current_line);
                                 }
                             }
                         }
@@ -528,54 +555,79 @@ impl MemorySafetyAnalyzer {
         branch_a: HashMap<String, VarState>,
         branch_b: HashMap<String, VarState>,
     ) {
-        for (name, state_a) in branch_a {
-            if let Some(state_b) = branch_b.get(&name) {
-                if state_a == *state_b {
-                    self.states.insert(name, state_a);
-                } else {
-                    match (&state_a, state_b) {
-                        (VarState::Freed { freed_line }, _) => {
-                            self.states.insert(
-                                name,
-                                VarState::Freed {
-                                    freed_line: *freed_line,
-                                },
-                            );
-                        }
-                        (_, VarState::Freed { freed_line }) => {
-                            self.states.insert(
-                                name,
-                                VarState::Freed {
-                                    freed_line: *freed_line,
-                                },
-                            );
-                        }
-                        (
-                            VarState::Allocated {
-                                allocated_line,
-                                checked_not_null: true,
-                                type_name,
-                            },
-                            VarState::Allocated {
-                                checked_not_null: false,
-                                ..
-                            },
-                        ) => {
-                            // Консервативно: если хоть в одной ветке не проверено — считаем непроверенным
-                            self.states.insert(
-                                name,
+        // Collect all keys from both branches
+        let all_keys: std::collections::HashSet<String> =
+            branch_a.keys().chain(branch_b.keys()).cloned().collect();
+
+        for name in all_keys {
+            match (branch_a.get(&name), branch_b.get(&name)) {
+                (Some(state_a), Some(state_b)) => {
+                    if state_a == state_b {
+                        self.states.insert(name, state_a.clone());
+                    } else {
+                        match (state_a, state_b) {
+                            (VarState::Freed { .. }, _) | (_, VarState::Freed { .. }) => {
+                                // If freed in either branch, conservatively mark as Freed
+                                // (use the earlier freed_line)
+                                let freed_line = match state_a {
+                                    VarState::Freed { freed_line } => *freed_line,
+                                    _ => match state_b {
+                                        VarState::Freed { freed_line } => *freed_line,
+                                        _ => 0,
+                                    },
+                                };
+                                self.states.insert(name, VarState::Freed { freed_line });
+                            }
+                            (
                                 VarState::Allocated {
-                                    allocated_line: *allocated_line,
-                                    checked_not_null: false,
-                                    type_name: type_name.clone(),
+                                    allocated_line,
+                                    checked_not_null: true,
+                                    type_name,
                                 },
-                            );
+                                VarState::Allocated {
+                                    checked_not_null: false,
+                                    ..
+                                },
+                            )
+                            | (
+                                VarState::Allocated {
+                                    checked_not_null: false,
+                                    ..
+                                },
+                                VarState::Allocated {
+                                    allocated_line,
+                                    checked_not_null: true,
+                                    type_name,
+                                },
+                            ) => {
+                                self.states.insert(
+                                    name,
+                                    VarState::Allocated {
+                                        allocated_line: *allocated_line,
+                                        checked_not_null: false, // conservative
+                                        type_name: type_name.clone(),
+                                    },
+                                );
+                            }
+                            _ => {
+                                self.states.insert(name, VarState::Safe);
+                            }
+                        }
+                    }
+                }
+                (Some(state), None) | (None, Some(state)) => {
+                    // Key exists only in one branch — conservatively mark as Safe
+                    // (or keep the state if it's Freed)
+                    match state {
+                        VarState::Freed { .. } => {
+                            self.states.insert(name, state.clone());
                         }
                         _ => {
                             self.states.insert(name, VarState::Safe);
                         }
                     }
                 }
+                (None, None) => unreachable!(),
             }
         }
     }

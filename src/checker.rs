@@ -39,7 +39,7 @@ impl TypeChecker {
         let s = self
             .structs
             .get(struct_name)
-            .ok_ok_or_else(|| format!("Struct {} not defined", struct_name))?;
+            .ok_or_else(|| format!("Struct {} not defined", struct_name))?;
 
         let mut offsets = Vec::new();
 
@@ -222,22 +222,5 @@ impl TypeChecker {
             _ => {}
         }
         Ok(())
-    }
-}
-
-trait OkOr {
-    type Value;
-    fn ok_ok_or_else<F, E>(self, f: F) -> Result<Self::Value, E>
-    where
-        F: FnOnce() -> E;
-}
-
-impl<T> OkOr for Option<T> {
-    type Value = T;
-    fn ok_ok_or_else<F, E>(self, f: F) -> Result<Self::Value, E>
-    where
-        F: FnOnce() -> E,
-    {
-        self.ok_or_else(f)
     }
 }

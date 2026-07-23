@@ -139,6 +139,19 @@ impl Lexer {
             }
         }
 
+        if ch == '*' && self.peek(1) == 'a' && self.peek(2) == 'd' && self.peek(3) == 'r' {
+            if !self.peek(4).is_alphanumeric() {
+                self.step_by(4);
+                let span = Span {
+                    line: start_line,
+                    col: start_col,
+                    start: start_pos,
+                    end: self.pos,
+                };
+                return (Token::OpAddrOf, span);
+            }
+        }
+
         if ch.is_alphabetic() || ch == '_' {
             let tok = self.read_identifier_or_modifier();
             let span = Span {
@@ -311,30 +324,35 @@ impl Lexer {
     fn read_number_or_float(&mut self) -> Token {
         let mut num_str = String::new();
         let mut is_float = false;
+
+        if self.current() == '0' && (self.peek(1) == 'x' || self.peek(1) == 'X') {
+            num_str.push(self.current()); // '0'
+            self.step();
+            num_str.push(self.current()); // 'x' or 'X'
+            self.step();
+            while self.pos < self.input.len() && self.current().is_ascii_hexdigit() {
+                num_str.push(self.current());
+                self.step();
+            }
+            let val = u64::from_str_radix(&num_str[2..], 16).unwrap_or(0);
+            return Token::Number(val);
+        }
+
         while self.pos < self.input.len()
             && (self.current().is_ascii_digit()
-                || self.current() == '.'
-                || self.current() == 'x'
-                || (self.current().is_ascii_hexdigit() && num_str.starts_with("0x")))
+                || (self.current() == '.' && self.peek(1).is_ascii_digit()))
         {
             if self.current() == '.' {
-                if self.peek(1).is_ascii_digit() {
-                    is_float = true;
-                } else {
-                    break; // Это точка доступа к полю (например, struct.field), а не дробная часть
-                }
+                is_float = true;
             }
             num_str.push(self.current());
             self.step();
         }
+
         if is_float {
             Token::FloatLiteral(num_str)
         } else {
-            let val = if num_str.starts_with("0x") {
-                u64::from_str_radix(&num_str[2..], 16).unwrap_or(0)
-            } else {
-                num_str.parse::<u64>().unwrap_or(0)
-            };
+            let val = num_str.parse::<u64>().unwrap_or(0);
             Token::Number(val)
         }
     }
@@ -360,15 +378,17 @@ impl Lexer {
         }
 
         if self.current() == '*' {
+            if self.peek_str(1, "adr") && !self.peek(4).is_alphanumeric() {
+                self.pos += 4; // * + a + d + r
+                return Token::AddrOf(name);
+            }
             if self.peek(1) == 'i' && !self.peek(2).is_alphanumeric() {
                 self.pos += 2;
                 return Token::PtrInputModifier(name);
-            } else if self.peek(1) == 'o' && !self.peek(2).is_alphanumeric() {
+            }
+            if self.peek(1) == 'o' && !self.peek(2).is_alphanumeric() {
                 self.pos += 2;
                 return Token::PtrOutputModifier(name);
-            } else if self.peek_str(1, "adr") && !self.peek(4).is_alphanumeric() {
-                self.pos += 4;
-                return Token::AddrOf(name);
             }
         }
 
@@ -401,6 +421,13 @@ impl Lexer {
             "i64" => Token::TypeI64,
             "f64" => Token::TypeF64,
             "void" => Token::TypeVoid,
+            "adr" => {
+                if !self.current().is_alphanumeric() && self.current() != '_' {
+                    Token::OpAddrOf
+                } else {
+                    Token::Ident(name)
+                }
+            }
             _ => Token::Ident(name),
         }
     }
