@@ -1099,16 +1099,16 @@ impl Parser {
 
     fn get_tok_precedence(&self) -> Option<u8> {
         match self.current_token {
-            Token::OpMul | Token::OpDiv | Token::OpMod => Some(6), // was 4
-            Token::OpAdd | Token::OpSub => Some(5),                // was 5
-            Token::OpShl | Token::OpShr => Some(4),                // was 5, now lower than +/-
-            Token::OpLt | Token::OpLtEq | Token::OpGt | Token::OpGtEq => Some(6),
-            Token::OpEq | Token::OpNotEq => Some(7),
-            Token::OpBitAnd => Some(8),
-            Token::OpBitXor => Some(9),
-            Token::OpBitOr => Some(10),
-            Token::OpAnd => Some(11),
-            Token::OpOr => Some(12),
+            Token::OpMul | Token::OpDiv | Token::OpMod => Some(10),
+            Token::OpAdd | Token::OpSub => Some(9),
+            Token::OpShl | Token::OpShr => Some(8),
+            Token::OpLt | Token::OpLtEq | Token::OpGt | Token::OpGtEq => Some(7),
+            Token::OpEq | Token::OpNotEq => Some(6),
+            Token::OpBitAnd => Some(5),
+            Token::OpBitXor => Some(4),
+            Token::OpBitOr => Some(3),
+            Token::OpAnd => Some(2),
+            Token::OpOr => Some(1),
             _ => None,
         }
     }

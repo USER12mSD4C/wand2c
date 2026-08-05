@@ -2,7 +2,7 @@
 
 `wand2c` is a compiler for the Wand systems programming language, tailored for operating systems, device drivers, and bare-metal application development.
 
-The compiler translates WandC source code directly into native x86_64 machine code and packages it into ELF64 executables. The generated binaries conform to the **Standard 4/6 Binary Interface Specification (v1.5.0)**, embedding type layouts, exports, imports, and reflection metadata directly within custom ELF Section Header Table (SHT) sections.
+The compiler translates WandC source code directly into native x86_64 machine code and packages it into ELF64 executables. The generated binaries conform to the **Standard 4/6 Binary Interface Specification (v1.6.0)**, embedding type layouts, exports, imports, and reflection metadata directly within custom ELF Section Header Table (SHT) sections.
 
 ---
 

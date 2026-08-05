@@ -736,16 +736,14 @@ impl NativeGenerator {
             }
         }
 
-        self.code.push(0x5B);
-
         let final_stack_size = (self.next_offset + 15) & !15;
         let bytes = final_stack_size.to_le_bytes();
         self.code[sub_rsp_offset + 3] = bytes[0];
         self.code[sub_rsp_offset + 4] = bytes[1];
         self.code[sub_rsp_offset + 5] = bytes[2];
         self.code[sub_rsp_offset + 6] = bytes[3];
-
-        self.code.extend_from_slice(&[0x48, 0x89, 0xEC]);
+        self.code.extend_from_slice(&[0x48, 0x8D, 0x65, 0xF8]);
+        self.code.push(0x5B);
         self.code.push(0x5D);
         self.code.push(0xC3);
     }
@@ -1822,12 +1820,12 @@ impl NativeGenerator {
                         self.code.extend_from_slice(&[0x48, 0x39, 0xD8]); // cmp rax, rbx
 
                         match op.as_str() {
-                            "OpEq" | "OpEqEq" | "==" => 0x85,
-                            "OpNotEq" | "OpNe" | "!=" => 0x85,
-                            "OpLt" | "Lt" | "<" => 0x8C,
-                            "OpLtEq" | "OpLe" | "<=" => 0x8E,
-                            "OpGt" | "Gt" | ">" => 0x8F,
-                            "OpGtEq" | "OpGe" | ">=" => 0x8D,
+                            "OpEq" | "OpEqEq" | "==" => 0x85,  // jne  : skip if a != b
+                            "OpNotEq" | "OpNe" | "!=" => 0x84, // je   : skip if a == b
+                            "OpLt" | "Lt" | "<" => 0x8D,       // jge  : skip if a >= b
+                            "OpLtEq" | "OpLe" | "<=" => 0x8F,  // jg   : skip if a > b
+                            "OpGt" | "Gt" | ">" => 0x8E,       // jle  : skip if a <= b
+                            "OpGtEq" | "OpGe" | ">=" => 0x8C,  // jl   : skip if a < b
                             _ => 0x84,
                         }
                     }
@@ -1857,12 +1855,10 @@ impl NativeGenerator {
                     .get(name)
                     .cloned()
                     .unwrap_or(PtrAccess::Normal);
-
                 if modifier == PtrAccess::Output {
                     if let Some(&offset) = self.local_offsets.get(name) {
                         self.emit_mem_load(3, offset, 8);
                     }
-
                     let elem_size = if let Some(dt) = self.local_types.get(name) {
                         match dt {
                             DataType::Pointer(inner) => self.get_type_size_internal(inner),
@@ -1871,7 +1867,6 @@ impl NativeGenerator {
                     } else {
                         8
                     };
-
                     match elem_size {
                         1 => self.code.extend_from_slice(&[0x88, 0x03]),
                         2 => self.code.extend_from_slice(&[0x66, 0x89, 0x03]),
@@ -1934,8 +1929,20 @@ impl NativeGenerator {
                 let patch_pos = self.code.len();
                 self.code.extend_from_slice(&[0; 8]);
                 self.address_patches.push((patch_pos, key));
-
                 self.code.extend_from_slice(&[0x48, 0x89, 0x03]);
+            }
+            Expr::Index { .. } | Expr::MemberAccess { .. } => {
+                // rax holds the value. Save it, compute target address into rbx, restore, store.
+                self.code.push(0x50); // push rax
+                self.compile_address(target, 3); // rbx = &target
+                self.code.push(0x58); // pop rax
+                let size = self.get_expr_type_size(target);
+                match size {
+                    1 => self.code.extend_from_slice(&[0x88, 0x03]), // mov [rbx], al
+                    2 => self.code.extend_from_slice(&[0x66, 0x89, 0x03]), // mov [rbx], ax
+                    4 => self.code.extend_from_slice(&[0x89, 0x03]), // mov [rbx], eax
+                    _ => self.code.extend_from_slice(&[0x48, 0x89, 0x03]), // mov [rbx], rax
+                }
             }
             _ => {}
         }
