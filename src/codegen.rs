@@ -445,6 +445,7 @@ impl NativeGenerator {
     fn is_float_expr(&self, expr: &Expr) -> bool {
         match expr {
             Expr::FloatLit(_) => true,
+            Expr::SignedNumber(_) => false,
             Expr::Variable(name) => {
                 if let Some(dt) = self.local_types.get(name) {
                     matches!(dt, DataType::F64)
@@ -457,6 +458,38 @@ impl NativeGenerator {
             }
             Expr::Call { name, .. } => {
                 matches!(name.as_str(), "sin" | "cos" | "tan" | "sqrt")
+            }
+            _ => false,
+        }
+    }
+
+    fn is_signed_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::SignedNumber(_) => true,
+            Expr::Variable(name) => {
+                if let Some(dt) = self.local_types.get(name) {
+                    matches!(
+                        dt,
+                        DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64
+                    )
+                } else {
+                    false
+                }
+            }
+            Expr::Number(n) => *n > 0x7FFFFFFFFFFFFFFF,
+            Expr::Binary { left, right, .. } => {
+                self.is_signed_expr(left) || self.is_signed_expr(right)
+            }
+            Expr::Call { name, .. } => {
+                if let Some(types) = self.function_signatures.get(name) {
+                    !types.is_empty()
+                        && matches!(
+                            types[0],
+                            DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64
+                        )
+                } else {
+                    false
+                }
             }
             _ => false,
         }
@@ -674,6 +707,35 @@ impl NativeGenerator {
         }
     }
 
+    fn has_return_statement(stmts: &[Stmt]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(_) => return true,
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    if Self::has_return_statement(then_branch) {
+                        return true;
+                    }
+                    if let Some(else_stmts) = else_branch {
+                        if Self::has_return_statement(else_stmts) {
+                            return true;
+                        }
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    if Self::has_return_statement(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn compile_function(&mut self, func: &FuncDecl) {
         self.local_offsets.clear();
         self.local_access.clear();
@@ -730,11 +792,14 @@ impl NativeGenerator {
             }
         }
 
-        if let Some(body) = &func.body {
+        let has_explicit_return = if let Some(body) = &func.body {
             for stmt in body {
                 self.compile_stmt(stmt);
             }
-        }
+            Self::has_return_statement(body)
+        } else {
+            false
+        };
 
         let final_stack_size = (self.next_offset + 15) & !15;
         let bytes = final_stack_size.to_le_bytes();
@@ -742,10 +807,13 @@ impl NativeGenerator {
         self.code[sub_rsp_offset + 4] = bytes[1];
         self.code[sub_rsp_offset + 5] = bytes[2];
         self.code[sub_rsp_offset + 6] = bytes[3];
-        self.code.extend_from_slice(&[0x48, 0x8D, 0x65, 0xF8]);
-        self.code.push(0x5B);
-        self.code.push(0x5D);
-        self.code.push(0xC3);
+
+        if !has_explicit_return {
+            self.code.extend_from_slice(&[0x48, 0x8D, 0x65, 0xF8]);
+            self.code.push(0x5B);
+            self.code.push(0x5D);
+            self.code.push(0xC3);
+        }
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
@@ -1015,7 +1083,8 @@ impl NativeGenerator {
                     self.compile_expr(expr, 0, true);
                     self.code.extend_from_slice(&[0x49, 0x89, 0xC0]);
                 }
-                self.code.extend_from_slice(&[0x48, 0x89, 0xEC]);
+                self.code.extend_from_slice(&[0x48, 0x8D, 0x65, 0xF8]);
+                self.code.push(0x5B);
                 self.code.push(0x5D);
                 self.code.push(0xC3);
             }
@@ -1117,6 +1186,12 @@ impl NativeGenerator {
         match expr {
             Expr::Number(n) => {
                 let val = *n;
+                let opcode = 0xB8 + reg;
+                self.code.extend_from_slice(&[0x48, opcode]);
+                self.code.extend_from_slice(&val.to_le_bytes());
+            }
+            Expr::SignedNumber(n) => {
+                let val = *n as u64;
                 let opcode = 0xB8 + reg;
                 self.code.extend_from_slice(&[0x48, opcode]);
                 self.code.extend_from_slice(&val.to_le_bytes());
@@ -1350,6 +1425,8 @@ impl NativeGenerator {
                                 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x66, 0x48, 0x0F, 0x6E, 0xCB, 0xF2,
                                 0x0F, 0x5E, 0xC1, 0x66, 0x48, 0x0F, 0x7E, 0xC0,
                             ]);
+                        } else if self.is_signed_expr(left) || self.is_signed_expr(right) {
+                            self.code.extend_from_slice(&[0x48, 0x99, 0x48, 0xF7, 0xFB]);
                         } else {
                             self.code
                                 .extend_from_slice(&[0x48, 0x31, 0xD2, 0x48, 0xF7, 0xF3]);
@@ -1374,8 +1451,13 @@ impl NativeGenerator {
                             .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xE0]);
                     }
                     "OpShr" => {
-                        self.code
-                            .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xE8]);
+                        if self.is_signed_expr(left) {
+                            self.code
+                                .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xF8]);
+                        } else {
+                            self.code
+                                .extend_from_slice(&[0x48, 0x89, 0xD9, 0x48, 0xD3, 0xE8]);
+                        }
                     }
                     _ => {}
                 }
@@ -1596,6 +1678,7 @@ impl NativeGenerator {
             match expr {
                 Expr::Variable(_)
                 | Expr::Number(_)
+                | Expr::SignedNumber(_)
                 | Expr::StringLit(_)
                 | Expr::AddrOf(_)
                 | Expr::FloatLit(_) => {}
@@ -1776,59 +1859,37 @@ impl NativeGenerator {
         match cond {
             Expr::Binary { left, op, right } => {
                 match op.as_str() {
-                    "OpAnd" | "&&" => {
-                        // Short-circuit AND: if left is false, jump to false
-                        self.compile_expr(left, 0, true);
-                        self.code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-                        self.code.push(0x0F);
-                        self.code.push(0x84); // jz
-                        let left_false_patch = self.code.len();
-                        self.code.extend_from_slice(&[0; 4]);
-
-                        self.compile_expr(right, 0, true);
-                        self.code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-
-                        // Patch left false jump to here
-                        let offset = (self.code.len() - (left_false_patch + 4)) as i32;
-                        self.patch_address(left_false_patch, offset);
-
-                        0x84 // jz (jump if zero = false)
-                    }
-                    "OpOr" | "||" => {
-                        self.compile_expr(left, 0, true);
-                        self.code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-                        self.code.push(0x0F);
-                        self.code.push(0x85); // jnz
-                        let left_true_patch = self.code.len();
-                        self.code.extend_from_slice(&[0; 4]);
-
-                        self.compile_expr(right, 0, true);
-                        self.code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-
-                        // Patch left true jump to here
-                        let offset = (self.code.len() - (left_true_patch + 4)) as i32;
-                        self.patch_address(left_true_patch, offset);
-
-                        0x84 // jz (jump if zero = false)
-                    }
-                    _ => {
-                        self.compile_expr(left, 0, true);
-                        self.code.push(0x50); // push rax
-                        self.compile_expr(right, 0, true);
-                        self.code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
-                        self.code.push(0x58); // pop rax
-                        self.code.extend_from_slice(&[0x48, 0x39, 0xD8]); // cmp rax, rbx
-
-                        match op.as_str() {
-                            "OpEq" | "OpEqEq" | "==" => 0x85,  // jne  : skip if a != b
-                            "OpNotEq" | "OpNe" | "!=" => 0x84, // je   : skip if a == b
-                            "OpLt" | "Lt" | "<" => 0x8D,       // jge  : skip if a >= b
-                            "OpLtEq" | "OpLe" | "<=" => 0x8F,  // jg   : skip if a > b
-                            "OpGt" | "Gt" | ">" => 0x8E,       // jle  : skip if a <= b
-                            "OpGtEq" | "OpGe" | ">=" => 0x8C,  // jl   : skip if a < b
-                            _ => 0x84,
+                    "OpEq" | "OpEqEq" | "==" => 0x85,  // jne
+                    "OpNotEq" | "OpNe" | "!=" => 0x84, // je
+                    "OpLt" | "Lt" | "<" => {
+                        if self.is_signed_expr(left) || self.is_signed_expr(right) {
+                            0x8D // jge (signed)
+                        } else {
+                            0x83 // jae (unsigned)
                         }
                     }
+                    "OpLtEq" | "OpLe" | "<=" => {
+                        if self.is_signed_expr(left) || self.is_signed_expr(right) {
+                            0x8F // jg (signed)
+                        } else {
+                            0x87 // ja (unsigned)
+                        }
+                    }
+                    "OpGt" | "Gt" | ">" => {
+                        if self.is_signed_expr(left) || self.is_signed_expr(right) {
+                            0x8E // jle (signed)
+                        } else {
+                            0x86 // jbe (unsigned)
+                        }
+                    }
+                    "OpGtEq" | "OpGe" | ">=" => {
+                        if self.is_signed_expr(left) || self.is_signed_expr(right) {
+                            0x8C // jl (signed)
+                        } else {
+                            0x82 // jb (unsigned)
+                        }
+                    }
+                    _ => 0x84,
                 }
             }
             _ => {

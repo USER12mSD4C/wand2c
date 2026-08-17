@@ -951,15 +951,24 @@ impl Parser {
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
         match &self.current_token {
-            // Поддержка унарного минуса: преобразуем `-expr` в `0 - expr`
             Token::OpSub => {
-                self.step(); // Потребляем '-'
+                self.step();
                 let expr = self.parse_primary_expr()?;
-                Ok(Expr::Binary {
-                    left: Box::new(Expr::Number(0)),
-                    op: "OpSub".to_string(),
-                    right: Box::new(expr),
-                })
+                match expr {
+                    Expr::Number(n) => Ok(Expr::SignedNumber(-(n as i64))),
+                    Expr::FloatLit(s) => {
+                        if s.starts_with('-') {
+                            Ok(Expr::FloatLit(s[1..].to_string()))
+                        } else {
+                            Ok(Expr::FloatLit(format!("-{}", s)))
+                        }
+                    }
+                    _ => Ok(Expr::Binary {
+                        left: Box::new(Expr::Number(0)),
+                        op: "OpSub".to_string(),
+                        right: Box::new(expr),
+                    }),
+                }
             }
             Token::OpBitNot => {
                 self.step();

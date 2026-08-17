@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 use crate::ast::{DataType, Program};
 use crate::codegen::NativeGenerator;
 use std::collections::HashMap;
@@ -13,6 +12,11 @@ pub const P46_SECTION_DEPENDENCIES: u32 = 5;
 pub const P46_EXPORT_KIND_FUNCTION: u8 = 1;
 pub const P46_EXPORT_KIND_VARIABLE: u8 = 2;
 pub const P46_EXPORT_KIND_TYPE: u8 = 3;
+
+pub const HEADER_SIZE: usize = 36;
+pub const SECTION_DESC_SIZE: usize = 20;
+pub const ADDRESS_SIZE: u8 = 8;
+pub const POINTER_SIZE: u8 = 8;
 
 pub struct Strtab {
     data: Vec<u8>,
@@ -54,6 +58,7 @@ pub struct BinaryBuilder {
     pub deps_count: u32,
     pub reflect_section: Vec<u8>,
     pub reflect_count: u32,
+    pub address_size: u8,
 }
 
 impl BinaryBuilder {
@@ -69,10 +74,11 @@ impl BinaryBuilder {
             deps_count: 0,
             reflect_section: Vec::new(),
             reflect_count: 0,
+            address_size: ADDRESS_SIZE,
         }
     }
 
-    pub fn add_dependency(&mut self, name: &str, major: u32, minor: u32) {
+    pub fn add_dependency(&mut self, name: &str, major: u32, minor: u32, patch: u32, build: u32) {
         if self.deps_count == 0 {
             self.deps_section.extend_from_slice(&0u32.to_le_bytes());
         }
@@ -81,8 +87,8 @@ impl BinaryBuilder {
             .extend_from_slice(&name_offset.to_le_bytes());
         self.deps_section.extend_from_slice(&major.to_le_bytes());
         self.deps_section.extend_from_slice(&minor.to_le_bytes());
-        self.deps_section.extend_from_slice(&0u32.to_le_bytes()); // patch
-        self.deps_section.extend_from_slice(&0u32.to_le_bytes()); // build
+        self.deps_section.extend_from_slice(&patch.to_le_bytes());
+        self.deps_section.extend_from_slice(&build.to_le_bytes());
         self.deps_count += 1;
     }
 
@@ -91,6 +97,15 @@ impl BinaryBuilder {
         self.types_section
             .extend_from_slice(&(payload.len() as u32).to_le_bytes());
         self.types_section.extend_from_slice(payload);
+    }
+
+    fn write_address(address_size: u8, buf: &mut Vec<u8>, address: u64) {
+        match address_size {
+            1 => buf.push(address as u8),
+            2 => buf.extend_from_slice(&(address as u16).to_le_bytes()),
+            4 => buf.extend_from_slice(&(address as u32).to_le_bytes()),
+            _ => buf.extend_from_slice(&address.to_le_bytes()),
+        }
     }
 
     pub fn add_export(
@@ -109,7 +124,6 @@ impl BinaryBuilder {
         }
         let name_offset = self.strtab.insert(name);
         let mod_offset = self.strtab.insert(module_name);
-
         self.exports_section
             .extend_from_slice(&name_offset.to_le_bytes());
         self.exports_section
@@ -117,11 +131,9 @@ impl BinaryBuilder {
         self.exports_section
             .extend_from_slice(&version.to_le_bytes());
         self.exports_section.push(kind);
-        self.exports_section
-            .extend_from_slice(&address.to_le_bytes());
+        Self::write_address(self.address_size, &mut self.exports_section, address);
         self.exports_section
             .extend_from_slice(&type_id.to_le_bytes());
-
         if kind == P46_EXPORT_KIND_FUNCTION {
             self.exports_section
                 .extend_from_slice(&(param_types.len() as u32).to_le_bytes());
@@ -132,8 +144,8 @@ impl BinaryBuilder {
                     .extend_from_slice(&p_type.to_le_bytes());
             }
         } else {
-            self.exports_section.extend_from_slice(&0u32.to_le_bytes()); // param_count
-            self.exports_section.extend_from_slice(&0u32.to_le_bytes()); // return_type
+            self.exports_section.extend_from_slice(&0u32.to_le_bytes());
+            self.exports_section.extend_from_slice(&0u32.to_le_bytes());
         }
         self.exports_count += 1;
     }
@@ -150,7 +162,6 @@ impl BinaryBuilder {
         }
         let name_offset = self.strtab.insert(name);
         let mod_offset = self.strtab.insert(module_name);
-
         self.imports_section
             .extend_from_slice(&name_offset.to_le_bytes());
         self.imports_section
@@ -173,7 +184,6 @@ impl BinaryBuilder {
             self.reflect_section.extend_from_slice(&0u32.to_le_bytes());
         }
         let name_offset = self.strtab.insert(qualified_name);
-
         self.reflect_section
             .extend_from_slice(&name_offset.to_le_bytes());
         self.reflect_section.push(target_kind);
@@ -184,91 +194,104 @@ impl BinaryBuilder {
         self.reflect_count += 1;
     }
 
-    pub fn build_binary_image(&mut self) -> Vec<u8> {
+    fn patch_section_counts(&mut self) {
         if self.deps_count > 0 {
-            let count_bytes = self.deps_count.to_le_bytes();
-            self.deps_section[0..4].copy_from_slice(&count_bytes);
+            self.deps_section[0..4].copy_from_slice(&self.deps_count.to_le_bytes());
         }
         if self.exports_count > 0 {
-            let count_bytes = self.exports_count.to_le_bytes();
-            self.exports_section[0..4].copy_from_slice(&count_bytes);
+            self.exports_section[0..4].copy_from_slice(&self.exports_count.to_le_bytes());
         }
         if self.imports_count > 0 {
-            let count_bytes = self.imports_count.to_le_bytes();
-            self.imports_section[0..4].copy_from_slice(&count_bytes);
+            self.imports_section[0..4].copy_from_slice(&self.imports_count.to_le_bytes());
         }
-        if self.reflect_count > 0 {
-            let count_bytes = self.reflect_count.to_le_bytes();
-            self.reflect_section[0..4].copy_from_slice(&count_bytes);
+        if self.reflect_count == 0 {
+            self.reflect_section.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            self.reflect_section[0..4].copy_from_slice(&self.reflect_count.to_le_bytes());
         }
+    }
+
+    fn build_header_and_descriptors(&self, sections_start: u64) -> (Vec<u8>, Vec<u64>, Vec<u64>) {
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+
+        header.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]);
+        header.push(1);
+        header.push(6);
+        header.push(0);
+        header.push(1);
+        header.push(POINTER_SIZE);
+        header.push(self.address_size);
+        header.extend_from_slice(&[0, 0]);
+        header.extend_from_slice(&0x01000000u32.to_le_bytes());
+        header.extend_from_slice(&5u32.to_le_bytes());
+
+        let header_end = sections_start;
+        let types_offset = header_end;
+        let types_size = self.types_section.len() as u64;
+        let exports_offset = types_offset + types_size;
+        let exports_size = self.exports_section.len() as u64;
+        let reflect_offset = exports_offset + exports_size;
+        let reflect_size = self.reflect_section.len() as u64;
+        let imports_offset = reflect_offset + reflect_size;
+        let imports_size = self.imports_section.len() as u64;
+        let deps_offset = imports_offset + imports_size;
+        let deps_size = self.deps_section.len() as u64;
+        let strtab_offset = deps_offset + deps_size;
+        let strtab_size = self.strtab.as_bytes().len() as u64;
+
+        header.extend_from_slice(&strtab_offset.to_le_bytes());
+        header.extend_from_slice(&strtab_size.to_le_bytes());
+
+        let offsets = vec![
+            types_offset,
+            exports_offset,
+            reflect_offset,
+            imports_offset,
+            deps_offset,
+        ];
+        let sizes = vec![
+            types_size,
+            exports_size,
+            reflect_size,
+            imports_size,
+            deps_size,
+        ];
+
+        let section_types = [
+            P46_SECTION_TYPES,
+            P46_SECTION_EXPORTS,
+            P46_SECTION_REFLECT,
+            P46_SECTION_IMPORTS,
+            P46_SECTION_DEPENDENCIES,
+        ];
+
+        for i in 0..5 {
+            header.extend_from_slice(&offsets[i].to_le_bytes());
+            header.extend_from_slice(&sizes[i].to_le_bytes());
+            header.extend_from_slice(&section_types[i].to_le_bytes());
+        }
+
+        (header, offsets, sizes)
+    }
+
+    pub fn build_binary_image(&mut self) -> Vec<u8> {
+        self.patch_section_counts();
+
+        let sections_start = HEADER_SIZE as u64 + (SECTION_DESC_SIZE as u64 * 5);
+        let (header, _offsets, _sizes) = self.build_header_and_descriptors(sections_start);
 
         let mut image = Vec::new();
-
-        let header_size = 24;
-        let section_desc_size = 12 * 5;
-        let sections_start = header_size + section_desc_size;
-
-        let types_offset = sections_start;
-        let types_size = self.types_section.len() as u32;
-
-        let exports_offset = types_offset + types_size;
-        let exports_size = self.exports_section.len() as u32;
-
-        let reflect_offset = exports_offset + exports_size;
-        let reflect_size = self.reflect_section.len() as u32;
-
-        let imports_offset = reflect_offset + reflect_size;
-        let imports_size = self.imports_section.len() as u32;
-
-        let deps_offset = imports_offset + imports_size;
-        let deps_size = self.deps_section.len() as u32;
-
-        let strtab_offset = deps_offset + deps_size;
-        let strtab_size = self.strtab.as_bytes().len() as u32;
-
-        image.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]); // magic
-        image.push(1); // format_major
-        image.push(5); // format_minor
-        image.push(0); // format_patch
-        image.push(1); // endianness (little-endian)
-        image.push(8); // pointer_size (64-bit)
-        image.extend_from_slice(&[0, 0, 0]); // reserved
-        image.extend_from_slice(&5u32.to_le_bytes()); // section_count: 5
-        image.extend_from_slice(&strtab_offset.to_le_bytes());
-        image.extend_from_slice(&strtab_size.to_le_bytes());
-
-        image.extend_from_slice(&types_offset.to_le_bytes());
-        image.extend_from_slice(&types_size.to_le_bytes());
-        image.extend_from_slice(&P46_SECTION_TYPES.to_le_bytes());
-
-        image.extend_from_slice(&exports_offset.to_le_bytes());
-        image.extend_from_slice(&exports_size.to_le_bytes());
-        image.extend_from_slice(&P46_SECTION_EXPORTS.to_le_bytes());
-
-        image.extend_from_slice(&reflect_offset.to_le_bytes());
-        image.extend_from_slice(&reflect_size.to_le_bytes());
-        image.extend_from_slice(&P46_SECTION_REFLECT.to_le_bytes());
-
-        image.extend_from_slice(&imports_offset.to_le_bytes());
-        image.extend_from_slice(&imports_size.to_le_bytes());
-        image.extend_from_slice(&P46_SECTION_IMPORTS.to_le_bytes());
-
-        image.extend_from_slice(&deps_offset.to_le_bytes());
-        image.extend_from_slice(&deps_size.to_le_bytes());
-        image.extend_from_slice(&P46_SECTION_DEPENDENCIES.to_le_bytes());
-
+        image.extend_from_slice(&header);
         image.extend_from_slice(&self.types_section);
         image.extend_from_slice(&self.exports_section);
         image.extend_from_slice(&self.reflect_section);
         image.extend_from_slice(&self.imports_section);
         image.extend_from_slice(&self.deps_section);
         image.extend_from_slice(self.strtab.as_bytes());
-
         image
     }
 }
 
-/// Централизованная генерация исполняемого файла ELF64 со всеми секциями Standard 4/6
 pub fn generate_elf64_binary(
     payload_bytes: &[u8],
     program: &Program,
@@ -276,71 +299,63 @@ pub fn generate_elf64_binary(
 ) -> Vec<u8> {
     let mut builder = BinaryBuilder::new();
 
-    // 1. Сборка секции зависимостей (.p46_deps)
     for imp in &program.imports {
-        builder.add_dependency(imp, 1, 0);
+        builder.add_dependency(imp, 1, 0, 0, 0);
     }
 
-    // 2. Сборка деклараций типов (.p46_types)
     for s in &program.structs {
         let name_off = builder.strtab.insert(&s.name);
-
         let mut fields_data = Vec::new();
         for field in &s.fields {
             let f_name_off = builder.strtab.insert(&field.name);
             fields_data.extend_from_slice(&f_name_off.to_le_bytes());
-
             let type_id = match &field.data_type {
-                DataType::U64 => 4u32,
-                DataType::U32 => 3u32,
-                DataType::F64 => 4u32,
+                DataType::U8 | DataType::I8 => 1u32,
+                DataType::U16 | DataType::I16 => 2u32,
+                DataType::U32 | DataType::I32 => 3u32,
+                DataType::U64 | DataType::I64 => 4u32,
+                DataType::F64 => 10u32,
+                DataType::Pointer(_) => 11u32,
                 DataType::Array(..) => 6u32,
                 DataType::Typedef(..) => 9u32,
-                _ => 11u32,
+                _ => 5u32,
             };
             fields_data.extend_from_slice(&type_id.to_le_bytes());
             fields_data.extend_from_slice(&0u32.to_le_bytes());
             fields_data.extend_from_slice(&field.version_added.to_le_bytes());
             fields_data.extend_from_slice(&field.version_removed.to_le_bytes());
         }
-
         let mut val = Vec::new();
         val.extend_from_slice(&name_off.to_le_bytes());
         val.extend_from_slice(&s.version.to_le_bytes());
         val.extend_from_slice(&16u32.to_le_bytes());
         val.extend_from_slice(&(s.fields.len() as u32).to_le_bytes());
         val.extend(fields_data);
-
-        builder.add_type_record(1, &val); // Struct ID
+        builder.add_type_record(1, &val);
     }
 
     for (name, dt) in &program.typedefs {
         let alias_off = builder.strtab.insert(name);
-
         let underlying_id = match dt {
             DataType::Array(..) => 6u32,
-            DataType::U64 => 4u32,
-            DataType::F64 => 4u32,
-            _ => 11u32,
+            DataType::U64 | DataType::I64 => 4u32,
+            DataType::U32 | DataType::I32 => 3u32,
+            DataType::F64 => 10u32,
+            _ => 5u32,
         };
-
         let mut val = Vec::new();
         val.extend_from_slice(&alias_off.to_le_bytes());
         val.extend_from_slice(&underlying_id.to_le_bytes());
-
-        builder.add_type_record(9, &val); // Typedef ID
+        builder.add_type_record(9, &val);
     }
 
-    // 3. Сборка таблицы экспорта (.p46_exports)
     for func in &program.functions {
         let local_offset = gen.function_offsets.get(&func.name).cloned().unwrap_or(0);
         let abs_addr = 0x400078u64 + (local_offset as u64);
-
         let mut param_types = Vec::new();
         for _ in &func.params {
             param_types.push(4u32);
         }
-
         builder.add_export(
             &func.name,
             "main_module",
@@ -353,7 +368,6 @@ pub fn generate_elf64_binary(
         );
     }
 
-    // 4. Сборка таблицы импорта (.p46_imports)
     let mut unresolved_calls = Vec::new();
     for (_, target_name) in &gen.call_patches {
         if !gen.function_offsets.contains_key(target_name) {
@@ -362,35 +376,17 @@ pub fn generate_elf64_binary(
             }
         }
     }
-
     let module_name = program
         .imports
         .first()
         .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
         .unwrap_or_else(|| "libc.ko".to_string());
-
     for name in &unresolved_calls {
         builder.add_import(name, &module_name, 1, 0);
     }
 
-    // Инициализация пустой секции рефлексии в случае отсутствия записей
-    if builder.reflect_count == 0 {
-        builder
-            .reflect_section
-            .extend_from_slice(&0u32.to_le_bytes());
-    }
+    builder.patch_section_counts();
 
-    // Патчинг счетчиков в собранных секциях
-    if builder.imports_count > 0 {
-        let count_bytes = builder.imports_count.to_le_bytes();
-        builder.imports_section[0..4].copy_from_slice(&count_bytes);
-    }
-    if builder.reflect_count > 0 {
-        let count_bytes = builder.reflect_count.to_le_bytes();
-        builder.reflect_section[0..4].copy_from_slice(&count_bytes);
-    }
-
-    // Извлечение байтов готовых секций
     let p46_types = &builder.types_section;
     let p46_exports = &builder.exports_section;
     let p46_reflect = &builder.reflect_section;
@@ -398,28 +394,22 @@ pub fn generate_elf64_binary(
     let p46_deps = &builder.deps_section;
     let p46_strtab = builder.strtab.as_bytes();
 
-    // 5. Расчет смещений в бинарном файле ELF64
     let text_offset = 120usize;
     let text_size = payload_bytes.len();
-
     let p46_hdr_offset = text_offset + text_size;
-    let p46_hdr_size = 24 + 12 * 5;
+    let p46_hdr_size = HEADER_SIZE + (SECTION_DESC_SIZE * 5);
 
-    let p46_types_offset = p46_hdr_offset + p46_hdr_size;
+    let sections_start = p46_hdr_offset + p46_hdr_size;
+    let p46_types_offset = sections_start;
     let p46_types_size = p46_types.len();
-
     let p46_exp_offset = p46_types_offset + p46_types_size;
     let p46_exp_size = p46_exports.len();
-
     let p46_refl_offset = p46_exp_offset + p46_exp_size;
     let p46_refl_size = p46_reflect.len();
-
     let p46_imp_offset = p46_refl_offset + p46_refl_size;
     let p46_imp_size = p46_imports.len();
-
     let p46_deps_offset = p46_imp_offset + p46_imp_size;
     let p46_deps_size = p46_deps.len();
-
     let p46_strtab_offset = p46_deps_offset + p46_deps_size;
     let p46_strtab_size = p46_strtab.len();
 
@@ -446,54 +436,57 @@ pub fn generate_elf64_binary(
 
     let shstrtab_offset = p46_strtab_offset + p46_strtab_size;
     let shstrtab_size = shstrtab.len();
-
     let sht_offset = shstrtab_offset + shstrtab_size;
 
-    // Сборка заголовка .p46_header
-    let mut p46_header = Vec::new();
-
+    let mut p46_header = Vec::with_capacity(p46_hdr_size);
+    p46_header.extend_from_slice(&[0x50, 0x34, 0x36, 0x00]);
     p46_header.push(1);
     p46_header.push(6);
     p46_header.push(0);
     p46_header.push(1);
-    p46_header.push(8);
-    p46_header.push(8);
+    p46_header.push(POINTER_SIZE);
+    p46_header.push(ADDRESS_SIZE);
     p46_header.extend_from_slice(&[0, 0]);
     p46_header.extend_from_slice(&0x01000000u32.to_le_bytes());
     p46_header.extend_from_slice(&5u32.to_le_bytes());
-    p46_header.extend_from_slice(&(p46_strtab_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_strtab_size as u32).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_strtab_offset as u64).to_le_bytes());
+    p46_header.extend_from_slice(&(p46_strtab_size as u64).to_le_bytes());
 
-    p46_header.extend_from_slice(&(p46_types_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_types_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&P46_SECTION_TYPES.to_le_bytes());
+    let section_offsets = [
+        p46_types_offset,
+        p46_exp_offset,
+        p46_refl_offset,
+        p46_imp_offset,
+        p46_deps_offset,
+    ];
+    let section_sizes = [
+        p46_types_size,
+        p46_exp_size,
+        p46_refl_size,
+        p46_imp_size,
+        p46_deps_size,
+    ];
+    let section_types = [
+        P46_SECTION_TYPES,
+        P46_SECTION_EXPORTS,
+        P46_SECTION_REFLECT,
+        P46_SECTION_IMPORTS,
+        P46_SECTION_DEPENDENCIES,
+    ];
 
-    p46_header.extend_from_slice(&(p46_exp_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_exp_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&P46_SECTION_EXPORTS.to_le_bytes());
+    for i in 0..5 {
+        p46_header.extend_from_slice(&(section_offsets[i] as u64).to_le_bytes());
+        p46_header.extend_from_slice(&(section_sizes[i] as u64).to_le_bytes());
+        p46_header.extend_from_slice(&section_types[i].to_le_bytes());
+    }
 
-    p46_header.extend_from_slice(&(p46_refl_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_refl_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&P46_SECTION_REFLECT.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_imp_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_imp_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&P46_SECTION_IMPORTS.to_le_bytes());
-
-    p46_header.extend_from_slice(&(p46_deps_offset as u32).to_le_bytes());
-    p46_header.extend_from_slice(&(p46_deps_size as u32).to_le_bytes());
-    p46_header.extend_from_slice(&P46_SECTION_DEPENDENCIES.to_le_bytes());
-
-    // Формирование итогового ELF-файла
     let mut elf = Vec::new();
-
     elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf.push(2);
     elf.push(1);
     elf.push(1);
     elf.push(0);
     elf.extend_from_slice(&[0; 8]);
-
     elf.extend_from_slice(&2u16.to_le_bytes());
     elf.extend_from_slice(&62u16.to_le_bytes());
     elf.extend_from_slice(&1u32.to_le_bytes());

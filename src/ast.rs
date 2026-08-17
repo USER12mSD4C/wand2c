@@ -67,6 +67,7 @@ pub struct SectionDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(u64),
+    SignedNumber(i64),
     StringLit(String),
     Variable(String),
     AddrOf(String),

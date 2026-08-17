@@ -277,7 +277,11 @@ fn get_expr_path(expr: &Expr) -> Option<String> {
 fn is_constant_expr(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::Number(_) | Expr::FloatLit(_) | Expr::StringLit(_) | Expr::Null
+        Expr::Number(_)
+            | Expr::SignedNumber(_)
+            | Expr::FloatLit(_)
+            | Expr::StringLit(_)
+            | Expr::Null
     )
 }
 
@@ -298,6 +302,7 @@ fn is_power_of_two(val: u64) -> bool {
 fn is_same_expr(a: &Expr, b: &Expr) -> bool {
     match (a, b) {
         (Expr::Number(n1), Expr::Number(n2)) => n1 == n2,
+        (Expr::SignedNumber(n1), Expr::SignedNumber(n2)) => n1 == n2,
         (Expr::FloatLit(s1), Expr::FloatLit(s2)) => s1 == s2,
         (Expr::StringLit(s1), Expr::StringLit(s2)) => s1 == s2,
         (Expr::Variable(v1), Expr::Variable(v2)) => v1 == v2,
@@ -485,9 +490,61 @@ fn optimize_expr_recursive(
 
     count += fold_commutative_chain(expr);
 
+    // Signed/mixed constant folding
     if let Expr::Binary { left, op, right } = expr {
         let op_str = op.clone();
+        let a_opt = match &**left {
+            Expr::SignedNumber(n) => Some(*n),
+            Expr::Number(n) => Some(*n as i64),
+            _ => None,
+        };
+        let b_opt = match &**right {
+            Expr::SignedNumber(n) => Some(*n),
+            Expr::Number(n) => Some(*n as i64),
+            _ => None,
+        };
+        let is_left_signed = matches!(&**left, Expr::SignedNumber(_));
+        let is_right_signed = matches!(&**right, Expr::SignedNumber(_));
 
+        if (a_opt.is_some() && b_opt.is_some()) && (is_left_signed || is_right_signed) {
+            let val_a = a_opt.unwrap();
+            let val_b = b_opt.unwrap();
+            let folded = match op_str.as_str() {
+                "OpAdd" => Some(val_a.wrapping_add(val_b)),
+                "OpSub" => Some(val_a.wrapping_sub(val_b)),
+                "OpMul" => Some(val_a.wrapping_mul(val_b)),
+                "OpDiv" => {
+                    if val_b != 0 {
+                        Some(val_a / val_b)
+                    } else {
+                        None
+                    }
+                }
+                "OpMod" => {
+                    if val_b != 0 {
+                        Some(val_a % val_b)
+                    } else {
+                        None
+                    }
+                }
+                "OpLt" | "Lt" | "<" => Some(if val_a < val_b { 1 } else { 0 }),
+                "OpLtEq" | "OpLe" | "<=" => Some(if val_a <= val_b { 1 } else { 0 }),
+                "OpGt" | "Gt" | ">" => Some(if val_a > val_b { 1 } else { 0 }),
+                "OpGtEq" | "OpGe" | ">=" => Some(if val_a >= val_b { 1 } else { 0 }),
+                "OpEq" | "OpEqEq" | "==" => Some(if val_a == val_b { 1 } else { 0 }),
+                "OpNotEq" | "OpNe" | "!=" => Some(if val_a != val_b { 1 } else { 0 }),
+                _ => None,
+            };
+            if let Some(f_val) = folded {
+                *expr = Expr::SignedNumber(f_val);
+                return count + 1;
+            }
+        }
+    }
+
+    // Unsigned constant folding and algebraic simplifications
+    if let Expr::Binary { left, op, right } = expr {
+        let op_str = op.clone();
         if let (Expr::Number(a), Expr::Number(b)) = (&**left, &**right) {
             let val_a = *a;
             let val_b = *b;
