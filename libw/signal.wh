@@ -1,0 +1,21 @@
+sc.true
+
+#import <syscall>
+#import <syscall_structs>
+
+struct SignalHandler {
+    u64 handler;
+    u64 flags;
+    u64 mask;
+}
+
+fn signal_init_handler(SignalHandler* handler);
+fn signal_set_handler(SignalHandler* handler, u64 func_ptr);
+fn signal_set_flags(SignalHandler* handler, u64 flags);
+fn signal_add_to_mask(SignalHandler* handler, u64 signum);
+fn signal_install(SignalHandler* handler, u64 signum) -> i64;
+fn signal_ignore(u64 signum) -> i64;
+fn signal_default(u64 signum) -> i64;
+fn signal_send(u64 pid, u64 signum) -> i64;
+fn signal_block(u64 signum) -> i64;
+fn signal_unblock(u64 signum) -> i64;

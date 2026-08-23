@@ -77,6 +77,34 @@ Use modifiers to show how a pointer works.
 - `*o` writes data to the pointer.
 - `*io` reads and writes data.
 
+## Pointer Rules
+
+WandC pointers point to variables.
+Multi-level pointers are not allowed.
+
+Use pointer modifiers to define data flow.
+
+- `*i` reads the pointed variable.
+- `*o` writes the pointed variable.
+- `*io` reads and writes the pointed variable.
+
+To pass an array to a function, use `*adr`.
+
+```wandc
+fn run(u8* argv);
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    u8* args[2];
+
+    args[0] = "sh";
+    args[1] = null;
+
+    run(args*adr);
+
+    return(0);
+}
+```
+
 ## 8. Control Flow
 Use `if` and `else` to make choices.
 ```wandc
@@ -367,5 +395,24 @@ struct stat {
     u64 st_ino;
     u32 st_mode;
     i64 st_size;
+}
+```
+
+## Return Statement
+
+Use `return(value);` to return a value.
+
+```wandc
+fn add(u64 a, u64 b) -> u64 {
+    return(a + b);
+}
+```
+
+A bare `return;` is allowed.
+It is the same as `return(0);`.
+
+```wandc
+fn stop() {
+    return;
 }
 ```

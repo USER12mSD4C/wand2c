@@ -1,0 +1,30 @@
+sc.true
+
+struct ProcessInfo {
+    i64 pid;
+    i64 status;
+    i64 exit_code;
+}
+
+struct ProcessGroup {
+    i64* pids;
+    i64 count;
+    i64 capacity;
+    i64 running;
+}
+
+fn process_fork() -> i64;
+fn process_exec(u8* path, u8* argv, u8* envp) -> i64;
+fn process_wait(i64 pid, ProcessInfo* info) -> i64;
+fn process_wait_all(ProcessInfo* info) -> i64;
+fn process_exit(i64 code);
+fn process_kill(i64 pid, u64 signum) -> i64;
+fn process_get_pid() -> i64;
+fn process_group_init(ProcessGroup* group);
+fn process_group_add(ProcessGroup* group, i64 pid);
+fn process_group_wait_any(ProcessGroup* group, ProcessInfo* info) -> i64;
+fn process_group_wait_all(ProcessGroup* group);
+fn process_group_kill_all(ProcessGroup* group, u64 signum);
+fn process_group_free(ProcessGroup* group);
+fn process_exec_shell(u8* cmd) -> i64;
+fn process_exec_shell_wait(u8* cmd) -> i64;

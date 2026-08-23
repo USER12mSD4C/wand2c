@@ -587,11 +587,19 @@ impl Parser {
 
             Token::Return => {
                 self.step();
+
                 if self.current_token != Token::LParen {
-                    return Err(self.err("Expected '(' after return"));
+                    if self.current_token == Token::Semicolon {
+                        self.step();
+                    }
+
+                    return Ok(Stmt::Return(vec![(DataType::U64, Expr::Number(0))]));
                 }
+
                 self.step();
+
                 let mut return_vals = Vec::new();
+
                 while self.current_token != Token::RParen && self.current_token != Token::EOF {
                     let dt = if self.is_current_token_type() {
                         self.parse_data_type()?
@@ -601,14 +609,18 @@ impl Parser {
 
                     let val_expr = self.parse_expr()?;
                     return_vals.push((dt, val_expr));
+
                     if self.current_token == Token::Comma {
                         self.step();
                     }
                 }
+
                 self.step();
+
                 if self.current_token == Token::Semicolon {
                     self.step();
                 }
+
                 Ok(Stmt::Return(return_vals))
             }
             Token::LBracket => {
@@ -1254,7 +1266,14 @@ impl Parser {
         if self.current_token == Token::OpMul {
             self.step();
             dt = DataType::Pointer(Box::new(dt));
+
+            if self.current_token == Token::OpMul {
+                return Err(self.err(
+                    "multi-level pointers are not allowed in WandC; use a single pointer and pass array addresses with *adr",
+                ));
+            }
         }
+
         Ok(dt)
     }
 
