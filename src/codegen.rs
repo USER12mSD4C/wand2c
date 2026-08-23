@@ -82,8 +82,9 @@ impl NativeGenerator {
     }
 
     fn emit_rip_relative_lea(&mut self, reg_code: u8, patch_key: String) {
-        let modrm = 0x05 | (reg_code << 3);
-        self.code.extend_from_slice(&[0x48, 0x8D, modrm]);
+        let rex = if reg_code >= 8 { 0x4C } else { 0x48 };
+        let modrm = 0x05 | ((reg_code & 7) << 3);
+        self.code.extend_from_slice(&[rex, 0x8D, modrm]);
         let patch_pos = self.code.len();
         self.code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         self.address_patches.push((patch_pos, patch_key, true));
@@ -881,14 +882,17 @@ impl NativeGenerator {
     }
 
     fn emit_mem_op(&mut self, opcode: u8, reg_code: u8, offset: u32) {
+        let rex = if reg_code >= 8 { 0x4C } else { 0x48 };
+        let low_reg = reg_code & 7;
+
         if offset <= 127 {
-            let modrm = 0x40 | (reg_code << 3) | 5;
-            self.code.extend_from_slice(&[0x48, opcode, modrm]);
+            let modrm = 0x40 | (low_reg << 3) | 5;
+            self.code.extend_from_slice(&[rex, opcode, modrm]);
             let disp = (-(offset as i8)) as u8;
             self.code.push(disp);
         } else {
-            let modrm = 0x80 | (reg_code << 3) | 5;
-            self.code.extend_from_slice(&[0x48, opcode, modrm]);
+            let modrm = 0x80 | (low_reg << 3) | 5;
+            self.code.extend_from_slice(&[rex, opcode, modrm]);
             let disp = -(offset as i32);
             self.code.extend_from_slice(&disp.to_le_bytes());
         }
@@ -938,29 +942,67 @@ impl NativeGenerator {
     fn emit_mem_store(&mut self, reg_code: u8, offset: u32, size: u32) {
         let is_large_disp = offset > 127;
         let low_reg = reg_code & 7;
+        let need_rex_for_high = reg_code >= 8;
+        let need_rex_for_low_byte = size == 1 && low_reg >= 4;
+
         match size {
             1 => {
-                let modrm = if is_large_disp { 0x80 | (low_reg << 3) | 5 } else { 0x40 | (low_reg << 3) | 5 };
-                let mut rex = 0x40;
-                if reg_code >= 8 { rex |= 0x01; }
-                if (reg_code & 0x0F) >= 4 {
+                let modrm = if is_large_disp {
+                    0x80 | (low_reg << 3) | 5
+                } else {
+                    0x40 | (low_reg << 3) | 5
+                };
+
+                let rex = 0x40 | if need_rex_for_high { 0x04 } else { 0 };
+
+                if need_rex_for_high || need_rex_for_low_byte {
                     self.code.push(rex);
                 }
+
                 self.code.extend_from_slice(&[0x88, modrm]);
             }
+
             2 => {
-                let modrm = if is_large_disp { 0x80 | (low_reg << 3) | 5 } else { 0x40 | (low_reg << 3) | 5 };
+                let modrm = if is_large_disp {
+                    0x80 | (low_reg << 3) | 5
+                } else {
+                    0x40 | (low_reg << 3) | 5
+                };
+
+                if need_rex_for_high {
+                    self.code.push(0x44);
+                }
+
                 self.code.extend_from_slice(&[0x66, 0x89, modrm]);
             }
+
             4 => {
-                let modrm = if is_large_disp { 0x80 | (low_reg << 3) | 5 } else { 0x40 | (low_reg << 3) | 5 };
+                let modrm = if is_large_disp {
+                    0x80 | (low_reg << 3) | 5
+                } else {
+                    0x40 | (low_reg << 3) | 5
+                };
+
+                if need_rex_for_high {
+                    self.code.push(0x44);
+                }
+
                 self.code.extend_from_slice(&[0x89, modrm]);
             }
+
             _ => {
-                let modrm = if is_large_disp { 0x80 | (low_reg << 3) | 5 } else { 0x40 | (low_reg << 3) | 5 };
-                self.code.extend_from_slice(&[0x48, 0x89, modrm]);
+                let modrm = if is_large_disp {
+                    0x80 | (low_reg << 3) | 5
+                } else {
+                    0x40 | (low_reg << 3) | 5
+                };
+
+                let rex = if need_rex_for_high { 0x4C } else { 0x48 };
+
+                self.code.extend_from_slice(&[rex, 0x89, modrm]);
             }
         }
+
         if is_large_disp {
             let disp = -(offset as i32);
             self.code.extend_from_slice(&disp.to_le_bytes());
@@ -1543,26 +1585,18 @@ impl NativeGenerator {
 
     fn compile_expr(&mut self, expr: &Expr, reg: u8, _deref_ptr: bool) {
         match expr {
-            Expr::Number(n) => {
-                let opcode = 0xB8 + reg;
-                self.code.extend_from_slice(&[0x48, opcode]);
-                self.code.extend_from_slice(&n.to_le_bytes());
-            }
-            Expr::SignedNumber(n) => {
-                let val = *n as u64;
-                let opcode = 0xB8 + reg;
-                self.code.extend_from_slice(&[0x48, opcode]);
-                self.code.extend_from_slice(&val.to_le_bytes());
-            }
+        Expr::Number(n) => {
+            self.emit_mov_imm64(reg, *n);
+        }
+        Expr::SignedNumber(n) => {
+            self.emit_mov_imm64(reg, *n as u64);
+        }
             Expr::FloatLit(s) => {
                 let key = format!("float:{}", s);
                 self.emit_rip_relative_lea(0, key);
                 self.code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x00]);
                 self.code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
-                if reg != 0 {
-                    let modrm = 0xC0 | (reg << 3) | 0;
-                    self.code.extend_from_slice(&[0x48, 0x89, modrm]);
-                }
+                self.move_rax_to_reg(reg);
             }
             Expr::StringLit(s) => {
                 self.emit_rip_relative_lea(reg, format!("str:{}", s));
@@ -1583,27 +1617,31 @@ impl NativeGenerator {
                         } else {
                             8
                         };
-                        let deref_modrm = (reg << 3) | reg;
+                        let low_reg = reg & 7;
+                        let deref_modrm = (low_reg << 3) | low_reg;
+
                         match elem_size {
                             1 => {
-                                let mut rex = 0x48;
-                                if reg >= 8 { rex |= 0x04; }
+                                let rex = if reg >= 8 { 0x4D } else { 0x48 };
                                 self.code.push(rex);
                                 self.code.extend_from_slice(&[0x0F, 0xB6, deref_modrm]);
                             }
+
                             2 => {
-                                let mut rex = 0x48;
-                                if reg >= 8 { rex |= 0x04; }
+                                let rex = if reg >= 8 { 0x4D } else { 0x48 };
                                 self.code.push(rex);
                                 self.code.extend_from_slice(&[0x0F, 0xB7, deref_modrm]);
                             }
+
                             4 => {
-                                if reg >= 8 { self.code.push(0x44); }
+                                if reg >= 8 {
+                                    self.code.push(0x44);
+                                }
                                 self.code.extend_from_slice(&[0x8B, deref_modrm]);
                             }
+
                             _ => {
-                                let mut rex = 0x48;
-                                if reg >= 8 { rex |= 0x04; }
+                                let rex = if reg >= 8 { 0x4D } else { 0x48 };
                                 self.code.push(rex);
                                 self.code.extend_from_slice(&[0x8B, deref_modrm]);
                             }
@@ -1693,9 +1731,7 @@ impl NativeGenerator {
                 }
             }
             Expr::Null => {
-                let opcode = 0xB8 + reg;
-                self.code.extend_from_slice(&[0x48, opcode]);
-                self.code.extend_from_slice(&0u64.to_le_bytes());
+                self.emit_mov_imm64(reg, 0);
             }
             Expr::SectionAccess { section, variable } => {
                 if let Some(values) = self.enums.get(section) {
@@ -1711,10 +1747,7 @@ impl NativeGenerator {
                 self.emit_rip_relative_lea(0, key);
                 self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
 
-                if reg != 0 {
-                    let modrm = 0xC0 | (reg << 3) | 0;
-                    self.code.extend_from_slice(&[0x48, 0x89, modrm]);
-                }
+                self.move_rax_to_reg(reg);
             }
             Expr::Binary { left, op, right } => {
                 if op == "OpCastF64" {
@@ -2223,15 +2256,13 @@ impl NativeGenerator {
                 | Expr::FloatLit(_) => {}
                 Expr::MemberAccess { .. } | Expr::Index { .. } | Expr::SectionAccess { .. } => {
                     if reg != 3 {
-                        let modrm = 0xC0 | (reg << 3) | 3;
-                        self.code.extend_from_slice(&[0x48, 0x89, modrm]);
+                        let rex = if reg >= 8 { 0x49 } else { 0x48 };
+                        let modrm = 0xC0 | (3 << 3) | (reg & 7);
+                        self.code.extend_from_slice(&[rex, 0x89, modrm]);
                     }
                 }
                 Expr::Binary { .. } | Expr::Call { .. } => {
-                    if reg != 0 {
-                        let modrm = 0xC0 | (reg << 3) | 0;
-                        self.code.extend_from_slice(&[0x48, 0x89, modrm]);
-                    }
+                    self.move_rax_to_reg(reg);
                 }
                 _ => {}
             }
@@ -2426,8 +2457,9 @@ impl NativeGenerator {
         }
 
         if reg != 0 && reg != 3 {
-            let modrm = 0xC0 | (3 << 3) | reg;
-            self.code.extend_from_slice(&[0x48, 0x89, modrm]);
+            let rex = if reg >= 8 { 0x49 } else { 0x48 };
+            let modrm = 0xC0 | (3 << 3) | (reg & 7);
+            self.code.extend_from_slice(&[rex, 0x89, modrm]);
         }
     }
 
@@ -2830,8 +2862,9 @@ impl NativeGenerator {
     }
     fn move_rax_to_reg(&mut self, reg: u8) {
         if reg != 0 {
-            let modrm = 0xC0 | (reg << 3) | 0;
-            self.code.extend_from_slice(&[0x48, 0x89, modrm]);
+            let rex = if reg >= 8 { 0x49 } else { 0x48 };
+            let modrm = 0xC0 | (reg & 7);
+            self.code.extend_from_slice(&[rex, 0x89, modrm]);
         }
     }
     fn elf_strtab_insert(
@@ -3206,5 +3239,16 @@ impl NativeGenerator {
         Self::elf_push_shdr(&mut elf, n_shstrtab, 3, 0, 0, shstrtab_off as u64, shstrtab_size as u64, 0, 0, 1, 0);
         Self::elf_push_shdr(&mut elf, n_note, 1, 0, 0, 0, 0, 0, 0, 1, 0);
         elf
+    }
+    fn emit_mov_imm64(&mut self, reg: u8, value: u64) {
+        if reg >= 8 {
+            self.code.push(0x49);
+            self.code.push(0xB8 + (reg & 7));
+        } else {
+            self.code.push(0x48);
+            self.code.push(0xB8 + reg);
+        }
+
+        self.code.extend_from_slice(&value.to_le_bytes());
     }
 }
