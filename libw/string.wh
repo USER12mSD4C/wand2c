@@ -8,3 +8,4 @@ extern fn memcpy(u8* dest, u8* src, u64 n) -> void*;
 extern fn memset(u8* s, u8 c, u64 n) -> void*;
 extern fn atoi(u8* s) -> u64;
 extern fn itoa(i64 num, u8* buf) -> u8*;
+extern fn memcmp(u8* s1, u8* s2, u64 n) -> i64;

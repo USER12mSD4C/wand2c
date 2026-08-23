@@ -125,6 +125,12 @@ impl NativeGenerator {
                     _ => None,
                 }
             }
+
+            Expr::AddrOfExpr(inner) => {
+                let inner_type = self.resolve_expr_type(inner)?;
+                Some(DataType::Pointer(Box::new(inner_type)))
+            }
+
             _ => None,
         }
     }
@@ -659,6 +665,9 @@ impl NativeGenerator {
             Expr::MemberAccess { expr: base, .. } => {
                 self.collect_string_constants_from_expr(base);
             }
+            Expr::AddrOfExpr(inner) => {
+                self.collect_string_constants_from_expr(inner);
+            }
             _ => {}
         }
     }
@@ -832,6 +841,9 @@ impl NativeGenerator {
             }
             Expr::MemberAccess { expr: base, .. } => {
                 self.collect_float_constants_from_expr(base);
+            }
+            Expr::AddrOfExpr(inner) => {
+                self.collect_float_constants_from_expr(inner);
             }
             _ => {}
         }
@@ -1637,6 +1649,11 @@ impl NativeGenerator {
                     }
                 }
             }
+
+            Expr::AddrOfExpr(inner) => {
+                self.compile_address(inner, reg);
+            }
+
             Expr::AddrOf(name) => {
                 if let Some(&offset) = self.local_offsets.get(name) {
                     self.emit_mem_op(0x8D, reg, offset);
@@ -2202,6 +2219,7 @@ impl NativeGenerator {
                 | Expr::SignedNumber(_)
                 | Expr::StringLit(_)
                 | Expr::AddrOf(_)
+                | Expr::AddrOfExpr(_)
                 | Expr::FloatLit(_) => {}
                 Expr::MemberAccess { .. } | Expr::Index { .. } | Expr::SectionAccess { .. } => {
                     if reg != 3 {
@@ -2363,6 +2381,47 @@ impl NativeGenerator {
                 let key = format!("{}:{}", section, variable);
                 self.emit_rip_relative_lea(internal_reg, key);
             }
+
+            Expr::AddrOf(_) => {
+                self.compile_expr(expr, internal_reg, false);
+            }
+
+            Expr::AddrOfExpr(inner) => {
+                self.compile_address(inner, internal_reg);
+            }
+
+            Expr::Binary { left, op, right } => {
+                match op.as_str() {
+                    "OpAdd" => {
+                        self.compile_address(left, 3);
+                        self.code.push(0x53);
+                        self.compile_expr(right, 0, true);
+                        self.code.push(0x5B);
+                        self.code.extend_from_slice(&[0x48, 0x01, 0xC3]);
+
+                        if internal_reg == 0 {
+                            self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
+                        }
+                    }
+
+                    "OpSub" => {
+                        self.compile_address(left, 3);
+                        self.code.push(0x53);
+                        self.compile_expr(right, 0, true);
+                        self.code.push(0x5B);
+                        self.code.extend_from_slice(&[0x48, 0x29, 0xC3]);
+
+                        if internal_reg == 0 {
+                            self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
+                        }
+                    }
+
+                    _ => {
+                        self.compile_expr(expr, internal_reg, false);
+                    }
+                }
+            }
+
             _ => {}
         }
 

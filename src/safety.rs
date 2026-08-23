@@ -68,6 +68,7 @@ pub fn new() -> Self {
             Expr::Index { expr: base, .. } => {
                 self.get_expr_path(base)
             }
+            Expr::AddrOfExpr(inner) => self.get_expr_path(inner),
             _ => None,
         }
     }
@@ -530,6 +531,28 @@ pub fn new() -> Self {
             for key in keys_to_update {
                 self.states.insert(key, VarState::Safe);
             }
+            return;
+        }
+
+        if let Expr::AddrOfExpr(inner) = expr {
+            if let Some(path) = self.get_expr_path(inner) {
+                self.states.insert(path.clone(), VarState::Safe);
+
+                let prefix = format!("{}.", path);
+
+                let keys: Vec<String> = self
+                    .states
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+
+                for key in keys {
+                    self.states.insert(key, VarState::Safe);
+                }
+            }
+
+            self.check_expression_safety(inner, line);
             return;
         }
 

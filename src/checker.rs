@@ -284,6 +284,9 @@ impl TypeChecker {
             Expr::MemberAccess { expr: base, .. } => {
                 self.verify_expr_calls(base)?;
             }
+            Expr::AddrOfExpr(inner) => {
+                self.verify_expr_calls(inner)?;
+            }
             _ => {}
         }
         Ok(())

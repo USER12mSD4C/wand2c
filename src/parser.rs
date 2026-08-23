@@ -1483,10 +1483,18 @@ pub fn new(lexer: Lexer) -> Self {
                 }
 
                 let expr = self.parse_expr()?;
+
                 if self.current_token != Token::RParen {
                     return Err(self.err("Expected ')' after parenthesized expression"));
                 }
+
                 self.step();
+
+                if self.current_token == Token::OpAddrOf {
+                    self.step();
+                    return Ok(Expr::AddrOfExpr(Box::new(expr)));
+                }
+
                 Ok(expr)
             }
             Token::Ident(name) => {
@@ -1544,17 +1552,38 @@ pub fn new(lexer: Lexer) -> Self {
                     } else {
                         let is_arrow = self.current_token == Token::Arrow;
                         self.step();
-                        if let Token::Ident(member) = &self.current_token {
-                            current_expr = Expr::MemberAccess {
-                                expr: Box::new(current_expr),
-                                member: member.clone(),
-                                is_arrow,
-                            };
-                            self.step();
-                        } else {
-                            return Err(self.err("Expected member identifier"));
+
+                        match &self.current_token {
+                            Token::Ident(member) => {
+                                current_expr = Expr::MemberAccess {
+                                    expr: Box::new(current_expr),
+                                    member: member.clone(),
+                                    is_arrow,
+                                };
+
+                                self.step();
+                            }
+
+                            Token::AddrOf(member) => {
+                                current_expr = Expr::MemberAccess {
+                                    expr: Box::new(current_expr),
+                                    member: member.clone(),
+                                    is_arrow,
+                                };
+
+                                self.step();
+
+                                current_expr = Expr::AddrOfExpr(Box::new(current_expr));
+                            }
+
+                            _ => return Err(self.err("Expected member identifier")),
                         }
                     }
+                }
+
+                if self.current_token == Token::OpAddrOf {
+                    self.step();
+                    current_expr = Expr::AddrOfExpr(Box::new(current_expr));
                 }
 
                 Ok(current_expr)

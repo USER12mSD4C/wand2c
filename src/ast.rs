@@ -101,6 +101,7 @@ pub enum Expr {
     StringLit(String),
     Variable(String),
     AddrOf(String),
+    AddrOfExpr(Box<Expr>),
     MemberAccess {
         expr: Box<Expr>,
         member: String,

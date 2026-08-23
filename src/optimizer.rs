@@ -163,6 +163,40 @@ fn collect_escaped_expr(expr: &Expr, escaped: &mut HashSet<String>) {
         Expr::MemberAccess { expr: base, .. } => {
             collect_escaped_expr(base, escaped);
         }
+        Expr::AddrOfExpr(inner) => {
+            collect_addr_target_roots(inner, escaped);
+            collect_escaped_expr(inner, escaped);
+        }
+        _ => {}
+    }
+}
+
+fn collect_addr_target_roots(expr: &Expr, escaped: &mut HashSet<String>) {
+    match expr {
+        Expr::Variable(name) => {
+            escaped.insert(name.clone());
+        }
+
+        Expr::MemberAccess { expr: base, .. } => {
+            collect_addr_target_roots(base, escaped);
+        }
+
+        Expr::Index { expr: base, index } => {
+            collect_addr_target_roots(base, escaped);
+            collect_addr_target_roots(index, escaped);
+        }
+
+        Expr::Binary { left, right, .. } => {
+            collect_addr_target_roots(left, escaped);
+            collect_addr_target_roots(right, escaped);
+        }
+
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_addr_target_roots(arg, escaped);
+            }
+        }
+
         _ => {}
     }
 }
@@ -287,6 +321,9 @@ fn collect_reads_expr(expr: &Expr, reads: &mut HashMap<String, usize>) {
         Expr::MemberAccess { expr: base, .. } => {
             collect_reads_expr(base, reads);
         }
+        Expr::AddrOfExpr(inner) => {
+            collect_reads_expr(inner, reads);
+        }
         _ => {}
     }
 }
@@ -308,6 +345,7 @@ fn get_expr_path(expr: &Expr) -> Option<String> {
                 None
             }
         }
+        Expr::AddrOfExpr(inner) => get_expr_path(inner),
         _ => None,
     }
 }
@@ -329,6 +367,7 @@ fn has_side_effects(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_side_effects(left) || has_side_effects(right),
         Expr::Index { expr, index } => has_side_effects(expr) || has_side_effects(index),
         Expr::MemberAccess { expr, .. } => has_side_effects(expr),
+        Expr::AddrOfExpr(inner) => has_side_effects(inner),
         _ => false,
     }
 }
@@ -407,6 +446,7 @@ fn is_same_expr(a: &Expr, b: &Expr) -> bool {
                 .zip(args2.iter())
                 .all(|(x, y)| is_same_expr(x, y))
         }
+        (Expr::AddrOfExpr(a), Expr::AddrOfExpr(b)) => is_same_expr(a, b),
         _ => false,
     }
 }
@@ -505,6 +545,9 @@ fn optimize_expr_recursive(
             for arg in args {
                 count += optimize_expr_recursive(arg, consts, escaped);
             }
+        }
+        Expr::AddrOfExpr(inner) => {
+            count += optimize_expr_recursive(inner, consts, escaped);
         }
         _ => {}
     }

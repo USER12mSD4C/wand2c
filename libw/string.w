@@ -159,3 +159,52 @@ fn itoa(i64 num, u8* buf) {
     p_final = 0;
     return(original_buf);
 }
+
+fn memcmp(u8* s1, u8* s2, u64 n) -> i64 {
+    u64 i = 0;
+
+    while (i + 8 <= n) {
+        u64* p1*i = s1 + i;
+        u64* p2*i = s2 + i;
+        u64 a = p1;
+        u64 b = p2;
+
+        if (a != b) {
+            u64 k = 0;
+
+            while (k < 8) {
+                u8 c1 = s1[i + k];
+                u8 c2 = s2[i + k];
+
+                if (c1 != c2) {
+                    if (c1 < c2) {
+                        return(-1);
+                    }
+
+                    return(1);
+                }
+
+                k = k + 1;
+            }
+        }
+
+        i = i + 8;
+    }
+
+    while (i < n) {
+        u8 c1 = s1[i];
+        u8 c2 = s2[i];
+
+        if (c1 != c2) {
+            if (c1 < c2) {
+                return(-1);
+            }
+
+            return(1);
+        }
+
+        i = i + 1;
+    }
+
+    return(0);
+}

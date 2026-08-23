@@ -228,3 +228,187 @@ fn read_integer() {
     }
     return(res * sign);
 }
+
+fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
+    if (size == 0) {
+        return(0);
+    }
+
+    if (fmt == null) {
+        buf[0] = 0;
+        return(0);
+    }
+
+    u64 pos = 0;
+    u64 arg_idx = 1;
+    u8* p*i = fmt;
+    u8 c = p;
+
+    while (c != 0) {
+        if (c == 37) {
+            p++;
+            c = p;
+
+            if (c == 115) {
+                u8* s = null;
+
+                if (arg_idx == 1) {
+                    s = arg1;
+                }
+
+                if (arg_idx == 2) {
+                    s = arg2;
+                }
+
+                if (arg_idx == 3) {
+                    s = arg3;
+                }
+
+                arg_idx = arg_idx + 1;
+
+                if (s == null) {
+                    u8* np*i = "(null)";
+                    u8 nc = np;
+
+                    while (nc != 0) {
+                        if (pos + 1 < size) {
+                            buf[pos] = nc;
+                            pos = pos + 1;
+                        }
+
+                        np++;
+                        nc = np;
+                    }
+                } else {
+                    u8* sp*i = s;
+                    u8 sc = sp;
+
+                    while (sc != 0) {
+                        if (pos + 1 < size) {
+                            buf[pos] = sc;
+                            pos = pos + 1;
+                        }
+
+                        sp++;
+                        sc = sp;
+                    }
+                }
+            } else {
+                if (c == 100) {
+                    i64 num = 0;
+
+                    if (arg_idx == 1) {
+                        num = arg1;
+                    }
+
+                    if (arg_idx == 2) {
+                        num = arg2;
+                    }
+
+                    if (arg_idx == 3) {
+                        num = arg3;
+                    }
+
+                    arg_idx = arg_idx + 1;
+
+                    if (num < 0) {
+                        if (pos + 1 < size) {
+                            buf[pos] = 45;
+                            pos = pos + 1;
+                        }
+
+                        num = 0 - num;
+                    }
+
+                    u8 tmp[32];
+                    u64 tpos = 31;
+                    tmp[31] = 0;
+                    u64 unum = num;
+
+                    if (unum == 0) {
+                        tmp[30] = 48;
+                        tpos = 30;
+                    } else {
+                        while (unum > 0) {
+                            tpos = tpos - 1;
+                            tmp[tpos] = (unum % 10) + 48;
+                            unum = unum / 10;
+                        }
+                    }
+
+                    while (tmp[tpos] != 0) {
+                        if (pos + 1 < size) {
+                            buf[pos] = tmp[tpos];
+                            pos = pos + 1;
+                        }
+
+                        tpos = tpos + 1;
+                    }
+                } else {
+                    if (c == 118) {
+                        u64 num = 0;
+
+                        if (arg_idx == 1) {
+                            num = arg1;
+                        }
+
+                        if (arg_idx == 2) {
+                            num = arg2;
+                        }
+
+                        if (arg_idx == 3) {
+                            num = arg3;
+                        }
+
+                        arg_idx = arg_idx + 1;
+
+                        u8 tmp[32];
+                        u64 tpos = 31;
+                        tmp[31] = 0;
+
+                        if (num == 0) {
+                            tmp[30] = 48;
+                            tpos = 30;
+                        } else {
+                            while (num > 0) {
+                                tpos = tpos - 1;
+                                tmp[tpos] = (num % 10) + 48;
+                                num = num / 10;
+                            }
+                        }
+
+                        while (tmp[tpos] != 0) {
+                            if (pos + 1 < size) {
+                                buf[pos] = tmp[tpos];
+                                pos = pos + 1;
+                            }
+
+                            tpos = tpos + 1;
+                        }
+                    } else {
+                        if (pos + 1 < size) {
+                            buf[pos] = 37;
+                            pos = pos + 1;
+                        }
+
+                        if (pos + 1 < size) {
+                            buf[pos] = c;
+                            pos = pos + 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            if (pos + 1 < size) {
+                buf[pos] = c;
+                pos = pos + 1;
+            }
+        }
+
+        p++;
+        c = p;
+    }
+
+    buf[pos] = 0;
+    return(pos);
+}
