@@ -44,6 +44,7 @@ pub struct NativeGenerator {
     enums: HashMap<String, HashMap<String, u64>>,
     struct_alignments: HashMap<String, u32>,
     struct_versions: HashMap<String, u32>,
+    struct_volatile_fields: HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl NativeGenerator {
@@ -76,6 +77,7 @@ impl NativeGenerator {
             enums: HashMap::new(),
             struct_alignments: HashMap::new(),
             struct_versions: HashMap::new(),
+            struct_volatile_fields: HashMap::new(),
         }
     }
 
@@ -124,6 +126,39 @@ impl NativeGenerator {
                 }
             }
             _ => None,
+        }
+    }
+
+    fn is_volatile_member_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MemberAccess {
+                expr: base,
+                member,
+                ..
+            } => {
+                if let Some(base_type) = self.resolve_expr_type(base) {
+                    let struct_name = match base_type {
+                        DataType::Struct(n) => Some(n),
+                        DataType::Pointer(boxed) => match *boxed {
+                            DataType::Struct(n) => Some(n),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                    if let Some(name) = struct_name {
+                        if let Some(fields) = self.struct_volatile_fields.get(&name) {
+                            return fields.contains(member);
+                        }
+                    }
+                }
+
+                false
+            }
+
+            Expr::Index { expr: base, .. } => self.is_volatile_member_expr(base),
+
+            _ => false,
         }
     }
 
@@ -235,11 +270,23 @@ impl NativeGenerator {
         self.enums.clear();
         self.struct_alignments.clear();
         self.struct_versions.clear();
+        self.struct_volatile_fields.clear();
         for s in &program.structs {
             let mut fields_types = HashMap::new();
+            let mut volatile_fields = std::collections::HashSet::new();
+
             for field in &s.fields {
                 fields_types.insert(field.name.clone(), field.data_type.clone());
+
+                if field.modifier == PtrAccess::Volatile || field.modifier == PtrAccess::Atomic {
+                    volatile_fields.insert(field.name.clone());
+                }
             }
+
+            if !volatile_fields.is_empty() {
+                self.struct_volatile_fields.insert(s.name.clone(), volatile_fields);
+            }
+
             self.struct_fields.insert(s.name.clone(), fields_types);
             self.struct_versions.insert(s.name.clone(), s.version);
         }
@@ -2477,11 +2524,16 @@ impl NativeGenerator {
                 self.compile_address(target, 3);
                 self.code.push(0x58);
                 let size = self.get_expr_type_size(target);
+
                 match size {
                     1 => self.code.extend_from_slice(&[0x88, 0x03]),
                     2 => self.code.extend_from_slice(&[0x66, 0x89, 0x03]),
                     4 => self.code.extend_from_slice(&[0x89, 0x03]),
                     _ => self.code.extend_from_slice(&[0x48, 0x89, 0x03]),
+                }
+
+                if self.is_volatile_member_expr(target) {
+                    self.code.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
                 }
             }
             _ => {}

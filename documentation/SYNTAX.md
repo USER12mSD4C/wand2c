@@ -438,3 +438,25 @@ struct User {
 ```
 
 Constants must appear before you use them in array sizes.
+
+## Volatile and Atomic Variables
+
+Use `volatile` and `atomic` on section variables and structure fields.
+
+Section example:
+
+```wandc
+sect.state
+    volatile i64 flag = 0;
+EOS
+```
+
+Structure example:
+
+```wandc
+struct Ctx {
+    volatile i64 interrupted;
+}
+```
+
+A write to a `volatile` target emits a memory fence after the store.

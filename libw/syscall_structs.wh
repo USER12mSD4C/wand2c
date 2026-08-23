@@ -1,3 +1,5 @@
+sc.true
+
 struct linux_dirent64 version 1 {
     u64 d_ino version 1;
     u64 d_off version 1;

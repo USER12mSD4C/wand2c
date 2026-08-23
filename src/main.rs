@@ -648,33 +648,50 @@ fn install_library(lib_path: &str) {
             "    \x1b[36mMulti-Install:\x1b[0m Scanning directory '{}'...",
             lib_path
         );
+
         let entries = match std::fs::read_dir(path) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!(
                     "\x1b[31;1merror\x1b[0m: failed to read directory '{}': {}",
-                    lib_path, e
+                    lib_path,
+                    e
                 );
                 std::process::exit(1);
             }
         };
 
-        let mut installed_any = false;
+        let mut stems = std::collections::BTreeSet::new();
+
         for entry in entries {
             if let Ok(entry) = entry {
                 let fpath = entry.path();
+
                 if fpath.is_file() {
-                    let ext = fpath.extension().and_then(|s| s.to_str()).unwrap_or("");
-                    if ext == "w" {
-                        let file_stem_path = fpath.with_extension("");
-                        let stem_str = file_stem_path.to_str().unwrap_or("");
-                        if !stem_str.is_empty() {
-                            install_single_file(stem_str);
-                            installed_any = true;
+                    let ext = fpath
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+
+                    if ext == "w" || ext == "wh" {
+                        if let Some(stem_os) = fpath.file_stem() {
+                            if let Some(stem) = stem_os.to_str() {
+                                if !stem.is_empty() {
+                                    stems.insert(stem.to_string());
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+
+        let mut installed_any = false;
+
+        for stem in stems {
+            let lib_file = format!("{}/{}", lib_path, stem);
+            install_single_file(&lib_file);
+            installed_any = true;
         }
 
         if installed_any {
@@ -688,6 +705,7 @@ fn install_library(lib_path: &str) {
                 lib_path
             );
         }
+
         return;
     }
 

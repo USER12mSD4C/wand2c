@@ -303,6 +303,7 @@ pub fn new(lexer: Lexer) -> Self {
                             data_type: field_type,
                             version_added: f_version_added,
                             version_removed: f_version_removed,
+                            modifier: PtrAccess::Normal,
                         });
 
                         if self.current_token == Token::Semicolon {
@@ -1098,6 +1099,16 @@ pub fn new(lexer: Lexer) -> Self {
 
         let mut fields = Vec::new();
         while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+            let mut field_modifier = PtrAccess::Normal;
+
+            if self.current_token == Token::Volatile {
+                field_modifier = PtrAccess::Volatile;
+                self.step();
+            } else if self.current_token == Token::Atomic {
+                field_modifier = PtrAccess::Atomic;
+                self.step();
+            }
+
             let mut field_type = self.parse_data_type()?;
             let field_name = match &self.current_token {
                 Token::Ident(n) => n.clone(),
@@ -1135,6 +1146,7 @@ pub fn new(lexer: Lexer) -> Self {
                 data_type: field_type,
                 version_added: f_version_added,
                 version_removed: f_version_removed,
+                modifier: field_modifier,
             });
 
             if self.current_token == Token::Semicolon {

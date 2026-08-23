@@ -42,6 +42,7 @@ pub struct FieldDecl {
     pub data_type: DataType,
     pub version_added: u32,
     pub version_removed: u32,
+    pub modifier: PtrAccess,
 }
 
 #[derive(Debug, Clone)]
