@@ -2,11 +2,9 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Системный заголовок
     ScTrue,
     ScFalse,
 
-    // Ключевые слова
     Fn,
     Struct,
     Version,
@@ -22,8 +20,20 @@ pub enum Token {
     Typedef,
     Jmpto,
     Packed,
+    Extern,
+    Export,
+    Const,
+    Match,
+    Case,
+    Default,
+    Volatile,
+    Atomic,
+    Critical,
+    Irq,
+    Align,
+    Ro,
+    Noinit,
 
-    // Примитивные типы данных
     TypeU8,
     TypeU16,
     TypeU32,
@@ -34,17 +44,15 @@ pub enum Token {
     TypeI64,
     TypeVoid,
 
-    // Идентификаторы и литералы
     Ident(String),
     Number(u64),
     StringLiteral(String),
 
-    // Модификаторы указателей
     PtrInputModifier(String),
     PtrOutputModifier(String),
+    PtrInputOutputModifier(String),
     AddrOf(String),
 
-    // Операторы
     OpAssign, // =
     OpAdd,    // +
     OpSub,    // -
@@ -66,7 +74,6 @@ pub enum Token {
     OpInc,    // ++
     OpDec,    // --
 
-    // Разделители
     LBrace,    // {
     RBrace,    // }
     LBracket,  // [
@@ -76,9 +83,8 @@ pub enum Token {
     Semicolon, // ;
     Comma,     // ,
 
-    OpAddrOf, // унарный оператор adr (для *adr)
+    OpAddrOf,
 
-    //euo токены
     Enum,
     Union,
     OpBitAnd, // &
@@ -90,7 +96,6 @@ pub enum Token {
     TypeF64,
     FloatLiteral(String),
 
-    // Ассемблерные блоки
     NasmBlock(String),
 
     EOF,

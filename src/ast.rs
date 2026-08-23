@@ -28,9 +28,12 @@ pub enum DataType {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PtrAccess {
-    Input,  // *i (Read-Only)
-    Output, // *o (Write-Only)
+    Input,
+    Output,
+    InputOutput,
     Normal,
+    Volatile,
+    Atomic,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +51,7 @@ pub struct StructDecl {
     pub fields: Vec<FieldDecl>,
     pub is_union: bool,
     pub is_packed: bool,
+    pub alignment: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -56,12 +60,37 @@ pub struct VarDecl {
     pub data_type: DataType,
     pub modifier: PtrAccess,
     pub initial_value: Option<Box<Expr>>,
+    pub alignment: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct SectionDecl {
     pub name: String,
     pub variables: Vec<VarDecl>,
+    pub alignment: u32,
+    pub is_ro: bool,
+    pub is_noinit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumValueDecl {
+    pub name: String,
+    pub value: u64,
+    pub version_added: u32,
+    pub version_removed: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub version: u32,
+    pub values: Vec<EnumValueDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +153,13 @@ pub enum Stmt {
         args: Vec<Stmt>,
     },
     Return(Vec<(DataType, Expr)>),
+    Critical(Vec<Stmt>),
     Nasm(String),
+    Match {
+        expr: Expr,
+        cases: Vec<(Expr, Vec<Stmt>)>,
+        default: Option<Vec<Stmt>>,
+    },
     Expr(Expr),
 }
 
@@ -134,6 +169,21 @@ pub struct FuncDecl {
     pub params: Vec<(DataType, String, PtrAccess)>,
     pub return_types: Vec<DataType>,
     pub body: Option<Vec<Stmt>>,
+    pub is_extern: bool,
+    pub is_export: bool,
+    pub is_irq: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PtrModifier {
+    Volatile,
+    Atomic,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeDecl {
+    pub name: String,
+    pub value: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +192,8 @@ pub struct Program {
     pub imports: Vec<String>,
     pub typedefs: Vec<(String, DataType)>,
     pub structs: Vec<StructDecl>,
+    pub enums: Vec<EnumDecl>,
+    pub constants: Vec<ConstDecl>,
     pub sections: Vec<SectionDecl>,
     pub functions: Vec<FuncDecl>,
 }

@@ -349,13 +349,32 @@ pub fn generate_elf64_binary(
         builder.add_type_record(9, &val);
     }
 
+    let has_explicit_exports = program
+        .functions
+        .iter()
+        .any(|f| f.is_export && !f.is_extern && f.body.is_some());
+
     for func in &program.functions {
-        let local_offset = gen.function_offsets.get(&func.name).cloned().unwrap_or(0);
+        if func.is_extern || func.body.is_none() {
+            continue;
+        }
+
+        if has_explicit_exports && !func.is_export {
+            continue;
+        }
+
+        let local_offset = match gen.function_offsets.get(&func.name) {
+            Some(offset) => *offset,
+            None => continue,
+        };
+
         let abs_addr = 0x400078u64 + (local_offset as u64);
         let mut param_types = Vec::new();
+
         for _ in &func.params {
             param_types.push(4u32);
         }
+
         builder.add_export(
             &func.name,
             "main_module",

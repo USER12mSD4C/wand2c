@@ -8,6 +8,7 @@ pub struct TypeChecker {
     sections: HashMap<String, SectionDecl>,
     functions: HashMap<String, FuncDecl>,
     typedefs: HashMap<String, DataType>,
+    use_os: bool,
 }
 
 impl TypeChecker {
@@ -17,10 +18,12 @@ impl TypeChecker {
             sections: HashMap::new(),
             functions: HashMap::new(),
             typedefs: HashMap::new(),
+            use_os: false,
         }
     }
 
     pub fn populate_symbols(&mut self, program: &Program) {
+        self.use_os = program.use_os;
         for s in &program.structs {
             self.structs.insert(s.name.clone(), s.clone());
         }
@@ -42,21 +45,37 @@ impl TypeChecker {
             .ok_or_else(|| format!("Struct {} not defined", struct_name))?;
 
         let mut offsets = Vec::new();
+        let declared_alignment = if s.alignment > 0 { s.alignment } else { 1 };
 
         if s.is_union {
-            let mut max_size = 0;
+            let mut max_size = 0u32;
+            let mut max_alignment = declared_alignment;
+
             for field in &s.fields {
                 offsets.push(0);
                 let size = self.get_type_size(&field.data_type)?;
                 if size > max_size {
                     max_size = size;
                 }
+
+                let mut alignment = if s.is_packed { 1 } else { size };
+                if alignment > 8 {
+                    alignment = 8;
+                }
+                if alignment > max_alignment {
+                    max_alignment = alignment;
+                }
             }
+
+            if max_size % max_alignment != 0 {
+                max_size += max_alignment - (max_size % max_alignment);
+            }
+
             return Ok((max_size, offsets));
         }
 
-        let mut current_offset = 0;
-        let mut max_alignment = 1;
+        let mut current_offset = 0u32;
+        let mut max_alignment = declared_alignment;
 
         for field in &s.fields {
             let size = self.get_type_size(&field.data_type)?;
@@ -168,8 +187,28 @@ impl TypeChecker {
                 Stmt::Jmpto { args, .. } => {
                     self.verify_stmts_calls(args)?;
                 }
+                Stmt::Critical(body) => {
+                    if self.use_os {
+                        return Err("critical requires sc.false".to_string());
+                    }
+                    self.verify_stmts_calls(body)?;
+                }
                 Stmt::Expr(expr) => {
                     self.verify_expr_calls(expr)?;
+                }
+                Stmt::Match {
+                    expr,
+                    cases,
+                    default,
+                } => {
+                    self.verify_expr_calls(expr)?;
+                    for (ce, body) in cases {
+                        self.verify_expr_calls(ce)?;
+                        self.verify_stmts_calls(body)?;
+                    }
+                    if let Some(d) = default {
+                        self.verify_stmts_calls(d)?;
+                    }
                 }
                 _ => {}
             }
@@ -181,26 +220,52 @@ impl TypeChecker {
         match expr {
             Expr::Call { name, args } => {
                 let builtins = [
-                    "mloc",
+                    "syscall0",
+                    "syscall1",
+                    "syscall2",
+                    "syscall3",
+                    "syscall4",
+                    "syscall5",
+                    "syscall6",
                     "bmloc",
-                    "mfree",
-                    "sys_read",
-                    "sys_write",
-                    "sys_open",
-                    "sys_close",
-                    "sys_unlink",
-                    "sys_ioctl",
-                    "sys_exit",
-                    "sys_fork",
-                    "sys_execve",
-                    "sys_wait4",
                     "inb",
                     "outb",
                     "inw",
                     "outw",
                     "inl",
                     "outl",
+                    "sizeof",
+                    "alignof",
+                    "offsetof",
+                    "versionof",
+                    "fieldsof",
+                    "nameof",
+                    "atomic_load",
+                    "atomic_store",
+                    "atomic_add",
+                    "atomic_sub",
+                    "atomic_inc",
+                    "atomic_dec",
+                    "atomic_swap",
+                    "atomic_cas",
+                    "memory_barrier",
+                    "compiler_barrier",
                 ];
+
+                let hosted_only = [
+                    "syscall0",
+                    "syscall1",
+                    "syscall2",
+                    "syscall3",
+                    "syscall4",
+                    "syscall5",
+                    "syscall6",
+                ];
+
+                if hosted_only.contains(&name.as_str()) && !self.use_os {
+                    return Err(format!("'{}' requires sc.true", name));
+                }
+
                 if !builtins.contains(&name.as_str()) && !self.functions.contains_key(name) {
                     return Err(format!("call to undeclared function '{}'", name));
                 }

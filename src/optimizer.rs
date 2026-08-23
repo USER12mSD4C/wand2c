@@ -21,7 +21,11 @@ impl Optimizer {
 
                     let mut output_ptrs = HashSet::new();
                     for (_, name, access) in &func.params {
-                        if *access == PtrAccess::Output {
+                        if *access == PtrAccess::Output
+                            || *access == PtrAccess::InputOutput
+                            || *access == PtrAccess::Volatile
+                            || *access == PtrAccess::Atomic
+                        {
                             output_ptrs.insert(name.clone());
                         }
                     }
@@ -111,6 +115,23 @@ fn collect_escaped_stmt(stmt: &Stmt, escaped: &mut HashSet<String>) {
         }
         Stmt::Expr(expr) => {
             collect_escaped_expr(expr, escaped);
+        }
+        Stmt::Match {
+            expr,
+            cases,
+            default,
+        } => {
+            collect_escaped_expr(expr, escaped);
+            for (ce, body) in cases {
+                collect_escaped_expr(ce, escaped);
+                collect_escaped(body, escaped);
+            }
+            if let Some(d) = default {
+                collect_escaped(d, escaped);
+            }
+        }
+        Stmt::Critical(body) => {
+            collect_escaped(body, escaped);
         }
         _ => {}
     }
@@ -207,6 +228,23 @@ fn collect_reads_stmt(stmt: &Stmt, reads: &mut HashMap<String, usize>) {
         }
         Stmt::Expr(expr) => {
             collect_reads_expr(expr, reads);
+        }
+        Stmt::Match {
+            expr,
+            cases,
+            default,
+        } => {
+            collect_reads_expr(expr, reads);
+            for (ce, body) in cases {
+                collect_reads_expr(ce, reads);
+                collect_reads(body, reads);
+            }
+            if let Some(d) = default {
+                collect_reads(d, reads);
+            }
+        }
+        Stmt::Critical(body) => {
+            collect_reads(body, reads);
         }
         _ => {}
     }
@@ -490,7 +528,6 @@ fn optimize_expr_recursive(
 
     count += fold_commutative_chain(expr);
 
-    // Signed/mixed constant folding
     if let Expr::Binary { left, op, right } = expr {
         let op_str = op.clone();
         let a_opt = match &**left {
@@ -542,7 +579,6 @@ fn optimize_expr_recursive(
         }
     }
 
-    // Unsigned constant folding and algebraic simplifications
     if let Expr::Binary { left, op, right } = expr {
         let op_str = op.clone();
         if let (Expr::Number(a), Expr::Number(b)) = (&**left, &**right) {
@@ -844,6 +880,23 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<String>) {
         Stmt::Expr(expr) => {
             collect_assigned_expr(expr, assigned);
         }
+        Stmt::Match {
+            expr,
+            cases,
+            default,
+        } => {
+            collect_assigned_expr(expr, assigned);
+            for (ce, body) in cases {
+                collect_assigned_expr(ce, assigned);
+                collect_assigned(body, assigned);
+            }
+            if let Some(d) = default {
+                collect_assigned(d, assigned);
+            }
+        }
+        Stmt::Critical(body) => {
+            collect_assigned(body, assigned);
+        }
         _ => {}
     }
 }
@@ -904,7 +957,11 @@ fn optimize_statements(
     for stmt in stmts {
         match stmt {
             Stmt::VarDefinition(mut decl) => {
-                if decl.modifier == PtrAccess::Output {
+                if decl.modifier == PtrAccess::Output
+                    || decl.modifier == PtrAccess::InputOutput
+                    || decl.modifier == PtrAccess::Volatile
+                    || decl.modifier == PtrAccess::Atomic
+                {
                     output_ptrs.insert(decl.name.clone());
                 }
                 if let Some(ref mut init) = decl.initial_value {
@@ -924,7 +981,9 @@ fn optimize_statements(
                 }
 
                 if let Some(ref init) = decl.initial_value {
-                    if is_constant_expr(init) && !escaped.contains(&decl.name) {
+                    let is_mmio = decl.modifier == PtrAccess::Volatile
+                        || decl.modifier == PtrAccess::Atomic;
+                    if is_constant_expr(init) && !escaped.contains(&decl.name) && !is_mmio {
                         consts.insert(decl.name.clone(), *init.clone());
                     }
                 }
@@ -965,7 +1024,10 @@ fn optimize_statements(
                             target_path.as_str()
                         };
 
-                        if !escaped.contains(root) && !target_path.contains(':') {
+                        if !escaped.contains(root)
+                            && !target_path.contains(':')
+                            && !output_ptrs.contains(&target_path)
+                        {
                             if is_constant_expr(&value) {
                                 consts.insert(target_path, value.clone());
                             } else {
@@ -1183,6 +1245,42 @@ fn optimize_statements(
             Stmt::Expr(mut expr) => {
                 *count += optimize_expr_recursive(&mut expr, consts, escaped);
                 new_stmts.push(Stmt::Expr(expr));
+            }
+            Stmt::Critical(body) => {
+                let opt_body = optimize_statements(
+                    body,
+                    consts,
+                    escaped,
+                    reads,
+                    output_ptrs,
+                    count,
+                );
+                new_stmts.push(Stmt::Critical(opt_body));
+            }
+            Stmt::Match {
+                mut expr,
+                cases,
+                default,
+            } => {
+                *count += optimize_expr_recursive(&mut expr, consts, escaped);
+
+                let mut new_cases = Vec::new();
+                for (case_expr, body) in cases {
+                    let mut ce = case_expr;
+                    *count += optimize_expr_recursive(&mut ce, consts, escaped);
+                    let opt_body =
+                        optimize_statements(body, consts, escaped, reads, output_ptrs, count);
+                    new_cases.push((ce, opt_body));
+                }
+
+                let new_default = default
+                    .map(|d| optimize_statements(d, consts, escaped, reads, output_ptrs, count));
+
+                new_stmts.push(Stmt::Match {
+                    expr,
+                    cases: new_cases,
+                    default: new_default,
+                });
             }
             other => {
                 new_stmts.push(other);

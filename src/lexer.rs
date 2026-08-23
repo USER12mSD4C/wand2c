@@ -382,6 +382,10 @@ impl Lexer {
                 self.pos += 4; // * + a + d + r
                 return Token::AddrOf(name);
             }
+            if self.peek(1) == 'i' && self.peek(2) == 'o' && !self.peek(3).is_alphanumeric() {
+                self.pos += 3;
+                return Token::PtrInputOutputModifier(name);
+            }
             if self.peek(1) == 'i' && !self.peek(2).is_alphanumeric() {
                 self.pos += 2;
                 return Token::PtrInputModifier(name);
@@ -411,6 +415,19 @@ impl Lexer {
             "typedef" => Token::Typedef,
             "jmpto" => Token::Jmpto,
             "packed" => Token::Packed,
+            "extern" => Token::Extern,
+            "export" => Token::Export,
+            "volatile" => Token::Volatile,
+            "atomic" => Token::Atomic,
+            "critical" => Token::Critical,
+            "irq" => Token::Irq,
+            "align" => Token::Align,
+            "ro" => Token::Ro,
+            "noinit" => Token::Noinit,
+            "const" => Token::Const,
+            "match" => Token::Match,
+            "case" => Token::Case,
+            "default" => Token::Default,
             "u8" => Token::TypeU8,
             "u16" => Token::TypeU16,
             "u32" => Token::TypeU32,

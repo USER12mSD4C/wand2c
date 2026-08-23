@@ -21,20 +21,22 @@ enum VarState {
 }
 
 pub struct MemorySafetyAnalyzer {
-    // Состояния путей: "q" -> Safe, "q.doorbell_ptr" -> Uninitialized, и т.д.
     states: HashMap<String, VarState>,
     errors: Vec<String>,
+    source_lines: Vec<String>,
+    base_line: usize,
 }
 
 impl MemorySafetyAnalyzer {
-    pub fn new() -> Self {
-        Self {
-            states: HashMap::new(),
-            errors: Vec::new(),
-        }
+pub fn new() -> Self {
+    Self {
+        states: HashMap::new(),
+        errors: Vec::new(),
+        source_lines: Vec::new(),
+        base_line: 0,
     }
+}
 
-    // Форматирование типов данных в строку WandC для красивых подсказок
     fn format_data_type(dt: &DataType) -> String {
         match dt {
             DataType::U8 => "u8".to_string(),
@@ -54,7 +56,6 @@ impl MemorySafetyAnalyzer {
         }
     }
 
-    // Преобразует сложные AST-выражения доступа (a.b, a->b) в плоский строковый путь "a.b"
     fn get_expr_path(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Variable(name) => Some(name.clone()),
@@ -65,11 +66,46 @@ impl MemorySafetyAnalyzer {
                 Some(format!("{}.{}", base_path, member))
             }
             Expr::Index { expr: base, .. } => {
-                // Для массивов отслеживаем базовый массив
                 self.get_expr_path(base)
             }
             _ => None,
         }
+    }
+
+    fn push_error(&mut self, severity: &str, message: &str, relative_line: usize, note: &str) {
+        let abs_line = if self.base_line > 0 {
+            self.base_line + relative_line
+        } else {
+            relative_line
+        };
+        let mut err = String::new();
+        if severity == "error" {
+            err.push_str(&format!("\x1b[31;1merror\x1b[0m: {}\n", message));
+        } else {
+            err.push_str(&format!("\x1b[33;1mwarning\x1b[0m: {}\n", message));
+        }
+        err.push_str(&format!("  \x1b[34;1m-->\x1b[0m line {}\n", abs_line));
+        if !self.source_lines.is_empty() && abs_line > 0 && abs_line <= self.source_lines.len() {
+            let start = if abs_line > 2 { abs_line - 2 } else { 1 };
+            let end = if abs_line + 1 <= self.source_lines.len() {
+                abs_line + 1
+            } else {
+                self.source_lines.len()
+            };
+            err.push_str("   |\n");
+            for i in start..=end {
+                let marker = if i == abs_line { ">" } else { " " };
+                err.push_str(&format!(
+                    "{} {:3} | {}\n",
+                    marker,
+                    i,
+                    self.source_lines[i - 1]
+                ));
+            }
+            err.push_str("   |\n");
+        }
+        err.push_str(&format!("  \x1b[32;1mnote\x1b[0m: {}\n", note));
+        self.errors.push(err);
     }
 
     fn is_allocation_call(&self, expr: &Expr) -> bool {
@@ -84,11 +120,16 @@ impl MemorySafetyAnalyzer {
         &mut self,
         func: &FuncDecl,
         structs: &HashMap<String, StructDecl>,
+        source: Option<&str>,
+        base_line: usize,
     ) -> Result<(), Vec<String>> {
         self.states.clear();
         self.errors.clear();
+        self.source_lines = source
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+        self.base_line = base_line;
 
-        // Параметры функции по умолчанию считаются инициализированными и безопасными
         for (dt, name, _) in &func.params {
             self.states.insert(name.clone(), VarState::Safe);
             self.register_struct_fields(name, dt, structs, VarState::Safe);
@@ -98,16 +139,19 @@ impl MemorySafetyAnalyzer {
             self.analyze_statements(body, structs);
         }
 
-        // Поиск утечек памяти в конце функции
-        for (path, state) in &self.states {
+        let states_snapshot = self.states.clone();
+        for (path, state) in &states_snapshot {
             if let VarState::Allocated { allocated_line, .. } = state {
-                // Если путь не содержит точек (это корень), рапортуем об утечке
                 if !path.contains('.') {
-                    self.errors.push(format!(
-                        "\x1b[33;1mwarning\x1b[0m: potential memory leak in function '{}'\n\
-                         \x1b[34;1m  -->\x1b[0m Pointer '{}' allocated on line {} was never freed via 'mfree()'.",
-                        func.name, path, allocated_line
-                    ));
+                    self.push_error(
+                        "warning",
+                        &format!(
+                            "potential memory leak in function '{}': pointer '{}' was never freed via 'mfree()'",
+                            func.name, path
+                        ),
+                        *allocated_line,
+                        "call mfree(ptr) before the function returns, or document that ownership is transferred",
+                    );
                 }
             }
         }
@@ -119,7 +163,6 @@ impl MemorySafetyAnalyzer {
         }
     }
 
-    // Регистрация полей структуры для отслеживания неинициализированного состояния
     fn register_struct_fields(
         &mut self,
         prefix: &str,
@@ -154,7 +197,6 @@ impl MemorySafetyAnalyzer {
 
                 self.states.insert(field_path.clone(), field_state.clone());
 
-                // Рекурсивно регистрируем вложенные структуры
                 self.register_struct_fields(&field_path, &field.data_type, structs, field_state);
             }
         }
@@ -163,14 +205,11 @@ impl MemorySafetyAnalyzer {
     fn check_lhs_safety(&mut self, expr: &Expr, line: usize) {
         match expr {
             Expr::Variable(_) => {
-                // Перезапись локальной переменной всегда безопасна
             }
             Expr::MemberAccess { expr: base, .. } => {
-                // Проверяем безопасность базовой структуры/указателя, но не само перезаписываемое поле
                 self.check_expression_safety(base, line);
             }
             Expr::Index { expr: base, index } => {
-                // Проверяем безопасность базового массива и используемого индекса
                 self.check_expression_safety(base, line);
                 self.check_expression_safety(index, line);
             }
@@ -202,6 +241,26 @@ impl MemorySafetyAnalyzer {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn branch_terminates(stmts: &[Stmt]) -> bool {
+        if stmts.is_empty() {
+            return false;
+        }
+        match stmts.last().unwrap() {
+            Stmt::Return(_) => true,
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::branch_terminates(then_branch)
+                    && else_branch
+                        .as_ref()
+                        .map_or(false, |e| Self::branch_terminates(e))
+            }
+            _ => false,
         }
     }
 
@@ -238,7 +297,6 @@ impl MemorySafetyAnalyzer {
                             );
                         }
                     } else {
-                        // Если это указатель, помечаем его как неинициализированный
                         if matches!(decl.data_type, DataType::Pointer(_)) {
                             self.states.insert(
                                 decl.name.clone(),
@@ -249,7 +307,6 @@ impl MemorySafetyAnalyzer {
                             );
                         } else {
                             self.states.insert(decl.name.clone(), VarState::Safe);
-                            // Если это структура на стеке, регистрируем её поля как неинициализированные
                             self.register_struct_fields(
                                 &decl.name,
                                 &decl.data_type,
@@ -271,7 +328,7 @@ impl MemorySafetyAnalyzer {
 
                         if let Some(path) = self.get_expr_path(target) {
                             if is_alloc {
-                                let type_str = "void*".to_string(); // Временное имя типа для аллокаций
+                                let type_str = "void*".to_string();
                                 self.states.insert(
                                     path.clone(),
                                     VarState::Allocated {
@@ -281,7 +338,6 @@ impl MemorySafetyAnalyzer {
                                     },
                                 );
                             } else {
-                                // Запись в путь делает его безопасным (инициализированным)
                                 self.states.insert(path.clone(), VarState::Safe);
                             }
                         }
@@ -308,7 +364,6 @@ impl MemorySafetyAnalyzer {
                         }
                     }
 
-                    // Анализ ветки THEN
                     let mut then_states = self.states.clone();
                     if let Some(ref path) = checked_var {
                         if check_is_not_null {
@@ -329,14 +384,18 @@ impl MemorySafetyAnalyzer {
                             }
                         }
                     }
+
                     let mut then_analyzer = MemorySafetyAnalyzer {
                         states: then_states.clone(),
                         errors: Vec::new(),
+                        source_lines: self.source_lines.clone(),
+                        base_line: self.base_line,
                     };
                     then_analyzer.analyze_statements(then_branch, structs);
                     self.errors.extend(then_analyzer.errors);
 
-                    // Анализ ветки ELSE
+                    let then_terminates = Self::branch_terminates(then_branch);
+
                     let mut else_states = self.states.clone();
                     if let Some(else_stmts) = else_branch {
                         if let Some(ref path) = checked_var {
@@ -358,18 +417,30 @@ impl MemorySafetyAnalyzer {
                                 }
                             }
                         }
+
                         let mut else_analyzer = MemorySafetyAnalyzer {
                             states: else_states.clone(),
                             errors: Vec::new(),
+                            source_lines: self.source_lines.clone(),
+                            base_line: self.base_line,
                         };
                         else_analyzer.analyze_statements(else_stmts, structs);
                         self.errors.extend(else_analyzer.errors);
 
-                        // Сливаем состояния веток
-                        self.merge_states(then_analyzer.states, else_analyzer.states);
+                        let else_terminates = Self::branch_terminates(else_stmts);
+
+                        if then_terminates && else_terminates {
+                        } else if then_terminates {
+                            self.states = else_analyzer.states;
+                        } else if else_terminates {
+                            self.states = then_analyzer.states;
+                        } else {
+                            self.merge_states(then_analyzer.states, else_analyzer.states);
+                        }
                     } else {
-                        // Если else нет, берем консервативные состояния из then
-                        self.states = then_analyzer.states;
+                        if !then_terminates {
+                            self.states = then_analyzer.states;
+                        }
                     }
                 }
                 Stmt::While { cond, body } => {
@@ -419,15 +490,29 @@ impl MemorySafetyAnalyzer {
                         }
                     }
                 }
+                Stmt::Critical(body) => {
+                    self.analyze_statements(body, structs);
+                }
+                Stmt::Match {
+                    expr,
+                    cases,
+                    default,
+                } => {
+                    self.check_expression_safety(expr, current_line);
+                    for (ce, body) in cases {
+                        self.check_expression_safety(ce, current_line);
+                        self.analyze_statements(body, structs);
+                    }
+                    if let Some(d) = default {
+                        self.analyze_statements(d, structs);
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     fn check_expression_safety(&mut self, expr: &Expr, line: usize) {
-        // Правило передачи адреса (Escape Analysis):
-        // Если адрес переменной передается в функцию (q*adr), мы предполагаем,
-        // что функция проведет инициализацию, и помечаем этот путь и все его поля как безопасные.
         if let Expr::AddrOf(name) = expr {
             self.states.insert(name.clone(), VarState::Safe);
             let prefix = format!("{}.", name);
@@ -449,39 +534,43 @@ impl MemorySafetyAnalyzer {
                     if let Some(state) = self.states.get(&path) {
                         match state {
                             VarState::Uninitialized {
-                                declared_line,
+                                declared_line: _,
                                 type_name,
                             } => {
                                 let is_field = path.contains('.');
-                                let err_msg = if is_field {
+                                if is_field {
                                     let parts: Vec<&str> = path.split('.').collect();
-                                    format!(
-                                        "\x1b[31;1merror\x1b[0m: use of uninitialized field '{}' of struct '{}'\n\
-                                         \x1b[34;1m  -->\x1b[0m line {}\n\
-                                         \x1b[37;1m  help\x1b[0m: Field '{}' was declared on line {} but never initialized.\n\
-                                         \x1b[32;1m  suggestion\x1b[0m: initialize the field before use:\n\
-                                         \x1b[32;1m             {}.{} = ...;",
-                                        parts[1], parts[0], line, parts[1], declared_line, parts[0], parts[1]
-                                    )
+                                    self.push_error(
+                                        "error",
+                                        &format!(
+                                            "use of uninitialized field '{}' of struct '{}'",
+                                            parts[1], parts[0]
+                                        ),
+                                        line,
+                                        &format!("initialize the field before use: {}.{} = ...;", parts[0], parts[1]),
+                                    );
                                 } else {
-                                    format!(
-                                        "\x1b[31;1merror\x1b[0m: use of potentially uninitialized variable '{}'\n\
-                                         \x1b[34;1m  -->\x1b[0m line {}\n\
-                                         \x1b[37;1m  help\x1b[0m: Variable '{}' of type '{}' was declared on line {} but never initialized.\n\
-                                         \x1b[32;1m  suggestion\x1b[0m: initialize it: '{} {} = null;'",
-                                        path, line, path, type_name, declared_line, type_name, path
-                                    )
-                                };
-                                self.errors.push(err_msg);
+                                    self.push_error(
+                                        "error",
+                                        &format!("use of potentially uninitialized variable '{}'", path),
+                                        line,
+                                        &format!("initialize it: '{} {} = null;'", type_name, path),
+                                    );
+                                }
                             }
                             VarState::Freed { freed_line } => {
-                                self.errors.push(format!(
-                                    "\x1b[31;1merror\x1b[0m: use-after-free violation on pointer '{}'\n\
-                                     \x1b[34;1m  -->\x1b[0m line {}\n\
-                                     \x1b[37;1m  help\x1b[0m: Memory pointed to by '{}' was already freed on line {}.\n\
-                                     \x1b[32;1m  suggestion\x1b[0m: remove this access or re-allocate the pointer before use.",
-                                    path, line, path, freed_line
-                                ));
+                                self.push_error(
+                                    "error",
+                                    &format!(
+                                        "use-after-free violation on pointer '{}'",
+                                        path
+                                    ),
+                                    line,
+                                    &format!(
+                                        "pointer '{}' was freed on line {}, remove this access or re-allocate before use",
+                                        path, freed_line
+                                    ),
+                                );
                             }
                             _ => {}
                         }
@@ -506,12 +595,15 @@ impl MemorySafetyAnalyzer {
                                 ..
                             }) = self.states.get(&path)
                             {
-                                self.errors.push(format!(
-                                    "\x1b[33;1mwarning\x1b[0m: freeing potentially null pointer '{}'\n\
-                                     \x1b[34;1m  -->\x1b[0m line {}\n\
-                                     \x1b[37;1m  help\x1b[0m: Pointer '{}' was allocated on line {} but never checked for 'null'.",
-                                    path, line, path, allocated_line
-                                ));
+                                self.push_error(
+                                    "warning",
+                                    &format!("freeing potentially null pointer '{}'", path),
+                                    line,
+                                    &format!(
+                                        "pointer '{}' was allocated on line {} but never checked for null, add if ({} != null) before mfree",
+                                        path, allocated_line, path
+                                    ),
+                                );
                             }
                         }
                     }
@@ -520,7 +612,6 @@ impl MemorySafetyAnalyzer {
             _ => {}
         }
 
-        // Проверка потенциального разыменования NULL через оператор -> (для полей)
         if let Expr::MemberAccess {
             expr: base,
             is_arrow: true,
@@ -529,33 +620,33 @@ impl MemorySafetyAnalyzer {
         {
             if let Some(path) = self.get_expr_path(base) {
                 if let Some(VarState::Allocated {
-                    allocated_line,
+                    allocated_line: _,
                     checked_not_null: false,
                     ..
                 }) = self.states.get(&path)
                 {
-                    self.errors.push(format!(
-                        "\x1b[31;1merror\x1b[0m: potential null pointer dereference of '{}' when accessing field '{}'\n\
-                         \x1b[34;1m  -->\x1b[0m line {}\n\
-                         \x1b[37;1m  help\x1b[0m: Pointer '{}' was allocated on line {} but never checked for 'null'.\n\
-                         \x1b[32;1m  suggestion\x1b[0m: wrap this block in a null-check:\n\
-                         \x1b[32;1m            if ({} != null) {{\n\
-                         \x1b[32;1m                // access {}.{} safely\n\
-                         \x1b[32;1m            }} \x1b[0m",
-                        path, member, line, path, allocated_line, path, path, member
-                    ));
+                    self.push_error(
+                        "error",
+                        &format!(
+                            "potential null pointer dereference of '{}' when accessing field '{}'",
+                            path, member
+                        ),
+                        line,
+                        &format!(
+                            "wrap in null check: if ({} != null) {{ ... }}",
+                            path
+                        ),
+                    );
                 }
             }
         }
     }
 
-    // Слияние веток
     fn merge_states(
         &mut self,
         branch_a: HashMap<String, VarState>,
         branch_b: HashMap<String, VarState>,
     ) {
-        // Collect all keys from both branches
         let all_keys: std::collections::HashSet<String> =
             branch_a.keys().chain(branch_b.keys()).cloned().collect();
 
@@ -567,8 +658,6 @@ impl MemorySafetyAnalyzer {
                     } else {
                         match (state_a, state_b) {
                             (VarState::Freed { .. }, _) | (_, VarState::Freed { .. }) => {
-                                // If freed in either branch, conservatively mark as Freed
-                                // (use the earlier freed_line)
                                 let freed_line = match state_a {
                                     VarState::Freed { freed_line } => *freed_line,
                                     _ => match state_b {
@@ -604,7 +693,7 @@ impl MemorySafetyAnalyzer {
                                     name,
                                     VarState::Allocated {
                                         allocated_line: *allocated_line,
-                                        checked_not_null: false, // conservative
+                                        checked_not_null: false,
                                         type_name: type_name.clone(),
                                     },
                                 );
@@ -616,8 +705,6 @@ impl MemorySafetyAnalyzer {
                     }
                 }
                 (Some(state), None) | (None, Some(state)) => {
-                    // Key exists only in one branch — conservatively mark as Safe
-                    // (or keep the state if it's Freed)
                     match state {
                         VarState::Freed { .. } => {
                             self.states.insert(name, state.clone());

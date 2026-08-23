@@ -69,7 +69,7 @@ impl Parser {
             | Token::TypeF64
             | Token::TypeVoid => true,
             Token::Ident(_) => match &self.peek_token {
-                Token::Ident(_) | Token::PtrInputModifier(_) | Token::PtrOutputModifier(_) => true,
+                Token::Ident(_) | Token::PtrInputModifier(_) | Token::PtrOutputModifier(_) | Token::PtrInputOutputModifier(_) => true,
                 _ => false,
             },
             _ => false,
@@ -82,6 +82,8 @@ impl Parser {
             imports: Vec::new(),
             typedefs: Vec::new(),
             structs: Vec::new(),
+            enums: Vec::new(),
+            constants: Vec::new(),
             sections: Vec::new(),
             functions: Vec::new(),
         };
@@ -99,7 +101,7 @@ impl Parser {
         while self.current_token != Token::EOF {
             match &self.current_token {
                 Token::Import => {
-                    self.step(); // consume 'import'
+                    self.step();
                     let mut import_path = String::new();
                     while self.current_token != Token::Semicolon && self.current_token != Token::EOF
                     {
@@ -132,8 +134,25 @@ impl Parser {
                         self.step();
                     }
                 }
+                Token::Const => {
+                    self.step();
+                    let name = match &self.current_token {
+                        Token::Ident(n) => n.clone(),
+                        _ => return Err(self.err("Expected constant name")),
+                    };
+                    self.step();
+                    if self.current_token != Token::OpAssign {
+                        return Err(self.err("Expected '=' after constant name"));
+                    }
+                    self.step();
+                    let value = self.parse_expr()?;
+                    if self.current_token == Token::Semicolon {
+                        self.step();
+                    }
+                    program.constants.push(ConstDecl { name, value });
+                }
                 Token::Union => {
-                    self.step(); // consume 'union'
+                    self.step();
                     let name = match &self.current_token {
                         Token::Ident(n) => n.clone(),
                         _ => return Err(self.err("Expected union name")),
@@ -192,55 +211,73 @@ impl Parser {
                         version,
                         fields,
                         is_union: true,
-                        is_packed: false, // Объединения не упаковываются по умолчанию
+                        is_packed: false,
+                        alignment: 0,
                     });
                 }
                 Token::Enum => {
-                    self.step(); // consume 'enum'
-                    let _name = match &self.current_token {
+                    self.step();
+                    let name = match &self.current_token {
                         Token::Ident(n) => n.clone(),
                         _ => return Err(self.err("Expected enum name")),
                     };
                     self.step();
-
+                    let mut version = 1;
                     if self.current_token == Token::Version {
                         self.step();
-                        if let Token::Number(_) = self.current_token {
+                        if let Token::Number(v) = self.current_token {
+                            version = v as u32;
                             self.step();
                         }
                     }
-
                     if self.current_token != Token::LBrace {
                         return Err(self.err("Expected '{' after enum name"));
                     }
                     self.step();
-
+                    let mut values = Vec::new();
+                    let mut next_value: u64 = 0;
                     while self.current_token != Token::RBrace && self.current_token != Token::EOF {
-                        let _val_name = match &self.current_token {
+                        let value_name = match &self.current_token {
                             Token::Ident(n) => n.clone(),
                             _ => return Err(self.err("Expected enum value identifier")),
                         };
                         self.step();
-
+                        let mut value = next_value;
                         if self.current_token == Token::OpAssign {
                             self.step();
-                            if let Token::Number(_) = self.current_token {
+                            if let Token::Number(n) = self.current_token {
+                                value = n;
                                 self.step();
+                            } else {
+                                return Err(self.err("Enum value must be an integer literal"));
                             }
                         }
-
+                        let mut version_added = 1;
+                        let version_removed = 0xFFFFFFFF;
                         if self.current_token == Token::Version {
                             self.step();
-                            if let Token::Number(_) = self.current_token {
+                            if let Token::Number(v) = self.current_token {
+                                version_added = v as u32;
                                 self.step();
                             }
                         }
-
-                        if self.current_token == Token::Comma {
+                        values.push(EnumValueDecl {
+                            name: value_name,
+                            value,
+                            version_added,
+                            version_removed,
+                        });
+                        next_value = value.wrapping_add(1);
+                        if self.current_token == Token::Semicolon || self.current_token == Token::Comma {
                             self.step();
                         }
                     }
                     self.step();
+                    program.enums.push(EnumDecl {
+                        name,
+                        version,
+                        values,
+                    });
                 }
                 Token::Typedef => {
                     self.step();
@@ -255,8 +292,67 @@ impl Parser {
                     }
                     program.typedefs.push((alias_name, underlying));
                 }
+
+                Token::Align | Token::Ro | Token::Noinit => {
+                    let mut sect_alignment = 0u32;
+                    let mut sect_ro = false;
+                    let mut sect_noinit = false;
+                    loop {
+                        if self.current_token == Token::Align {
+                            self.step();
+                            if self.current_token != Token::LParen {
+                                return Err(self.err("Expected '(' after align"));
+                            }
+                            self.step();
+                            let alignment = match self.current_token {
+                                Token::Number(n) => n as u32,
+                                _ => return Err(self.err("Expected alignment number")),
+                            };
+                            self.step();
+                            if alignment == 0 || (alignment & (alignment - 1)) != 0 {
+                                return Err(self.err("align value must be a power of two"));
+                            }
+                            if self.current_token != Token::RParen {
+                                return Err(self.err("Expected ')' after alignment"));
+                            }
+                            self.step();
+                            sect_alignment = alignment;
+                        } else if self.current_token == Token::Ro {
+                            self.step();
+                            sect_ro = true;
+                        } else if self.current_token == Token::Noinit {
+                            self.step();
+                            sect_noinit = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    if self.current_token == Token::Packed {
+                        self.step();
+                        if self.current_token != Token::Struct {
+                            return Err(self.err("Expected 'struct' after 'packed'"));
+                        }
+                        let mut s_decl = self.parse_struct_decl()?;
+                        s_decl.is_packed = true;
+                        s_decl.alignment = sect_alignment;
+                        program.structs.push(s_decl);
+                    } else if self.current_token == Token::Struct {
+                        let mut s_decl = self.parse_struct_decl()?;
+                        s_decl.alignment = sect_alignment;
+                        program.structs.push(s_decl);
+                    } else if self.current_token == Token::Sect {
+                        let mut sect_decl = self.parse_section_decl()?;
+                        sect_decl.alignment = sect_alignment;
+                        sect_decl.is_ro = sect_ro;
+                        sect_decl.is_noinit = sect_noinit;
+                        program.sections.push(sect_decl);
+                    } else {
+                        return Err(self.err("align/ro/noinit requires struct or sect"));
+                    }
+                }
+
                 Token::Packed => {
-                    self.step(); // consume 'packed'
+                    self.step();
                     if self.current_token == Token::Struct {
                         let mut s_decl = self.parse_struct_decl()?;
                         s_decl.is_packed = true;
@@ -273,6 +369,33 @@ impl Parser {
                     let sect_decl = self.parse_section_decl()?;
                     program.sections.push(sect_decl);
                 }
+                Token::Extern => {
+                    self.step();
+                    if self.current_token != Token::Fn {
+                        return Err(self.err("Expected 'fn' after 'extern'"));
+                    }
+                    let mut func_decl = self.parse_function_signature()?;
+                    func_decl.is_extern = true;
+                    program.functions.push(func_decl);
+                }
+                Token::Export => {
+                    self.step();
+                    if self.current_token != Token::Fn {
+                        return Err(self.err("Expected 'fn' after 'export'"));
+                    }
+                    let mut func_decl = self.parse_function_signature()?;
+                    func_decl.is_export = true;
+                    program.functions.push(func_decl);
+                }
+                Token::Irq => {
+                    self.step();
+                    if self.current_token != Token::Fn {
+                        return Err(self.err("Expected 'fn' after 'irq'"));
+                    }
+                    let mut func_decl = self.parse_function_signature()?;
+                    func_decl.is_irq = true;
+                    program.functions.push(func_decl);
+                }
                 Token::Fn => {
                     let func_decl = self.parse_function_signature()?;
                     program.functions.push(func_decl);
@@ -288,20 +411,34 @@ impl Parser {
         while self.current_token != Token::EOF {
             if self.current_token == Token::Fn {
                 self.step();
+
                 if let Token::Ident(n) = &self.current_token {
                     if n == name {
+                        self.step();
+
                         while self.current_token != Token::LBrace
+                            && self.current_token != Token::Semicolon
                             && self.current_token != Token::EOF
                         {
                             self.step();
                         }
-                        return Ok(());
+
+                        if self.current_token == Token::LBrace {
+                            return Ok(());
+                        }
+
+                        return Err(self.err(&format!("Function {} has no body", name)));
                     }
                 }
             }
+
             self.step();
         }
-        Err(self.err(&format!("Function {} not found for second pass", name)))
+
+        Err(self.err(&format!(
+            "Function {} not found for second pass",
+            name
+        )))
     }
 
     pub fn parse_function_body(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -328,7 +465,76 @@ impl Parser {
             Token::While => self.parse_while_statement(),
             Token::For => self.parse_for_statement(),
             Token::Jmpto => self.parse_jmpto_statement(),
+            Token::Match => self.parse_match_statement(),
+            Token::Critical => {
+                self.step();
+                if self.current_token != Token::LBrace {
+                    return Err(self.err("Expected '{' after critical"));
+                }
+                self.step();
 
+                let mut body = Vec::new();
+                while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                    body.push(self.parse_statement()?);
+                }
+
+                if self.current_token == Token::RBrace {
+                    self.step();
+                }
+
+                Ok(Stmt::Critical(body))
+            }
+            Token::Volatile | Token::Atomic => {
+                let forced_modifier = if self.current_token == Token::Volatile {
+                    PtrAccess::Volatile
+                } else {
+                    PtrAccess::Atomic
+                };
+
+                self.step();
+
+                let dt = self.parse_data_type()?;
+                let mut var_decl = self.parse_var_decl_tail(dt)?;
+
+                if var_decl.modifier != PtrAccess::Normal {
+                    return Err(self.err("volatile/atomic cannot be combined with *i or *o"));
+                }
+
+                var_decl.modifier = forced_modifier;
+
+                if self.current_token == Token::Semicolon {
+                    self.step();
+                }
+
+                Ok(Stmt::VarDefinition(var_decl))
+            }
+
+            Token::Align => {
+                self.step();
+                if self.current_token != Token::LParen {
+                    return Err(self.err("Expected '(' after align"));
+                }
+                self.step();
+                let alignment = match self.current_token {
+                    Token::Number(n) => n as u32,
+                    _ => return Err(self.err("Expected alignment number")),
+                };
+                self.step();
+                if alignment == 0 || (alignment & (alignment - 1)) != 0 {
+                    return Err(self.err("align value must be a power of two"));
+                }
+                if self.current_token != Token::RParen {
+                    return Err(self.err("Expected ')' after alignment"));
+                }
+                self.step();
+                let dt = self.parse_data_type()?;
+                let mut var_decl = self.parse_var_decl_tail(dt)?;
+                var_decl.alignment = alignment;
+                if self.current_token == Token::Semicolon {
+                    self.step();
+                }
+                Ok(Stmt::VarDefinition(var_decl))
+            }
             Token::TypeU8
             | Token::TypeU16
             | Token::TypeU32
@@ -340,7 +546,8 @@ impl Parser {
             | Token::TypeF64
             | Token::TypeVoid => {
                 let dt = self.parse_data_type()?;
-                let var_decl = self.parse_var_decl_tail(dt)?;
+                let mut var_decl = self.parse_var_decl_tail(dt)?;
+                var_decl.alignment = 0;
                 if self.current_token == Token::Semicolon {
                     self.step();
                 }
@@ -361,6 +568,7 @@ impl Parser {
                     Token::Ident(_)
                     | Token::PtrInputModifier(_)
                     | Token::PtrOutputModifier(_)
+                    | Token::PtrInputOutputModifier(_)
                     | Token::OpMul => true,
                     _ => false,
                 };
@@ -437,7 +645,7 @@ impl Parser {
     }
 
     fn parse_jmpto_statement(&mut self) -> Result<Stmt, ParseError> {
-        self.step(); // consume 'jmpto'
+        self.step();
 
         let mut module_name = String::new();
         match &self.current_token {
@@ -475,6 +683,82 @@ impl Parser {
         }
 
         Ok(Stmt::Jmpto { module_name, args })
+    }
+
+    fn parse_match_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.step();
+        if self.current_token != Token::LParen {
+            return Err(self.err("Expected '(' after 'match'"));
+        }
+        self.step();
+
+        let expr = self.parse_expr()?;
+
+        if self.current_token != Token::RParen {
+            return Err(self.err("Expected ')' after match expression"));
+        }
+        self.step();
+
+        if self.current_token != Token::LBrace {
+            return Err(self.err("Expected '{' after match expression"));
+        }
+        self.step();
+
+        let mut cases = Vec::new();
+        let mut default = None;
+
+        while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+            if self.current_token == Token::Case {
+                self.step();
+                let case_expr = self.parse_expr()?;
+
+                if self.current_token != Token::LBrace {
+                    return Err(self.err("Expected '{' after case value"));
+                }
+                self.step();
+
+                let mut body = Vec::new();
+                while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                    body.push(self.parse_statement()?);
+                }
+
+                if self.current_token == Token::RBrace {
+                    self.step();
+                }
+
+                cases.push((case_expr, body));
+            } else if self.current_token == Token::Default {
+                self.step();
+
+                if self.current_token != Token::LBrace {
+                    return Err(self.err("Expected '{' after default"));
+                }
+                self.step();
+
+                let mut body = Vec::new();
+                while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                    body.push(self.parse_statement()?);
+                }
+
+                if self.current_token == Token::RBrace {
+                    self.step();
+                }
+
+                default = Some(body);
+            } else {
+                return Err(self.err("Expected 'case' or 'default' inside match"));
+            }
+        }
+
+        if self.current_token == Token::RBrace {
+            self.step();
+        }
+
+        Ok(Stmt::Match {
+            expr,
+            cases,
+            default,
+        })
     }
 
     fn parse_if_statement(&mut self) -> Result<Stmt, ParseError> {
@@ -692,12 +976,26 @@ impl Parser {
 
         let mut fields = Vec::new();
         while self.current_token != Token::RBrace && self.current_token != Token::EOF {
-            let field_type = self.parse_data_type()?;
+            let mut field_type = self.parse_data_type()?;
             let field_name = match &self.current_token {
                 Token::Ident(n) => n.clone(),
                 _ => return Err(self.err("Expected field name")),
             };
             self.step();
+
+            if self.current_token == Token::LBracket {
+                self.step();
+                let count = match self.current_token {
+                    Token::Number(n) => n as usize,
+                    _ => return Err(self.err("Expected array size number")),
+                };
+                self.step();
+                if self.current_token != Token::RBracket {
+                    return Err(self.err("Expected ']' after array size"));
+                }
+                self.step();
+                field_type = DataType::Array(Box::new(field_type), count);
+            }
 
             let mut f_version_added = 1;
             let f_version_removed = 0xFFFFFFFF;
@@ -729,6 +1027,7 @@ impl Parser {
             fields,
             is_union: false,
             is_packed,
+            alignment: 0,
         })
     }
 
@@ -745,16 +1044,42 @@ impl Parser {
 
         let mut variables = Vec::new();
         while self.current_token != Token::Eos && self.current_token != Token::EOF {
+            let mut forced_modifier = PtrAccess::Normal;
+
+            if self.current_token == Token::Volatile || self.current_token == Token::Atomic {
+                forced_modifier = if self.current_token == Token::Volatile {
+                    PtrAccess::Volatile
+                } else {
+                    PtrAccess::Atomic
+                };
+                self.step();
+            }
+
             let var_type = self.parse_data_type()?;
-            let var_decl = self.parse_var_decl_tail(var_type)?;
+            let mut var_decl = self.parse_var_decl_tail(var_type)?;
+
+            if forced_modifier != PtrAccess::Normal {
+                if var_decl.modifier != PtrAccess::Normal {
+                    return Err(self.err("volatile/atomic cannot be combined with *i or *o"));
+                }
+                var_decl.modifier = forced_modifier;
+            }
+
             variables.push(var_decl);
+
             if self.current_token == Token::Semicolon {
                 self.step();
             }
         }
         self.step();
 
-        Ok(SectionDecl { name, variables })
+        Ok(SectionDecl {
+            name,
+            variables,
+            alignment: 0,
+            is_ro: false,
+            is_noinit: false,
+        })
     }
 
     fn parse_function_signature(&mut self) -> Result<FuncDecl, ParseError> {
@@ -777,6 +1102,7 @@ impl Parser {
                 Token::Ident(n) => (n.clone(), PtrAccess::Normal),
                 Token::PtrInputModifier(n) => (n.clone(), PtrAccess::Input),
                 Token::PtrOutputModifier(n) => (n.clone(), PtrAccess::Output),
+                Token::PtrInputOutputModifier(n) => (n.clone(), PtrAccess::InputOutput),
                 _ => return Err(self.err("Expected parameter name")),
             };
             self.step();
@@ -813,6 +1139,9 @@ impl Parser {
                 params,
                 return_types,
                 body: None,
+                is_extern: false,
+                is_export: false,
+                is_irq: false,
             });
         }
 
@@ -825,6 +1154,9 @@ impl Parser {
             params,
             return_types,
             body: None,
+            is_extern: false,
+            is_export: false,
+            is_irq: false,
         })
     }
 
@@ -833,6 +1165,7 @@ impl Parser {
             Token::Ident(n) => (n.clone(), PtrAccess::Normal),
             Token::PtrInputModifier(n) => (n.clone(), PtrAccess::Input),
             Token::PtrOutputModifier(n) => (n.clone(), PtrAccess::Output),
+            Token::PtrInputOutputModifier(n) => (n.clone(), PtrAccess::InputOutput),
             _ => return Err(self.err("Expected variable name")),
         };
         self.step();
@@ -861,6 +1194,7 @@ impl Parser {
             data_type: base_type,
             modifier,
             initial_value,
+            alignment: 0,
         })
     }
 
@@ -1101,6 +1435,46 @@ impl Parser {
             Token::Null => {
                 self.step();
                 Ok(Expr::Null)
+            }
+            Token::TypeU8 => {
+                self.step();
+                Ok(Expr::Variable("u8".to_string()))
+            }
+            Token::TypeU16 => {
+                self.step();
+                Ok(Expr::Variable("u16".to_string()))
+            }
+            Token::TypeU32 => {
+                self.step();
+                Ok(Expr::Variable("u32".to_string()))
+            }
+            Token::TypeU64 => {
+                self.step();
+                Ok(Expr::Variable("u64".to_string()))
+            }
+            Token::TypeI8 => {
+                self.step();
+                Ok(Expr::Variable("i8".to_string()))
+            }
+            Token::TypeI16 => {
+                self.step();
+                Ok(Expr::Variable("i16".to_string()))
+            }
+            Token::TypeI32 => {
+                self.step();
+                Ok(Expr::Variable("i32".to_string()))
+            }
+            Token::TypeI64 => {
+                self.step();
+                Ok(Expr::Variable("i64".to_string()))
+            }
+            Token::TypeF64 => {
+                self.step();
+                Ok(Expr::Variable("f64".to_string()))
+            }
+            Token::TypeVoid => {
+                self.step();
+                Ok(Expr::Variable("void".to_string()))
             }
             _ => Err(self.err("Unexpected primary expression")),
         }
