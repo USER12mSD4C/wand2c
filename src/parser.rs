@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::Token;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -14,31 +15,34 @@ pub struct Parser {
     current_span: Span,
     peek_token: Token,
     peek_span: Span,
+    constants: HashMap<String, u64>,
 }
 
 impl Parser {
-    pub fn new(lexer: Lexer) -> Self {
-        let mut p = Self {
-            lexer,
-            current_token: Token::EOF,
-            current_span: Span {
-                line: 1,
-                col: 1,
-                start: 0,
-                end: 0,
-            },
-            peek_token: Token::EOF,
-            peek_span: Span {
-                line: 1,
-                col: 1,
-                start: 0,
-                end: 0,
-            },
-        };
-        p.step();
-        p.step();
-        p
-    }
+pub fn new(lexer: Lexer) -> Self {
+    let mut p = Self {
+        lexer,
+        current_token: Token::EOF,
+        current_span: Span {
+            line: 1,
+            col: 1,
+            start: 0,
+            end: 0,
+        },
+        peek_token: Token::EOF,
+        peek_span: Span {
+            line: 1,
+            col: 1,
+            start: 0,
+            end: 0,
+        },
+        constants: HashMap::new(),
+    };
+
+    p.step();
+    p.step();
+    p
+}
 
     fn step(&mut self) {
         self.current_token = self.peek_token.clone();
@@ -53,6 +57,121 @@ impl Parser {
         ParseError {
             message: msg.to_string(),
             span: self.current_span,
+        }
+    }
+
+    fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {
+        self.step();
+
+        let name = match &self.current_token {
+            Token::Ident(n) => n.clone(),
+            _ => return Err(self.err("Expected constant name")),
+        };
+
+        self.step();
+
+        if self.current_token != Token::OpAssign {
+            return Err(self.err("Expected '=' after constant name"));
+        }
+
+        self.step();
+
+        let value = self.parse_expr()?;
+
+        if let Ok(v) = self.eval_parser_const_expr(&value) {
+            self.constants.insert(name.clone(), v);
+        }
+
+        if self.current_token == Token::Semicolon {
+            self.step();
+        }
+
+        Ok(ConstDecl { name, value })
+    }
+
+    fn parse_array_size(&mut self) -> Result<usize, ParseError> {
+        let expr = self.parse_expr()?;
+
+        match self.eval_parser_const_expr(&expr) {
+            Ok(value) => Ok(value as usize),
+            Err(_) => Err(self.err("array size must be a compile-time constant number")),
+        }
+    }
+
+    fn eval_parser_const_expr(&self, expr: &Expr) -> Result<u64, String> {
+        self.eval_parser_const_expr_depth(expr, 0)
+    }
+
+    fn eval_parser_const_expr_depth(&self, expr: &Expr, depth: usize) -> Result<u64, String> {
+        if depth > 64 {
+            return Err("constant evaluation depth too high".to_string());
+        }
+
+        match expr {
+            Expr::Number(n) => Ok(*n),
+            Expr::SignedNumber(n) => Ok(*n as u64),
+            Expr::Null => Ok(0),
+
+            Expr::Variable(name) => self
+                .constants
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unknown constant '{}'", name)),
+
+            Expr::Binary { left, op, right } => {
+                if op == "OpCastF64" || op == "OpCastInt" || op == "OpCast" {
+                    return self.eval_parser_const_expr_depth(left, depth + 1);
+                }
+
+                if op == "OpBitNot" {
+                    let value = self.eval_parser_const_expr_depth(left, depth + 1)?;
+                    return Ok(!value);
+                }
+
+                let a = self.eval_parser_const_expr_depth(left, depth + 1)?;
+                let b = self.eval_parser_const_expr_depth(right, depth + 1)?;
+
+                match op.as_str() {
+                    "OpAdd" => Ok(a.wrapping_add(b)),
+                    "OpSub" => Ok(a.wrapping_sub(b)),
+                    "OpMul" => Ok(a.wrapping_mul(b)),
+
+                    "OpDiv" => {
+                        if b == 0 {
+                            return Err("division by zero in constant expression".to_string());
+                        }
+
+                        Ok(a / b)
+                    }
+
+                    "OpMod" => {
+                        if b == 0 {
+                            return Err("modulo by zero in constant expression".to_string());
+                        }
+
+                        Ok(a % b)
+                    }
+
+                    "OpBitAnd" => Ok(a & b),
+                    "OpBitOr" => Ok(a | b),
+                    "OpBitXor" => Ok(a ^ b),
+                    "OpShl" => Ok(a.wrapping_shl(b as u32)),
+                    "OpShr" => Ok(a.wrapping_shr(b as u32)),
+
+                    "OpEq" | "OpEqEq" | "==" => Ok(if a == b { 1 } else { 0 }),
+                    "OpNotEq" | "OpNe" | "!=" => Ok(if a != b { 1 } else { 0 }),
+                    "OpLt" | "Lt" | "<" => Ok(if a < b { 1 } else { 0 }),
+                    "OpLtEq" | "OpLe" | "<=" => Ok(if a <= b { 1 } else { 0 }),
+                    "OpGt" | "Gt" | ">" => Ok(if a > b { 1 } else { 0 }),
+                    "OpGtEq" | "OpGe" | ">=" => Ok(if a >= b { 1 } else { 0 }),
+                    "OpAnd" | "&&" => Ok(if a != 0 && b != 0 { 1 } else { 0 }),
+                    "OpOr" | "||" => Ok(if a != 0 || b != 0 { 1 } else { 0 }),
+
+                    _ => Err(format!("unsupported constant operator '{}'", op)),
+                }
+            }
+
+            _ => Err("unsupported constant expression".to_string()),
         }
     }
 
@@ -135,21 +254,7 @@ impl Parser {
                     }
                 }
                 Token::Const => {
-                    self.step();
-                    let name = match &self.current_token {
-                        Token::Ident(n) => n.clone(),
-                        _ => return Err(self.err("Expected constant name")),
-                    };
-                    self.step();
-                    if self.current_token != Token::OpAssign {
-                        return Err(self.err("Expected '=' after constant name"));
-                    }
-                    self.step();
-                    let value = self.parse_expr()?;
-                    if self.current_token == Token::Semicolon {
-                        self.step();
-                    }
-                    program.constants.push(ConstDecl { name, value });
+                    program.constants.push(self.parse_const_decl()?);
                 }
                 Token::Union => {
                     self.step();
@@ -409,6 +514,11 @@ impl Parser {
 
     pub fn seek_to_function(&mut self, name: &str) -> Result<(), ParseError> {
         while self.current_token != Token::EOF {
+            if self.current_token == Token::Const {
+                self.parse_const_decl()?;
+                continue;
+            }
+
             if self.current_token == Token::Fn {
                 self.step();
 
@@ -997,15 +1107,15 @@ impl Parser {
 
             if self.current_token == Token::LBracket {
                 self.step();
-                let count = match self.current_token {
-                    Token::Number(n) => n as usize,
-                    _ => return Err(self.err("Expected array size number")),
-                };
-                self.step();
+
+                let count = self.parse_array_size()?;
+
                 if self.current_token != Token::RBracket {
                     return Err(self.err("Expected ']' after array size"));
                 }
+
                 self.step();
+
                 field_type = DataType::Array(Box::new(field_type), count);
             }
 
@@ -1182,16 +1292,16 @@ impl Parser {
         };
         self.step();
         if self.current_token == Token::LBracket {
-            self.step(); // [
-            let count = match self.current_token {
-                Token::Number(n) => n as usize,
-                _ => return Err(self.err("Expected array size number")),
-            };
             self.step();
+
+            let count = self.parse_array_size()?;
+
             if self.current_token != Token::RBracket {
                 return Err(self.err("Expected ']' after array size"));
             }
+
             self.step();
+
             base_type = DataType::Array(Box::new(base_type), count);
         }
 
@@ -1220,11 +1330,7 @@ impl Parser {
                     return Err(self.err("Expected '[' in array declaration"));
                 }
                 self.step();
-                let count = match self.current_token {
-                    Token::Number(n) => n as usize,
-                    _ => return Err(self.err("Expected array count")),
-                };
-                self.step();
+                let count = self.parse_array_size()?;
                 if self.current_token != Token::RBracket {
                     return Err(self.err("Expected ']' in array declaration"));
                 }
@@ -1250,16 +1356,16 @@ impl Parser {
         self.step();
 
         if self.current_token == Token::LBracket {
-            self.step(); // [
-            let count = match self.current_token {
-                Token::Number(n) => n as usize,
-                _ => return Err(self.err("Expected array size number")),
-            };
             self.step();
+
+            let count = self.parse_array_size()?;
+
             if self.current_token != Token::RBracket {
                 return Err(self.err("Expected ']' after array size"));
             }
+
             self.step();
+
             dt = DataType::Array(Box::new(dt), count);
         }
 

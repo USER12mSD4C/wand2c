@@ -416,3 +416,25 @@ fn stop() {
     return;
 }
 ```
+
+## Array Sizes
+
+The size of an array must be a compile-time constant.
+
+You can use a number literal.
+
+```wandc
+u8 buffer[4096];
+```
+
+You can also use a constant.
+
+```wandc
+const MAX_NAME = 256;
+
+struct User {
+    u8 name[MAX_NAME];
+}
+```
+
+Constants must appear before you use them in array sizes.
