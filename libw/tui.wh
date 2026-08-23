@@ -7,12 +7,12 @@ sect.tui_state
     u64 rows = 24;
 EOS
 
-fn get_terminal_size(u64* out_rows*o, u64* out_cols*o) void;
-fn tui_init() void;
-fn tui_clear_physical() void;
-fn tui_move_cursor_physical(u64 row, u64 col) void;
-fn tui_clear() void;
-fn tui_draw_char(u64 r, u64 c, u8 ch) void;
-fn tui_draw_string(u64 r, u64 c, u8* s) void;
-fn tui_set_cursor(u64 r, u64 c) void;
-fn tui_render() void;
+extern fn get_terminal_size(u64* out_rows*o, u64* out_cols*o) void;
+extern fn tui_init() void;
+extern fn tui_clear_physical() void;
+extern fn tui_move_cursor_physical(u64 row, u64 col) void;
+extern fn tui_clear() void;
+extern fn tui_draw_char(u64 r, u64 c, u8 ch) void;
+extern fn tui_draw_string(u64 r, u64 c, u8* s) void;
+extern fn tui_set_cursor(u64 r, u64 c) void;
+extern fn tui_render() void;

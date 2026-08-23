@@ -1,9 +1,0 @@
-[project]
-name = "calculator"
-
-[dotw]
-"testing/calculator.w" -> "calc"
-
-[venv]
-path = "build_env"
-isolated = 1

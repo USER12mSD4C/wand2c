@@ -1,0 +1,71 @@
+struct linux_dirent64 version 1 {
+    u64 d_ino version 1;
+    u64 d_off version 1;
+    u16 d_reclen version 1;
+    u8 d_type version 1;
+    u8 d_name[256] version 1;
+}
+
+struct timespec version 1 {
+    i64 tv_sec version 1;
+    i64 tv_nsec version 1;
+}
+
+struct sigaction version 1 {
+    u64 sa_handler version 1;
+    u64 sa_flags version 1;
+    u64 sa_restorer version 1;
+    u64 sa_mask version 1;
+}
+
+struct wait_status version 1 {
+    u32 status version 1;
+}
+
+struct siginfo version 1 {
+    i32 si_signo version 1;
+    i32 si_errno version 1;
+    i32 si_code version 1;
+    u64 si_addr version 1;
+}
+
+struct stat version 1 {
+    u64 st_dev version 1;
+    u64 st_ino version 1;
+    u64 st_nlink version 1;
+    u32 st_mode version 1;
+    u32 st_uid version 1;
+    u32 st_gid version 1;
+    u32 __pad0 version 1;
+    u64 st_rdev version 1;
+    i64 st_size version 1;
+    i64 st_blksize version 1;
+    i64 st_blocks version 1;
+    u64 st_atime_sec version 1;
+    u64 st_atime_nsec version 1;
+    u64 st_mtime_sec version 1;
+    u64 st_mtime_nsec version 1;
+    u64 st_ctime_sec version 1;
+    u64 st_ctime_nsec version 1;
+    u64 __unused[3] version 1;
+}
+
+struct fd_set version 1 {
+    u64 fds_bits[16] version 1;
+}
+
+struct timeval version 1 {
+    i64 tv_sec version 1;
+    i64 tv_usec version 1;
+}
+
+struct pollfd version 1 {
+    i32 fd version 1;
+    i16 events version 1;
+    i16 revents version 1;
+}
+
+struct epoll_event version 1 {
+    u32 events version 1;
+    u64 data version 1;
+}

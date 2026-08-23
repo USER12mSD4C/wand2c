@@ -1,0 +1,6 @@
+sc.true
+
+extern fn get_arg(u64 argv, u64 index) -> u8*;
+extern fn arg_equals(u64 argv, u64 index, u8* expected) -> u64;
+extern fn find_arg(u64 argc, u64 argv, u8* name) -> u64;
+extern fn get_arg_value(u64 argc, u64 argv, u8* name) -> u8*;

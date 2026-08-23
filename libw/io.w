@@ -1,4 +1,5 @@
 sc.true
+#import <syscall>
 
 fn print_char(u8 c) {
     sys_write(1, c*adr, 1);

@@ -1,8 +1,8 @@
 sc.true
-
-#import io
-#import mem
-#import string
+#import <syscall>
+#import <io>
+#import <mem>
+#import <string>
 
 sect.tui_state
     u8* screen_buf = null;

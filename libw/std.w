@@ -1,4 +1,5 @@
 sc.true
+#import <syscall>
 
 sect.rand_state
     u64 next = 1;

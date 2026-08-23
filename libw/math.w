@@ -1,4 +1,5 @@
 sc.true
+#import <syscall>
 
 sect.math_const
     f64 PI = 3.141592653589793;

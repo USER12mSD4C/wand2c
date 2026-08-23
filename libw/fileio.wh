@@ -1,0 +1,11 @@
+sc.true
+
+struct FileReader {
+    i64 fd;
+    u8 buf[4096];
+    u64 pos;
+    u64 len;
+}
+
+extern fn file_reader_init(FileReader* r, i64 fd);
+extern fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64;

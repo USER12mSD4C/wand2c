@@ -1,0 +1,16 @@
+sc.true
+
+struct DIR {
+    i64 fd;
+    u8 data[2048];
+    u64 data_pos;
+    u64 data_len;
+    u8 name[256];
+}
+
+extern fn get_cpu_count() -> i64;
+extern fn popen(u8* command) -> i64;
+extern fn pclose(i64 fd) -> i64;
+extern fn opendir(u8* path) -> DIR*;
+extern fn readdir(DIR* dir) -> u8*;
+extern fn closedir(DIR* dir);

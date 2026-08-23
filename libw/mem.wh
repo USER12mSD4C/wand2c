@@ -1,7 +1,8 @@
 sc.true
 
-fn mloc(void* owner, u64 size) -> void*;
-fn mfree(void* ptr) -> void;
-fn malloc(u64 size) -> void*;
-fn calloc(u64 num, u64 size) -> void*;
-fn mfree_all() -> void;
+extern fn mloc(void* owner, u64 size) -> void*;
+extern fn mfree(void* ptr) -> void;
+extern fn malloc(u64 size) -> void*;
+extern fn calloc(u64 num, u64 size) -> void*;
+extern fn mfree_all() -> void;
+extern fn mrealloc(u8* ptr, u64 new_size) -> u8*;

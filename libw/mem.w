@@ -1,6 +1,6 @@
 sc.true
-
-#import string
+#import <syscall>
+#import <string>
 
 sect.heap
     u8* arena_start = null;
@@ -78,4 +78,43 @@ fn calloc(u64 num, u64 size) {
 
 fn mfree_all() {
     heap:offset = 0;
+}
+
+fn mrealloc(u8* ptr, u64 new_size) -> u8* {
+    if (ptr == null) {
+        return(malloc(new_size));
+    }
+    if (new_size == 0) {
+        mfree(ptr);
+        return(null);
+    }
+
+    u8* block = ptr - 16;
+    u64* p_size*i = block;
+    u64 old_block_size = p_size;
+    u64 old_usable = old_block_size - 16;
+
+    u64 aligned_new = new_size;
+    u64 rem = new_size % 8;
+    if (rem != 0) {
+        aligned_new = new_size + (8 - rem);
+    }
+    u64 new_block_size = aligned_new + 16;
+
+    if (new_block_size <= old_block_size) {
+        return(ptr);
+    }
+
+    u8* new_ptr = malloc(new_size);
+    if (new_ptr == null) {
+        return(null);
+    }
+
+    u64 copy_size = old_usable;
+    if (new_size < old_usable) {
+        copy_size = new_size;
+    }
+    memcpy(new_ptr, ptr, copy_size);
+    mfree(ptr);
+    return(new_ptr);
 }

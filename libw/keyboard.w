@@ -1,6 +1,6 @@
 sc.true
-
-#import io
+#import <syscall>
+#import <io>
 
 sect.keys
     u64 arrow_up = 1000;

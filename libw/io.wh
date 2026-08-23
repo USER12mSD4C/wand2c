@@ -1,17 +1,17 @@
 sc.true
 
-fn print_char(u8 c);
-fn read_char() -> u8;
-fn read_string(u8* buf, u64 max_size);
-fn print_string(u8* s);
-fn print_number(u64 num);
-fn print_signed_number(i64 num);
-fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
-fn file_open(u8* path, u64 flags, u64 mode) -> i64;
-fn file_close(u64 fd) -> i64;
-fn file_remove(u8* path) -> i64;
-fn file_read(u64 fd, u8* buf, u64 size) -> i64;
-fn file_write(u64 fd, u8* buf, u64 size) -> i64;
-fn parse_float(u8* s) -> f64;
-fn read_float() -> f64;
-fn read_integer() -> i64;
+extern fn print_char(u8 c);
+extern fn read_char() -> u8;
+extern fn read_string(u8* buf, u64 max_size);
+extern fn print_string(u8* s);
+extern fn print_number(u64 num);
+extern fn print_signed_number(i64 num);
+extern fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
+extern fn file_open(u8* path, u64 flags, u64 mode) -> i64;
+extern fn file_close(u64 fd) -> i64;
+extern fn file_remove(u8* path) -> i64;
+extern fn file_read(u64 fd, u8* buf, u64 size) -> i64;
+extern fn file_write(u64 fd, u8* buf, u64 size) -> i64;
+extern fn parse_float(u8* s) -> f64;
+extern fn read_float() -> f64;
+extern fn read_integer() -> i64;

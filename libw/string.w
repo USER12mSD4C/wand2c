@@ -1,4 +1,5 @@
 sc.true
+#import <syscall>
 
 fn strlen(u8* s) -> u64 {
     u64 len = 0;

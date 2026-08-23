@@ -1,5 +1,5 @@
 sc.true
 
-fn exit(u64 code) -> void;
-fn rand() -> u64;
-fn srand(u64 seed) -> void;
+extern fn exit(u64 code) -> void;
+extern fn rand() -> u64;
+extern fn srand(u64 seed) -> void;

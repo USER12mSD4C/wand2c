@@ -1,0 +1,18 @@
+sc.true
+
+struct StrVec {
+    u64 items;
+    u64 count;
+    u64 capacity;
+}
+
+extern fn read_u64_ptr(u64 ptr) -> u64;
+extern fn write_u64_ptr(u64 ptr, u64 val);
+extern fn xmalloc(u64 size) -> u64;
+extern fn xstrdup(u64 s) -> u64;
+extern fn strvec_init(StrVec* v);
+extern fn strvec_add(StrVec* v, u64 str_ptr);
+extern fn strvec_contains(StrVec* v, u64 str_ptr) -> i64;
+extern fn strvec_free(StrVec* v);
+extern fn strvec_clear(StrVec* v);
+extern fn strvec_pop(StrVec* v);

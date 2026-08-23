@@ -50,4 +50,4 @@ sect.keys
     u64 ctrl_z = 26;
 EOS
 
-fn read_key() u64;
+extern fn read_key() u64;

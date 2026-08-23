@@ -1,8 +1,8 @@
 sc.true
 
-fn abs(f64 x) -> f64;
-fn sqrt(f64 x) -> f64;
-fn sin(f64 x) -> f64;
-fn cos(f64 x) -> f64;
-fn tan(f64 x) -> f64;
-fn print_float(f64 x);
+extern fn abs(f64 x) -> f64;
+extern fn sqrt(f64 x) -> f64;
+extern fn sin(f64 x) -> f64;
+extern fn cos(f64 x) -> f64;
+extern fn tan(f64 x) -> f64;
+extern fn print_float(f64 x);
