@@ -269,44 +269,26 @@ pub fn new() -> Self {
             let current_line = idx + 1;
 
             match stmt {
-                Stmt::VarDefinition(decl) => {
-                    let type_str = Self::format_data_type(&decl.data_type);
+            Stmt::VarDefinition(decl) => {
+                let type_str = Self::format_data_type(&decl.data_type);
+                let is_pointer = matches!(&decl.data_type, DataType::Pointer(_));
 
-                    if let Some(init_expr) = &decl.initial_value {
-                        self.check_expression_safety(init_expr, current_line);
+                if let Some(init_expr) = &decl.initial_value {
+                    self.check_expression_safety(init_expr, current_line);
 
-                        if self.is_allocation_call(init_expr) {
-                            self.states.insert(
-                                decl.name.clone(),
-                                VarState::Allocated {
-                                    allocated_line: current_line,
-                                    checked_not_null: false,
-                                    type_name: type_str.clone(),
-                                },
-                            );
-                        } else {
-                            self.states.insert(decl.name.clone(), VarState::Safe);
-                            self.register_struct_fields(
-                                &decl.name,
-                                &decl.data_type,
-                                structs,
-                                VarState::Uninitialized {
-                                    declared_line: current_line,
-                                    type_name: type_str.clone(),
-                                },
-                            );
-                        }
+                    if self.is_allocation_call(init_expr) {
+                        self.states.insert(
+                            decl.name.clone(),
+                            VarState::Allocated {
+                                allocated_line: current_line,
+                                checked_not_null: false,
+                                type_name: type_str.clone(),
+                            },
+                        );
                     } else {
-                        if matches!(decl.data_type, DataType::Pointer(_)) {
-                            self.states.insert(
-                                decl.name.clone(),
-                                VarState::Uninitialized {
-                                    declared_line: current_line,
-                                    type_name: type_str.clone(),
-                                },
-                            );
-                        } else {
-                            self.states.insert(decl.name.clone(), VarState::Safe);
+                        self.states.insert(decl.name.clone(), VarState::Safe);
+
+                        if !is_pointer {
                             self.register_struct_fields(
                                 &decl.name,
                                 &decl.data_type,
@@ -318,7 +300,30 @@ pub fn new() -> Self {
                             );
                         }
                     }
+                } else {
+                    if is_pointer {
+                        self.states.insert(
+                            decl.name.clone(),
+                            VarState::Uninitialized {
+                                declared_line: current_line,
+                                type_name: type_str.clone(),
+                            },
+                        );
+                    } else {
+                        self.states.insert(decl.name.clone(), VarState::Safe);
+
+                        self.register_struct_fields(
+                            &decl.name,
+                            &decl.data_type,
+                            structs,
+                            VarState::Uninitialized {
+                                declared_line: current_line,
+                                type_name: type_str.clone(),
+                            },
+                        );
+                    }
                 }
+            }
                 Stmt::Assignment { targets, value } => {
                     self.check_expression_safety(value, current_line);
                     let is_alloc = self.is_allocation_call(value);

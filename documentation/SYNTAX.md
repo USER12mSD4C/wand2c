@@ -1,697 +1,371 @@
-# WandC Language Syntax Specification
-
-WandC is a systems programming language. It targets operating systems, device drivers, boot code, kernel modules, and hosted user-space programs. WandC provides direct hardware access, explicit memory layout control, strict compile-time safety checks, and Standard 4/6 binary metadata.
-
----
+# WandC Language Syntax
 
 ## 1. Source Files
-
-Every WandC source file must start with an environment token.
-
-```c
-sc.true
-```
-
-or
-
-```c
-sc.false
-```
-
-### sc.true
-
-Use `sc.true` for hosted environments. A hosted environment provides operating system services.
-
-Examples:
-- Linux user-space programs
-- Init systems
-- Daemons
-- Service managers
-
-`sc.true` enables hosted compiler built-ins:
-- `syscall0` through `syscall6`
-
-### sc.false
-
-Use `sc.false` for bare-metal and kernel code.
-
-Examples:
-- Kernels
-- Schedulers
-- Interrupt handlers
-- Hardware drivers
-- Bootloader modules
-
-`sc.false` forbids hosted built-ins. Use `bmloc`, port I/O, inline assembly, and custom kernel services.
-
----
+Every file must start with an environment token.
+Use `sc.true` for programs that run in an operating system.
+Use `sc.false` for bare-metal code like kernels or drivers.
 
 ## 2. Comments
-
-WandC supports single-line comments only.
-
-```c
+Use two slash characters for a comment.
+```wandc
 // This is a comment.
 ```
-
-Multi-line comments are not supported.
-
----
+The compiler ignores comments.
 
 ## 3. Literals
-
-### Integer literals
-
-Decimal:
-```c
+Numbers:
+```wandc
 u64 a = 4096;
 ```
-
-Hexadecimal:
-```c
+Hexadecimal numbers:
+```wandc
 u64 b = 0x1000;
 ```
-
-### Float literals
-
-```c
-f64 pi = 3.14159;
+Text strings:
+```wandc
+u8* msg = "hello";
 ```
-
-### String literals
-
-```c
-u8* msg = "boot complete\n";
-```
-
-Supported escape sequences:
-- `\n` (newline)
-- `\t` (tab)
-- `\r` (carriage return)
-- `\"` (double quote)
-
----
 
 ## 4. Primitive Types
-
 | Type | Size |
-|---|---:|
+|---|---|
 | `u8` | 1 byte |
 | `u16` | 2 bytes |
 | `u32` | 4 bytes |
 | `u64` | 8 bytes |
-| `i8` | 1 byte |
-| `i16` | 2 bytes |
-| `i32` | 4 bytes |
-| `i64` | 8 bytes |
-| `f64` | 8 bytes |
+| `i8` | 1 byte (signed) |
+| `i16` | 2 bytes (signed) |
+| `i32` | 4 bytes (signed) |
+| `i64` | 8 bytes (signed) |
+| `f64` | 8 bytes (float) |
 | `void` | 0 bytes |
 
-Pointers use the `*` symbol.
-
-```c
+Use `*` for pointers.
+```wandc
 u8* p;
-u64* counter;
 ```
-
-Arrays use brackets.
-
-```c
+Use brackets for arrays.
+```wandc
 u8 buffer[256];
 ```
 
-Alternative array syntax:
-
-```c
-array:u8[256] buffer;
-```
-
-Type aliases use `typedef`.
-
-```c
-typedef u8[256] SectorBuffer;
-```
-
----
-
 ## 5. Constants
-
-Constants are compile-time values.
-
-Syntax:
-```c
-const NAME = expression;
-```
-
-Examples:
-```c
+Constants do not change.
+```wandc
 const MAX_TASKS = 256;
-const TASK_STACK_SIZE = 0x4000;
-const FRAMEBUFFER_SIZE = SCREEN_WIDTH * SCREEN_HEIGHT * 4;
 ```
-
-Constants may use numbers, other constants, arithmetic, enums, and compile-time reflection functions.
-
-Rules:
-1. A constant expression must be known at compile time.
-2. A constant must not depend on a runtime variable.
-3. A constant must not call a user function.
-4. A constant may use `sizeof`, `alignof`, `offsetof`, `versionof`, `fieldsof`.
-
----
 
 ## 6. Enums
-
-Enums define named integer values.
-
-Syntax:
-```c
-enum Name {
-    VALUE_A = 0;
-    VALUE_B = 1;
+Enums give names to numbers.
+```wandc
+enum State {
+    OFF = 0;
+    ON = 1;
 }
 ```
+Read the value like this: `State:ON`.
 
-If a value has no explicit number, the compiler assigns the previous value plus one.
-
-Enums can have versions.
-
-```c
-enum GpuState version 2 {
-    OFF = 0 version 1;
-    IDLE = 1 version 1;
-    ACTIVE = 2 version 2;
-}
-```
-
-Enum values are unsigned 64-bit integers. Access uses the colon syntax: `EnumName:ValueName`.
-
----
-
-## 7. Variables and Pointers
-
-Local variable declaration:
-```c
+## 7. Variables
+Declare a variable with a type and a name.
+```wandc
 u64 x = 10;
-i64 delta = -5;
 ```
 
-### Pointer access modifiers
+### Pointers
+Use modifiers to show how a pointer works.
+- `*i` reads data from the pointer.
+- `*o` writes data to the pointer.
+- `*io` reads and writes data.
 
-WandC provides three pointer modifiers to define data flow semantics.
-
-- `*i` means input pointer.
-- `*o` means output pointer.
-- `*io` means input-output pointer.
-
-Input pointer:
-```c
-u64 value*i;
+## 8. Control Flow
+Use `if` and `else` to make choices.
+```wandc
+if (x == 10) {
+    x = 0;
+}
 ```
-- Reading the variable loads the pointed value.
-- Assigning to the variable changes the pointer address itself.
 
-Output pointer:
-```c
-u64 slot*o;
-```
-- Reading the variable reads the pointer address.
-- Assigning to the variable writes through the pointer.
-
-Input-output pointer:
-```c
-u64 data*io;
-```
-- Reading the variable loads the pointed value (like `*i`).
-- Assigning to the variable writes through the pointer (like `*o`).
-
-Example:
-```c
-fn modify(u64 x*io) {
+Use `while` to repeat code.
+```wandc
+while (x < 10) {
     x = x + 1;
 }
 ```
 
----
-
-## 8. Control Flow
-
-### if / else
-
-```c
-if (x == 10) {
-    x = 0;
-} else {
-    x = 1;
-}
-```
-
-### while
-
-```c
-u64 i = 0;
-while (i < 10) {
-    i = i + 1;
-}
-```
-
-### for
-
-```c
+Use `for` to repeat code with a counter.
+```wandc
 for (u64 i = 0; i < 10; i = i + 1) {
-    outb(0x3F8, i);
 }
 ```
 
-### match
-
-```c
+Use `match` to check multiple values.
+```wandc
 match (state) {
     case 1 {
-        print_string("State 1\n");
-    }
-    case 2 {
-        print_string("State 2\n");
+        print_string("One");
     }
     default {
-        print_string("Unknown\n");
+        print_string("Other");
     }
 }
 ```
 
-Increment and decrement operators (`++`, `--`) are allowed only as full standalone statements.
-
----
-
 ## 9. Functions
-
-Function syntax:
-```c
-fn name(u64 a, u8* ptr) {
-}
-```
-
-Function with return type:
-```c
+A function groups code together.
+```wandc
 fn add(u64 a, u64 b) -> u64 {
     return(a + b);
 }
 ```
 
-Function with multiple return values:
-```c
-fn range() -> (u64, u64) {
-    return(u64 0, u64 1024);
-}
-```
-
-Destructuring assignment:
-```c
-u64 low;
-u64 high;
-[low, high] = range();
-```
-
-Function modifiers:
-- `extern`: Declares a function without a body.
-- `export`: Marks a function for export in the binary metadata.
-- `irq`: Marks a function as an interrupt handler (saves and restores all registers).
-
-### Hosted Entry Point
-
-For `sc.true` programs, the entry point must accept three arguments:
-
-```c
+The main function starts the program.
+```wandc
 fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     return(0);
 }
 ```
 
-- `argc`: Number of command-line arguments.
-- `argv`: Pointer to the array of argument strings.
-- `envp`: Pointer to the array of environment variables.
-
----
-
-## 10. Structures and Unions
-
-Structure syntax:
-```c
-struct Task version 1 {
-    u64 pid version 1;
-    u64 state version 1;
-    u64 stack version 1;
+## 10. Structures
+A structure holds multiple variables.
+```wandc
+struct Task {
+    u64 id;
+    u64 state;
 }
 ```
-
-Field access:
-```c
-Task t;
-t.pid = 1;
-```
-
-Pointer field access:
-```c
-Task* tp = t*adr;
-tp->pid = 2;
-```
-
-Packed structure:
-```c
-packed struct HardwareRegister version 1 {
-    u8 control version 1;
-    u32 value version 1;
-}
-```
-
-Union syntax:
-```c
-union PacketView version 1 {
-    u64 raw version 1;
-    u8 bytes[8] version 1;
-}
-```
-
-Structure layout rules:
-1. Fields keep declaration order.
-2. Field alignment equals field size, capped at a maximum of 8 bytes.
-3. Packed structures use alignment 1.
-4. Total structure size is padded to maximum field alignment.
-
----
+Read a field like this: `task.id`.
+Read a pointer field like this: `task_ptr->id`.
 
 ## 11. Global Sections
-
-Global variables live inside `sect` blocks.
-
-```c
-sect.kernel_state
+Put global variables in a section.
+```wandc
+sect.state
     u64 ticks = 0;
-    u64 active_cpu = 0;
 EOS
 ```
-
-Access syntax:
-```c
-kernel_state:ticks = kernel_state:ticks + 1;
-```
-
-A section ends with the `EOS` token.
-
-### Section Attributes
-
-Attributes are placed before the `sect` keyword.
-
-```c
-align(4096) ro sect.vga_config
-    u64 width = 1920;
-EOS
-
-align(64) noinit sect.per_cpu
-    u64 ticks;
-EOS
-```
-
-| Attribute | Meaning |
-|---|---|
-| `align(N)` | Section alignment in memory. N must be a power of two. |
-| `ro` | Read-only section. Placed in `.rodata`. |
-| `noinit` | Section has no initial data in the binary. Analogous to `.bss`. |
-
-### Volatile and Atomic Section Variables
-
-```c
-sect.mmio_regs
-    volatile u32 status = 0;
-    atomic u64 counter = 0;
-EOS
-```
-
-Reads and writes to `volatile` variables generate real memory operations. A write to a `volatile` variable emits an `MFENCE` instruction after the store.
-
----
+Read the variable like this: `state:ticks`.
 
 ## 12. Compile-Time Reflection
-
-WandC provides compile-time type inspection.
-
-- `sizeof(Type)`: Returns type size in bytes.
-- `alignof(Type)`: Returns type alignment in bytes.
-- `offsetof(Type:field)`: Returns field offset in bytes.
-- `versionof(Type)`: Returns structure version.
-- `fieldsof(Type)`: Returns number of fields.
-- `nameof(Type)`: Returns type name as a string pointer.
-
-Reflection is evaluated strictly at compile time.
-
----
+The compiler knows type sizes.
+- `sizeof(Type)` gives the size in bytes.
+- `alignof(Type)` gives the alignment.
 
 ## 13. Built-In Functions
-
-The compiler provides low-level hardware and system primitives.
-
-### Port I/O (x86)
-
-```c
-u8 value = inb(0x3F8);
-outb(0x3F8, value);
-u16 w = inw(0x1F0);
-outw(0x1F0, w);
-u32 d = inl(0xCF8);
-outl(0xCF8, d);
-```
-
-### Memory Allocation
-
-Bare-metal mode allocation:
-```c
-u64 phys = 0x100000;
-u64 mapped = bmloc(phys);
-```
-
-### Raw System Calls
-
-The compiler exposes raw system call instructions for hosted environments:
-```c
-syscall0(number);
-syscall1(number, arg1);
-syscall2(number, arg1, arg2);
-syscall3(number, arg1, arg2, arg3);
-syscall4(number, arg1, arg2, arg3, arg4);
-syscall5(number, arg1, arg2, arg3, arg4, arg5);
-syscall6(number, arg1, arg2, arg3, arg4, arg5, arg6);
-```
-
-### Atomics and Barriers
-
-```c
-u64 val = atomic_load(ptr);
-atomic_store(ptr, val);
-atomic_add(ptr, 1);
-atomic_sub(ptr, 1);
-atomic_inc(ptr);
-atomic_dec(ptr);
-atomic_swap(ptr, new_val);
-atomic_cas(ptr, expected, desired);
-memory_barrier();
-compiler_barrier();
-```
-
----
+The compiler has built-in tools.
+Use `inb` and `outb` for hardware ports.
+Use `atomic_add` for safe math.
 
 ## 14. Standard Library
-
-High-level system calls, memory management, and I/O are provided by the standard library (`libw`), not the compiler core.
-
-Import required modules:
-```c
-#import <syscall>
+Import modules to get more functions.
+```wandc
 #import <io>
-#import <mem>
-#import <string>
-#import <args>
-#import <path>
 ```
 
-The `<syscall>` library wraps `syscall0`..`syscall6` into named functions like `sys_read`, `sys_write`, `sys_fork`, `sys_execve`, etc.
-The `<mem>` library provides `malloc`, `mfree`, `mrealloc`, and `calloc` on top of the raw `mloc` syscall.
-
----
-
 ## 15. Inline Assembly
-
-Inline assembly uses the `::nasm::` block.
-
-```c
-fn halt_cpu() {
+Write CPU instructions in a block.
+```wandc
+fn halt() {
     ::nasm::{
-        cli
         hlt
     }
 }
 ```
 
-Local variables can be accessed with brackets:
-```c
-fn write_value(u64 value) {
-    ::nasm::{
-        mov rax, [value]
-    }
-}
-```
-
-Section variables use the section syntax:
-```c
-fn tick() {
-    ::nasm::{
-        mov rax, [cpu_state:ticks]
-        add rax, 1
-        mov [cpu_state:ticks], rax
-    }
-}
-```
-
----
-
 ## 16. Imports
-
-Use `#import` to load library modules.
-
-```c
-#import <io>
+Use `#import` to load files.
+```wandc
 #import <string>
 ```
 
-System libraries use angle brackets `<name>`. Local files use plain names `name`. Import paths must not include file extensions.
+## 17. Memory Safety
+The compiler checks your code for safety.
+1. Initialize variables before use.
+2. Check pointers for `null`.
+3. Free memory when done.
 
----
+## 18. Compiler Formats
+Tell the compiler what to make.
+- `-fp` makes a normal program.
+- `-fk` makes a kernel.
+```
 
-## 17. Dynamic Execution Modules
+### STDLIB.md
 
-WandC supports dynamic execution modules with the `.wexp` format.
+```markdown
+# WandC Standard Library
 
-Use `jmpto` to execute a module dynamically.
+The standard library gives you ready functions.
+You must import the modules you need.
 
-```c
-fn main(u64 argc, u64 argv, u64 envp) {
-    u64 input_val = 100;
-    jmpto module.wexp {
-        input_val;
-    }
+## Setup
+Install the library:
+```bash
+wand2c -il libw
+```
+
+Import modules in your code:
+```wandc
+#import <io>
+#import <mem>
+```
+
+## Module: io
+This module prints text and reads input.
+
+### Print text
+```wandc
+fn print_string(u8* s);
+fn print_number(u64 num);
+fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
+```
+
+Example:
+```wandc
+printf("Hello %s\n", name);
+```
+
+### Read input
+```wandc
+fn read_char() -> u8;
+fn read_string(u8* buf, u64 max_size);
+```
+
+### File operations
+```wandc
+fn file_open(u8* path, u64 flags, u64 mode) -> i64;
+fn file_close(u64 fd) -> i64;
+fn file_read(u64 fd, u8* buf, u64 size) -> i64;
+fn file_write(u64 fd, u8* buf, u64 size) -> i64;
+```
+
+## Module: mem
+This module manages memory.
+
+### Start the memory system
+Call this function first:
+```wandc
+fn mem_init(u64 initial_size);
+```
+
+### Allocate memory
+```wandc
+fn malloc(u64 size) -> void*;
+fn calloc(u64 num, u64 size) -> void*;
+```
+
+### Free memory
+```wandc
+fn mfree(u8* ptr);
+```
+
+Example:
+```wandc
+mem_init(1048576);
+u8* buf = malloc(256);
+mfree(buf);
+```
+
+## Module: string
+This module changes text and memory.
+
+```wandc
+fn strlen(u8* s) -> u64;
+fn strcmp(u8* s1, u8* s2) -> i64;
+fn strcpy(u8* dest, u8* src) -> u8*;
+fn memcpy(u8* dest, u8* src, u64 n) -> void*;
+fn memset(u8* s, u8 c, u64 n) -> void*;
+```
+
+`strcmp` returns 0 if the strings are equal.
+
+## Module: syscall
+This module talks to the operating system.
+
+### Open a file
+```wandc
+fn sys_open(u8* path, u64 flags, u64 mode) -> u64;
+```
+
+### Check for errors
+```wandc
+fn syscall_error(u64 ret) -> u64;
+```
+It returns 1 if there is an error.
+
+Example:
+```wandc
+u64 fd = sys_open("file.txt", 0, 0);
+if (syscall_error(fd) == 1) {
+    print_string("Error");
 }
 ```
 
----
+### Process control
+```wandc
+fn sys_fork() -> u64;
+fn sys_exit(u64 code);
+```
 
-## 18. Operator Precedence
+## Module: args
+This module reads command arguments.
 
-Listed from highest to lowest precedence.
+```wandc
+fn get_arg(u64 argv, u64 index) -> u8*;
+fn arg_equals(u64 argv, u64 index, u8* expected) -> u64;
+```
 
-| Operator | Meaning |
-|---|---|
-| `*adr` | Address-of |
-| `->` | Pointer member access |
-| `.` | Member access |
-| `[index]` | Array index |
-| `!`, `~` | Logical NOT, Bitwise NOT |
-| `*`, `/`, `%` | Multiply, Divide, Modulo |
-| `+`, `-` | Add, Subtract |
-| `<<`, `>>` | Shift left, Shift right |
-| `<`, `<=`, `>`, `>=` | Relational operators |
-| `==`, `!=` | Equality operators |
-| `&` | Bitwise AND |
-| `^` | Bitwise XOR |
-| `\|` | Bitwise OR |
-| `&&` | Logical AND |
-| `\|\|` | Logical OR |
-| `=` | Assignment |
-
----
-
-## 19. Memory Safety Rules
-
-The compiler performs static analysis to enforce memory safety.
-
-1. Local variables must be initialized before use.
-2. Structure fields must be initialized before use.
-3. Pointers returned by allocators must be checked for `null` before dereference.
-4. Freed pointers must not be used (use-after-free detection).
-5. Allocated pointers must be freed before the function returns (leak detection).
-6. Pointer writes through `*o` are checked for initialization.
-
-Example of a required null check:
-```c
-void* p = malloc(4096);
-if (p != null) {
-    mfree(p);
+Example:
+```wandc
+if (arg_equals(argv, 1, "build") == 1) {
+    print_string("Building");
 }
 ```
 
----
+## Module: math
+This module does float math.
 
-## 20. Compiler Output Formats
+```wandc
+fn sqrt(f64 x) -> f64;
+fn sin(f64 x) -> f64;
+fn cos(f64 x) -> f64;
+```
 
-The compiler supports multiple target formats.
+## Module: path
+This module joins file paths.
 
-| Flag | Format | Description |
+```wandc
+fn path_exists(u8* path) -> u64;
+fn path_join(u8* dest, u8* a, u8* b);
+```
+
+## Constants
+The `syscall` module has standard constants.
+
+### File flags
+| Name | Value | Meaning |
 |---|---|---|
-| `-fp` | program | Hosted ELF64 executable. Requires `sc.true`. Entry is `main`. |
-| `-fo` | object | Relocatable ELF64 object file. For linking. |
-| `-fr` | raw | Flat binary image. No ELF header. Entry set via `--entry`. |
-| `-fk` | kernel | Freestanding kernel image. Requires `sc.false`. Entry set via `--entry`. |
-| `-fw` | wexp | Dynamic execution module. |
+| `O_RDONLY` | 0 | Read only |
+| `O_WRONLY` | 1 | Write only |
+| `O_RDWR` | 2 | Read and write |
+| `O_CREAT` | 64 | Make a new file |
 
-Examples:
-```bash
-wand2c init.w -o init -fp
-wand2c boot.w -o boot.bin -fr --entry=start
-wand2c kernel.w -o kernel.kbin -fk --entry=kmain
-```
+### Signals
+| Name | Value |
+|---|---|
+| `SIGINT` | 2 |
+| `SIGKILL` | 9 |
+| `SIGTERM` | 15 |
 
----
+## Structures
+The `syscall` module has standard structures.
 
-## 21. Complete Example
-
-```c
-sc.false
-
-const MAX_TASKS = 64;
-const STACK_SIZE = 0x4000;
-
-enum TaskState {
-    READY = 1;
-    RUNNING = 2;
-    SLEEPING = 3;
+### stat
+This structure holds file data.
+```wandc
+struct stat {
+    u64 st_dev;
+    u64 st_ino;
+    u32 st_mode;
+    i64 st_size;
 }
-
-struct Task version 1 {
-    u64 pid version 1;
-    u64 state version 1;
-    u64 stack version 1;
-}
-
-sect.scheduler_data
-    u64 current_task = 0;
-    u64 task_count = 0;
-EOS
-
-fn task_size() -> u64 {
-    return(sizeof(Task));
-}
-
-fn kmain() {
-    u64 size = sizeof(Task);
-    u64 state = TaskState:READY;
-
-    if (state == TaskState:READY) {
-        state = TaskState:RUNNING;
-    }
-
-    scheduler_data:current_task = 1;
-}
-```
-
-Compile:
-```bash
-wand2c kernel.w -o kernel.kbin -fk --entry=kmain
 ```
