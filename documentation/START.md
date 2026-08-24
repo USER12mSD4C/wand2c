@@ -108,11 +108,11 @@ Import system libraries with angle brackets:
 
 ### Local Modules
 
-Import local modules without angle brackets:
+Import local modules with double quotes:
 
 ```
-#import <utils>
-#import <parser>
+#import "utils"
+#import "parser"
 ```
 
 The compiler searches for:
@@ -368,7 +368,7 @@ fn subtract(u64 a, u64 b) -> u64 {
 sc.true
 
 #import <io>
-#import <calc>
+#import "calc"
 
 fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     u64 result = add(10, 20);

@@ -12,6 +12,7 @@ fn file_reader_init(FileReader* r, i64 fd) {
 fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
     u64 pos = 0;
     i64 running = 1;
+    i64 saw_any_data = 0;
 
     while (running == 1 && pos < max_size - 1) {
         if (r->pos >= r->len) {
@@ -21,6 +22,7 @@ fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
             } else {
                 r->pos = 0;
                 r->len = (u64)n;
+                saw_any_data = 1;
             }
         }
 
@@ -30,6 +32,7 @@ fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
 
             if (c == 10) {
                 running = 0;
+                saw_any_data = 1;
             } else {
                 out[pos] = c;
                 pos = pos + 1;
@@ -38,7 +41,7 @@ fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
     }
 
     out[pos] = 0;
-    if (pos == 0 && running == 0) {
+    if (pos == 0 && saw_any_data == 0) {
         return(-1);
     }
     return(pos);

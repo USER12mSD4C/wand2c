@@ -638,3 +638,53 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     return(0);
 }
 ```
+
+---
+
+## Local Module Import
+
+This example shows how to import a local module.
+
+File `math_utils.wh`:
+
+```
+sc.true
+
+fn add(u64 a, u64 b) -> u64;
+fn multiply(u64 a, u64 b) -> u64;
+```
+
+File `math_utils.w`:
+
+```
+sc.true
+
+export fn add(u64 a, u64 b) -> u64 {
+    return(a + b);
+}
+
+export fn multiply(u64 a, u64 b) -> u64 {
+    return(a * b);
+}
+```
+
+File `main.w`:
+
+```
+sc.true
+
+#import <io>
+#import "math_utils"
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    u64 sum = add(3, 4);
+    u64 product = multiply(3, 4);
+
+    print_number(sum);
+    print_char(10);
+    print_number(product);
+    print_char(10);
+
+    return(0);
+}
+```

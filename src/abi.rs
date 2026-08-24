@@ -398,7 +398,10 @@ pub fn generate_elf64_binary(
     let module_name = program
         .imports
         .first()
-        .map(|s| s.trim_matches(|c| c == '<' || c == '>').to_string())
+        .map(|s| {
+            s.trim_matches(|c| c == '<' || c == '>' || c == '"')
+                .to_string()
+        })
         .unwrap_or_else(|| "libc.ko".to_string());
     for name in &unresolved_calls {
         builder.add_import(name, &module_name, 1, 0);

@@ -419,6 +419,9 @@ Correct:
 #import "mymodule"
 ```
 
+System modules use angle brackets.
+Local modules use double quotes.
+
 ### Array Size Must Be Compile-Time Constant
 
 Array sizes must be numeric literals or `const` values.

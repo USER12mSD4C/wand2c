@@ -57,10 +57,7 @@ fn main() {
                 match parsed {
                     Some(fmt) => select_format(&mut output_format, fmt),
                     None => {
-                        eprintln!(
-                            "\x1b[31;1merror\x1b[0m: unknown format '{}'",
-                            args[i + 1]
-                        );
+                        eprintln!("\x1b[31;1merror\x1b[0m: unknown format '{}'", args[i + 1]);
                         std::process::exit(1);
                     }
                 }
@@ -85,10 +82,7 @@ fn main() {
                 match parsed {
                     Some(fmt) => select_format(&mut output_format, fmt),
                     None => {
-                        eprintln!(
-                            "\x1b[31;1merror\x1b[0m: unknown format '{}'",
-                            args[i + 1]
-                        );
+                        eprintln!("\x1b[31;1merror\x1b[0m: unknown format '{}'", args[i + 1]);
                         std::process::exit(1);
                     }
                 }
@@ -333,10 +327,8 @@ fn main() {
                             function_sources
                                 .insert(func.name.clone(), (w_filename.clone(), w_source.clone()));
                         }
-                        let existing_pos = program
-                            .functions
-                            .iter()
-                            .position(|f| f.name == func.name);
+                        let existing_pos =
+                            program.functions.iter().position(|f| f.name == func.name);
                         if let Some(pos) = existing_pos {
                             if program.functions[pos].is_extern && !func.is_extern {
                                 program.functions[pos] = func.clone();
@@ -477,8 +469,7 @@ fn main() {
             } else {
                 (None, 0)
             };
-        if let Err(errors) =
-            safety_analyzer.analyze_function(func, &structs_map, source, base_line)
+        if let Err(errors) = safety_analyzer.analyze_function(func, &structs_map, source, base_line)
         {
             for err in errors {
                 eprintln!("{}", err);
@@ -540,13 +531,12 @@ fn main() {
         }
     }
 
-    let executable_image = if output_format == OutputFormat::Program
-        || output_format == OutputFormat::Wexp
-    {
-        generate_elf64_binary(&raw_machine_code, &program, &generator)
-    } else {
-        raw_machine_code.clone()
-    };
+    let executable_image =
+        if output_format == OutputFormat::Program || output_format == OutputFormat::Wexp {
+            generate_elf64_binary(&raw_machine_code, &program, &generator)
+        } else {
+            raw_machine_code.clone()
+        };
 
     println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
     println!("      .text          (0x400078) -> Executive payload");
@@ -604,6 +594,9 @@ fn resolve_import_path(imp_name: &str) -> (String, String) {
             format!("{}/{}.wh", system_dir, lib_name),
             format!("{}/{}.w", system_dir, lib_name),
         )
+    } else if imp_name.starts_with('"') && imp_name.ends_with('"') {
+        let local_name = &imp_name[1..imp_name.len() - 1];
+        (format!("{}.wh", local_name), format!("{}.w", local_name))
     } else {
         (format!("{}.wh", imp_name), format!("{}.w", imp_name))
     }
@@ -660,8 +653,7 @@ fn install_library(lib_path: &str) {
             Err(e) => {
                 eprintln!(
                     "\x1b[31;1merror\x1b[0m: failed to read directory '{}': {}",
-                    lib_path,
-                    e
+                    lib_path, e
                 );
                 std::process::exit(1);
             }
@@ -674,10 +666,7 @@ fn install_library(lib_path: &str) {
                 let fpath = entry.path();
 
                 if fpath.is_file() {
-                    let ext = fpath
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
+                    let ext = fpath.extension().and_then(|s| s.to_str()).unwrap_or("");
 
                     if ext == "w" || ext == "wh" {
                         if let Some(stem_os) = fpath.file_stem() {

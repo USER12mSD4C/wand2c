@@ -1,0 +1,3 @@
+sc.true
+
+fn dummy() -> u64;

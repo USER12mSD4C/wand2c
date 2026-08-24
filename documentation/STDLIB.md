@@ -20,6 +20,7 @@ wand2c -il libw
 
 Add import lines at the top of your source file.
 Use angle brackets for system modules.
+Use double quotes for local modules.
 
 ```
 sc.true

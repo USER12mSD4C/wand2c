@@ -229,6 +229,7 @@ impl Parser {
                     {
                         match &self.current_token {
                             Token::Ident(name) => import_path.push_str(name),
+                            Token::StringLiteral(s) => import_path.push_str(&format!("\"{}\"", s)),
                             Token::Dot => import_path.push('.'),
                             Token::Colon => import_path.push(':'),
                             Token::OpDiv => import_path.push('/'),
@@ -238,20 +239,24 @@ impl Parser {
                         }
                         self.step();
                     }
-
                     if import_path.is_empty() {
                         return Err(self.err("Expected import path after #import"));
                     }
-
-                    if import_path.contains('.') {
+                    let is_system = import_path.starts_with('<') && import_path.ends_with('>');
+                    let is_local = import_path.starts_with('"') && import_path.ends_with('"');
+                    if !is_system && !is_local {
                         return Err(self.err(
-                                "Import path must not contain file extensions (such as .h, .w or .wlib). \
-                                 WandC expects logical module names."
-                            ));
+                        "import must use <module> for system modules or \"module\" for local modules",
+                    ));
                     }
-
+                    let inner = &import_path[1..import_path.len() - 1];
+                    if inner.contains('.') {
+                        return Err(self.err(
+                        "Import path must not contain file extensions (such as .h, .w or .wlib). \
+WandC expects logical module names.",
+                    ));
+                    }
                     program.imports.push(import_path);
-
                     if self.current_token == Token::Semicolon {
                         self.step();
                     }
