@@ -1,8 +1,8 @@
 # WandC Standard Library Reference
 
 This document describes the WandC standard library.
-The library gives you ready functions for common tasks.
-You must import the modules you need in your source file.
+The library contains ready functions for common tasks.
+You must import the necessary modules in your source file.
 
 ---
 
@@ -10,7 +10,7 @@ You must import the modules you need in your source file.
 
 Run this command to install the library:
 
-```bash
+```
 wand2c -il libw
 ```
 
@@ -21,7 +21,7 @@ wand2c -il libw
 Add import lines at the top of your source file.
 Use angle brackets for system modules.
 
-```wandc
+```
 sc.true
 
 #import <syscall>
@@ -44,11 +44,11 @@ sc.true
 
 ## Module: syscall
 
-This module talks to the operating system.
+This module interfaces with the operating system.
 
 ### Check for errors
 
-```wandc
+```
 fn syscall_error(u64 ret) -> u64;
 ```
 
@@ -57,7 +57,7 @@ It returns 0 if `ret` is valid.
 
 Example:
 
-```wandc
+```
 u64 fd = sys_open("file.txt", O_RDONLY, 0);
 if (syscall_error(fd) == 1) {
     printf("error: cannot open file\n");
@@ -67,7 +67,7 @@ if (syscall_error(fd) == 1) {
 
 ### File operations
 
-```wandc
+```
 fn sys_open(u8* path, u64 flags, u64 mode) -> u64;
 fn sys_close(u64 fd) -> u64;
 fn sys_read(u64 fd, u8* buf, u64 size) -> u64;
@@ -82,7 +82,7 @@ fn sys_getdents64(u64 fd, u8* dirp, u64 count) -> u64;
 
 ### File status
 
-```wandc
+```
 fn sys_stat(u8* path, u8* statbuf) -> u64;
 fn sys_fstat(u64 fd, u8* statbuf) -> u64;
 fn sys_lstat(u8* path, u8* statbuf) -> u64;
@@ -94,7 +94,7 @@ fn sys_rmdir(u8* path) -> u64;
 
 ### Process control
 
-```wandc
+```
 fn sys_fork() -> u64;
 fn sys_execve(u8* path, u8* argv, u8* envp) -> u64;
 fn sys_wait4(u64 pid, u64* status, u64 options, u8* rusage) -> u64;
@@ -108,7 +108,7 @@ fn sys_exit_group(u64 code);
 
 ### User and group
 
-```wandc
+```
 fn sys_getuid() -> u64;
 fn sys_getgid() -> u64;
 fn sys_geteuid() -> u64;
@@ -119,21 +119,21 @@ fn sys_setgid(u64 gid) -> u64;
 
 ### Signals
 
-```wandc
+```
 fn sys_rt_sigaction(u64 signum, u8* act, u8* oldact, u64 sigsetsize) -> u64;
 fn sys_rt_sigprocmask(u64 how, u8* set, u8* oldset, u64 sigsetsize) -> u64;
 ```
 
 ### Time
 
-```wandc
+```
 fn sys_nanosleep(u8* req, u8* rem) -> u64;
 fn sys_clock_gettime(u64 clockid, u8* tp) -> u64;
 ```
 
 ### Network
 
-```wandc
+```
 fn sys_socket(u64 domain, u64 type, u64 protocol) -> u64;
 fn sys_bind(u64 sockfd, u8* addr, u64 addrlen) -> u64;
 fn sys_listen(u64 sockfd, u64 backlog) -> u64;
@@ -145,7 +145,7 @@ fn sys_recvfrom(u64 sockfd, u8* buf, u64 len, u64 flags, u8* src_addr, u64* addr
 
 ### Event polling
 
-```wandc
+```
 fn sys_epoll_create(u64 flags) -> u64;
 fn sys_epoll_ctl(u64 epfd, u64 op, u64 fd, u8* event) -> u64;
 fn sys_epoll_wait(u64 epfd, u8* events, u64 maxevents, u64 timeout) -> u64;
@@ -153,7 +153,7 @@ fn sys_epoll_wait(u64 epfd, u8* events, u64 maxevents, u64 timeout) -> u64;
 
 ### System control
 
-```wandc
+```
 fn sys_mount(u8* source, u8* target, u8* fstype, u64 flags, u8* data) -> u64;
 fn sys_umount2(u8* target, u64 flags) -> u64;
 fn sys_reboot(u64 magic1, u64 magic2, u64 cmd, u8* arg) -> u64;
@@ -167,15 +167,15 @@ fn sys_setns(u64 fd, u64 nstype) -> u64;
 
 ### Raw memory allocation
 
-```wandc
+```
 fn mloc(u64 hint, u64 size) -> u8*;
 fn mfree(u8* ptr);
 ```
 
-`mloc` allocates memory through the `mmap` system call.
-`mloc` stores the block size in a header.
+The `mloc` function allocates memory through the `mmap` system call.
+The `mloc` function stores the block size in a header.
 The returned pointer is offset by 8 bytes.
-`mfree` reads the header and unmaps the block.
+The `mfree` function reads the header and unmaps the block.
 
 ---
 
@@ -185,7 +185,7 @@ This module prints text and reads input.
 
 ### Console output
 
-```wandc
+```
 fn print_char(u8 c);
 fn print_string(u8* s);
 fn print_number(u64 num);
@@ -193,7 +193,7 @@ fn print_signed_number(i64 num);
 fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
 ```
 
-`printf` supports three format specifiers.
+The `printf` function supports three format specifiers.
 
 | Specifier | Output |
 |---|---|
@@ -203,13 +203,13 @@ fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
 
 Example:
 
-```wandc
+```
 printf("name: %s, count: %v\n", name, count);
 ```
 
 ### Console input
 
-```wandc
+```
 fn read_char() -> u8;
 fn read_string(u8* buf, u64 max_size);
 fn read_integer() -> i64;
@@ -218,7 +218,7 @@ fn read_float() -> f64;
 
 ### File operations
 
-```wandc
+```
 fn file_open(u8* path, u64 flags, u64 mode) -> i64;
 fn file_close(u64 fd) -> i64;
 fn file_read(u64 fd, u8* buf, u64 size) -> i64;
@@ -228,7 +228,7 @@ fn file_remove(u8* path) -> i64;
 
 ### Parsing
 
-```wandc
+```
 fn parse_float(u8* s) -> f64;
 ```
 
@@ -241,7 +241,7 @@ It uses a first-fit allocator with block headers.
 
 ### Initialization
 
-```wandc
+```
 fn mem_init(u64 initial_size);
 ```
 
@@ -250,7 +250,7 @@ This function allocates an arena of `initial_size` bytes.
 
 ### Allocation
 
-```wandc
+```
 fn malloc(u64 size) -> void*;
 fn calloc(u64 num, u64 size) -> void*;
 fn mrealloc(u8* ptr, u64 new_size) -> u8*;
@@ -258,15 +258,15 @@ fn mfree(u8* ptr);
 fn mfree_all();
 ```
 
-- `malloc` gives a block of at least `size` bytes.
-- `calloc` gives a block and fills it with zeros.
-- `mrealloc` changes block size and copies data.
-- `mfree` marks a block as free.
-- `mfree_all` resets the arena offset.
+- The `malloc` function provides a block of at least `size` bytes.
+- The `calloc` function provides a block and fills it with zeros.
+- The `mrealloc` function changes the block size and copies data.
+- The `mfree` function marks a block as free.
+- The `mfree_all` function resets the arena offset.
 
 Example:
 
-```wandc
+```
 mem_init(1048576);
 u8* buf = malloc(256);
 if (buf != null) {
@@ -278,9 +278,9 @@ if (buf != null) {
 
 ## Module: string
 
-This module gives C-style string and memory operations.
+This module contains C-style string and memory operations.
 
-```wandc
+```
 fn strlen(u8* s) -> u64;
 fn strcmp(u8* s1, u8* s2) -> i64;
 fn strcpy(u8* dest, u8* src) -> u8*;
@@ -291,17 +291,17 @@ fn atoi(u8* s) -> u64;
 fn itoa(i64 num, u8* buf) -> u8*;
 ```
 
-`strcmp` returns 0 if the strings are equal.
-`strcmp` returns -1 if `s1` is less than `s2`.
-`strcmp` returns 1 if `s1` is greater than `s2`.
+The `strcmp` function returns 0 if the strings are equal.
+The `strcmp` function returns -1 if `s1` is less than `s2`.
+The `strcmp` function returns 1 if `s1` is greater than `s2`.
 
 ---
 
 ## Module: path
 
-This module gives file path utilities.
+This module contains file path utilities.
 
-```wandc
+```
 fn path_exists(u8* path) -> u64;
 fn path_is_dir(u8* path) -> u64;
 fn path_join(u8* dest, u8* a, u8* b);
@@ -309,13 +309,13 @@ fn path_dirname(u8* path, u8* dest);
 fn path_basename(u8* path) -> u8*;
 ```
 
-- `path_exists` returns 1 if the path exists.
-- `path_is_dir` returns 1 if the path is a directory.
-- `path_join` writes `a/b` into `dest`.
+- The `path_exists` function returns 1 if the path exists.
+- The `path_is_dir` function returns 1 if the path is a directory.
+- The `path_join` function writes `a/b` into `dest`.
 
 Example:
 
-```wandc
+```
 u8 full_path[512];
 path_join(full_path*adr, "/etc", "hostname");
 ```
@@ -326,21 +326,21 @@ path_join(full_path*adr, "/etc", "hostname");
 
 This module parses command-line arguments.
 
-```wandc
+```
 fn get_arg(u64 argv, u64 index) -> u8*;
 fn arg_equals(u64 argv, u64 index, u8* expected) -> u64;
 fn find_arg(u64 argc, u64 argv, u8* name) -> u64;
 fn get_arg_value(u64 argc, u64 argv, u8* name) -> u8*;
 ```
 
-- `get_arg` returns the string at `index`.
-- `arg_equals` returns 1 if the argument matches `expected`.
-- `find_arg` returns the index of `name` or 0.
-- `get_arg_value` returns the argument after `name`.
+- The `get_arg` function returns the string at `index`.
+- The `arg_equals` function returns 1 if the argument matches `expected`.
+- The `find_arg` function returns the index of `name` or 0.
+- The `get_arg_value` function returns the argument after `name`.
 
 Example:
 
-```wandc
+```
 fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     if (arg_equals(argv, 1, "build") == 1) {
         u8* target = get_arg_value(argc, argv, "-t");
@@ -362,7 +362,7 @@ This module reads files line by line.
 
 ### Structure
 
-```wandc
+```
 struct FileReader {
     i64 fd;
     u8 buf[4096];
@@ -373,17 +373,17 @@ struct FileReader {
 
 ### Functions
 
-```wandc
+```
 fn file_reader_init(FileReader* r, i64 fd);
 fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64;
 ```
 
-`file_reader_next_line` returns the line length.
-It returns -1 at end of file.
+The `file_reader_next_line` function returns the line length.
+It returns -1 at the end of the file.
 
 Example:
 
-```wandc
+```
 i64 fd = file_open("data.txt", O_RDONLY, 0);
 FileReader reader;
 file_reader_init(reader*adr, fd);
@@ -398,11 +398,11 @@ file_close(fd);
 
 ## Module: vector
 
-This module gives a dynamic array of string pointers.
+This module provides a dynamic array of string pointers.
 
 ### Structure
 
-```wandc
+```
 struct StrVec {
     u64 items;
     u64 count;
@@ -412,7 +412,7 @@ struct StrVec {
 
 ### Functions
 
-```wandc
+```
 fn strvec_init(StrVec* v);
 fn strvec_add(StrVec* v, u64 str_ptr);
 fn strvec_contains(StrVec* v, u64 str_ptr) -> i64;
@@ -423,17 +423,17 @@ fn strvec_pop(StrVec* v);
 
 ### Helpers
 
-```wandc
+```
 fn xmalloc(u64 size) -> u64;
 fn xstrdup(u64 s) -> u64;
 ```
 
-- `xmalloc` allocates memory or exits on failure.
-- `xstrdup` copies a string to new memory.
+- The `xmalloc` function allocates memory or exits on failure.
+- The `xstrdup` function copies a string to new memory.
 
 Example:
 
-```wandc
+```
 StrVec list;
 strvec_init(list*adr);
 u64 s = xstrdup("hello");
@@ -448,9 +448,9 @@ strvec_free(list*adr);
 
 ## Module: unistd
 
-This module gives process and directory helpers.
+This module provides process and directory helpers.
 
-```wandc
+```
 fn get_cpu_count() -> i64;
 fn popen(u8* command) -> i64;
 fn pclose(i64 fd) -> i64;
@@ -459,16 +459,16 @@ fn readdir(DIR* dir) -> u8*;
 fn closedir(DIR* dir);
 ```
 
-- `get_cpu_count` reads `/proc/cpuinfo` and returns CPU count.
-- `popen` runs a shell command and returns a read pipe fd.
-- `pclose` closes the pipe and waits for the child.
-- `opendir` opens a directory for reading.
-- `readdir` returns the next file name. It skips `.` and `..`.
-- `closedir` closes the directory and frees memory.
+- The `get_cpu_count` function reads `/proc/cpuinfo` and returns the CPU count.
+- The `popen` function runs a shell command and returns a read pipe file descriptor.
+- The `pclose` function closes the pipe and waits for the child process.
+- The `opendir` function opens a directory for reading.
+- The `readdir` function returns the next file name. It skips `.` and `..`.
+- The `closedir` function closes the directory and frees memory.
 
 ### Structure
 
-```wandc
+```
 struct DIR {
     i64 fd;
     u8 data[2048];
@@ -480,7 +480,7 @@ struct DIR {
 
 Example:
 
-```wandc
+```
 DIR* d = opendir("/tmp");
 if (d != null) {
     u8* name = readdir(d);
@@ -496,9 +496,9 @@ if (d != null) {
 
 ## Module: math
 
-This module gives floating-point math functions.
+This module provides floating-point math functions.
 
-```wandc
+```
 fn abs(f64 x) -> f64;
 fn sqrt(f64 x) -> f64;
 fn sin(f64 x) -> f64;
@@ -511,12 +511,12 @@ fn print_float(f64 x);
 
 ## Module: fpmath
 
-This module gives fixed-point math functions.
+This module provides fixed-point math functions.
 Values use a scale factor of 1000000.
 
 ### Constants
 
-```wandc
+```
 sect.math_const
     i64 PI = 3141592;
     i64 TWO_PI = 6283185;
@@ -527,7 +527,7 @@ EOS
 
 ### Functions
 
-```wandc
+```
 fn abs(i64 x) -> i64;
 fn pow(i64 base, u64 exp) -> i64;
 fn sqrt(i64 x) -> i64;
@@ -544,18 +544,18 @@ fn print_fixed(i64 x);
 This module reads terminal key input.
 It parses escape sequences for special keys.
 
-```wandc
+```
 fn char_available() -> u64;
 fn read_key() -> u64;
 ```
 
-`read_key` returns the key code.
+The `read_key` function returns the key code.
 Printable characters return their ASCII value.
 Special keys return codes from the `keys` section.
 
 ### Key constants
 
-```wandc
+```
 sect.keys
     u64 arrow_up = 1000;
     u64 arrow_down = 1001;
@@ -580,7 +580,7 @@ EOS
 
 Example:
 
-```wandc
+```
 u64 key = read_key();
 if (key == keys:arrow_up) {
     print_string("up\n");
@@ -591,9 +591,9 @@ if (key == keys:arrow_up) {
 
 ## Module: tui
 
-This module gives a terminal user interface with double buffering.
+This module provides a terminal user interface with double buffering.
 
-```wandc
+```
 fn get_terminal_size(u64* out_rows*o, u64* out_cols*o);
 fn tui_init();
 fn tui_clear_physical();
@@ -611,7 +611,7 @@ Call `tui_render` to update the terminal.
 
 Example:
 
-```wandc
+```
 tui_init();
 tui_clear();
 tui_draw_string(0, 0, "Hello TUI");
@@ -622,15 +622,15 @@ tui_render();
 
 ## Module: std
 
-This module gives basic utility functions.
+This module provides basic utility functions.
 
-```wandc
+```
 fn exit(u64 code);
 fn srand(u64 seed);
 fn rand() -> u64;
 ```
 
-`rand` uses a linear congruential generator.
+The `rand` function uses a linear congruential generator.
 Call `srand` to set the seed.
 
 ---
@@ -767,7 +767,7 @@ Import `<syscall>` to use these structures.
 
 Directory entry from `sys_getdents64`.
 
-```wandc
+```
 struct linux_dirent64 version 1 {
     u64 d_ino version 1;
     u64 d_off version 1;
@@ -781,7 +781,7 @@ struct linux_dirent64 version 1 {
 
 Time value for `sys_nanosleep` and `sys_clock_gettime`.
 
-```wandc
+```
 struct timespec version 1 {
     i64 tv_sec version 1;
     i64 tv_nsec version 1;
@@ -792,7 +792,7 @@ struct timespec version 1 {
 
 Signal handler configuration for `sys_rt_sigaction`.
 
-```wandc
+```
 struct sigaction version 1 {
     u64 sa_handler version 1;
     u64 sa_flags version 1;
@@ -805,7 +805,7 @@ struct sigaction version 1 {
 
 File status from `sys_stat`, `sys_fstat`, and `sys_lstat`.
 
-```wandc
+```
 struct stat version 1 {
     u64 st_dev version 1;
     u64 st_ino version 1;
@@ -832,7 +832,7 @@ struct stat version 1 {
 
 Event structure for `sys_epoll_ctl` and `sys_epoll_wait`.
 
-```wandc
+```
 struct epoll_event version 1 {
     u32 events version 1;
     u64 data version 1;
@@ -843,7 +843,7 @@ struct epoll_event version 1 {
 
 Poll descriptor.
 
-```wandc
+```
 struct pollfd version 1 {
     i32 fd version 1;
     i16 events version 1;
@@ -855,7 +855,7 @@ struct pollfd version 1 {
 
 Time value with microsecond precision.
 
-```wandc
+```
 struct timeval version 1 {
     i64 tv_sec version 1;
     i64 tv_usec version 1;

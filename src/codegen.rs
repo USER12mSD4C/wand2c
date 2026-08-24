@@ -1283,6 +1283,7 @@ impl NativeGenerator {
             Stmt::Jmpto { module_name, args } => {
                 let mut compiled_inline = false;
                 let mut source_code = None;
+
                 if let Ok(code) = std::fs::read_to_string(&module_name) {
                     source_code = Some(code);
                 } else {
@@ -1301,15 +1302,36 @@ impl NativeGenerator {
                             let mut local_parser = crate::parser::Parser::new(local_lexer);
                             if local_parser.seek_to_function("main").is_ok() {
                                 if let Ok(body) = local_parser.parse_function_body() {
+                                    let prefix = format!(
+                                        "__jmpto_{}_",
+                                        module_name.replace(
+                                            |c: char| !c.is_alphanumeric() && c != '_',
+                                            "_"
+                                        )
+                                    );
+
                                     for arg in args {
                                         self.compile_stmt(arg);
                                     }
-                                    for stmt in body {
+
+                                    for stmt in &body {
                                         if let Stmt::Return(values) = stmt {
                                             if let Some((dt, Expr::Variable(ref var_name))) =
                                                 values.first()
                                             {
-                                                if !self.local_offsets.contains_key(var_name) {
+                                                let prefixed_name =
+                                                    format!("{}{}", prefix, var_name);
+                                                let lookup_name = if self
+                                                    .local_offsets
+                                                    .contains_key(var_name.as_str())
+                                                {
+                                                    var_name.clone()
+                                                } else if self
+                                                    .local_offsets
+                                                    .contains_key(&prefixed_name)
+                                                {
+                                                    prefixed_name.clone()
+                                                } else {
                                                     let mut is_global = false;
                                                     for key in self.global_offsets.keys() {
                                                         if key.ends_with(&format!(":{}", var_name))
@@ -1332,16 +1354,42 @@ impl NativeGenerator {
                                                         self.local_types
                                                             .insert(var_name.clone(), dt.clone());
                                                     }
-                                                }
+                                                    var_name.clone()
+                                                };
                                                 if let Some(&offset) =
-                                                    self.local_offsets.get(var_name)
+                                                    self.local_offsets.get(&lookup_name)
                                                 {
                                                     let var_size = self.get_type_size_internal(dt);
                                                     self.emit_mem_store(0, offset, var_size);
                                                 }
                                             }
+                                        } else if let Stmt::VarDefinition(ref decl) = stmt {
+                                            let _prefixed_name = format!("{}{}", prefix, decl.name);
+                                            let var_size =
+                                                self.get_type_size_internal(&decl.data_type).max(1);
+                                            let align = if decl.alignment > 0 {
+                                                decl.alignment
+                                            } else {
+                                                self.resolve_type_alignment_for_datatype(
+                                                    &decl.data_type,
+                                                )
+                                                .unwrap_or(1)
+                                            };
+                                            self.next_offset =
+                                                ((self.next_offset + align - 1) / align) * align;
+                                            self.next_offset += var_size;
+                                            let offset = self.next_offset;
+                                            self.local_offsets.insert(decl.name.clone(), offset);
+                                            self.local_access
+                                                .insert(decl.name.clone(), decl.modifier.clone());
+                                            self.local_types
+                                                .insert(decl.name.clone(), decl.data_type.clone());
+                                            if let Some(init) = &decl.initial_value {
+                                                self.compile_expr(init, 0, true);
+                                                self.emit_mem_store(0, offset, var_size);
+                                            }
                                         } else {
-                                            self.compile_stmt(&stmt);
+                                            self.compile_stmt(stmt);
                                         }
                                     }
                                     compiled_inline = true;
@@ -1352,15 +1400,27 @@ impl NativeGenerator {
                 }
 
                 if !compiled_inline {
-                    for arg in args {
-                        self.compile_stmt(arg);
+                    if self.use_os {
+                        for arg in args {
+                            self.compile_stmt(arg);
+                        }
+                        self.emit_rip_relative_lea(7, format!("str:{}", module_name));
+                        self.code.push(0xE8);
+                        let patch_pos_call = self.code.len();
+                        self.code.extend_from_slice(&[0, 0, 0, 0]);
+                        self.call_patches
+                            .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
+                    } else {
+                        for arg in args {
+                            self.compile_stmt(arg);
+                        }
+                        self.emit_rip_relative_lea(7, format!("str:{}", module_name));
+                        self.code.push(0xE8);
+                        let patch_pos_call = self.code.len();
+                        self.code.extend_from_slice(&[0, 0, 0, 0]);
+                        self.call_patches
+                            .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
                     }
-                    self.emit_rip_relative_lea(7, format!("str:{}", module_name));
-                    self.code.push(0xE8);
-                    let patch_pos_call = self.code.len();
-                    self.code.extend_from_slice(&[0, 0, 0, 0]);
-                    self.call_patches
-                        .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
                 }
             }
             Stmt::Return(values) => {

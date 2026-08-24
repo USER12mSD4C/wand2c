@@ -1,6 +1,6 @@
 # WandC Code Examples
 
-This document gives practical examples of WandC code.
+This document contains practical examples of WandC code.
 Use these examples to learn the language syntax.
 
 ---
@@ -9,7 +9,7 @@ Use these examples to learn the language syntax.
 
 This example prints text to the console.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -24,9 +24,9 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 ## Variables and Control Flow
 
-This example shows variables, `if`, and `while` loops.
+This example shows variables, if statements, and while loops.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -53,9 +53,9 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 ## For Loops
 
-This example shows a `for` loop.
+This example shows a for loop.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -75,11 +75,11 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 ## Pointers and Modifiers
 
 WandC uses pointer modifiers to show data flow.
-- `*i` reads data.
-- `*o` writes data.
-- `*io` reads and writes data.
+The `*i` modifier reads data.
+The `*o` modifier writes data.
+The `*io` modifier reads and writes data.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -103,7 +103,7 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 This example defines a structure and changes its fields.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -136,12 +136,125 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 ---
 
+## Packed Structures
+
+This example shows a packed structure with custom alignment.
+
+```
+sc.true
+
+#import <io>
+
+packed align(1) struct Packet {
+    u8 type version 1;
+    u16 length version 1;
+    u32 data version 1;
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    Packet pkt;
+    pkt.type = 1;
+    pkt.length = 10;
+    pkt.data = 0x12345678;
+    
+    print_number(sizeof(Packet));
+    print_char(10);
+    
+    return(0);
+}
+```
+
+---
+
+## Unions
+
+This example shows a union type.
+
+```
+sc.true
+
+#import <io>
+
+union Data version 1 {
+    u64 as_u64 version 1;
+    f64 as_f64 version 1;
+    u8 bytes[8] version 1;
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    Data d;
+    d.as_u64 = 0x1234567890ABCDEF;
+    
+    print_number(d.as_u64);
+    print_char(10);
+    
+    return(0);
+}
+```
+
+---
+
+## Enums
+
+This example shows enum usage with versioning.
+
+```
+sc.true
+
+#import <io>
+
+enum State version 1 {
+    Idle = 0 version 1;
+    Running = 1 version 1;
+    Stopped = 2 version 1;
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    State s = State:Running;
+    
+    if (s == State:Running) {
+        print_string("Running\n");
+    }
+    
+    return(0);
+}
+```
+
+---
+
+## Typedef
+
+This example shows type aliases.
+
+```
+sc.true
+
+#import <io>
+
+typedef u8[256] Buffer;
+typedef i64 Result;
+
+fn process(Buffer buf) -> Result {
+    return(0);
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    Buffer b;
+    Result r = process(b);
+    print_signed_number(r);
+    print_char(10);
+    return(0);
+}
+```
+
+---
+
 ## Memory Allocation
 
 This example allocates heap memory and frees it.
 You must call `mem_init` before you use `malloc`.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -169,7 +282,7 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 This example opens a file, reads data, and closes the file.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -200,7 +313,7 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 This example reads arguments from the command line.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -228,7 +341,7 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 This example uses a global section to store state.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -255,11 +368,40 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 ---
 
+## Volatile and Atomic Variables
+
+This example shows volatile variables for memory-mapped I/O.
+
+```
+sc.true
+
+#import <io>
+
+sect.hardware
+    volatile u64 status = 0;
+    volatile u8* mmio_base = 0;
+EOS
+
+fn check_status() -> u64 {
+    return(hardware:status);
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    hardware:status = 1;
+    u64 s = check_status();
+    print_number(s);
+    print_char(10);
+    return(0);
+}
+```
+
+---
+
 ## Match Statement
 
 This example uses `match` to check multiple values.
 
-```wandc
+```
 sc.true
 
 #import <io>
@@ -286,11 +428,113 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 
 ---
 
+## Multiple Return Values
+
+This example shows functions that return multiple values.
+
+```
+sc.true
+
+#import <io>
+
+fn divmod(u64 a, u64 b) -> (u64, u64) {
+    u64 quotient = a / b;
+    u64 remainder = a % b;
+    return(quotient, remainder);
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    u64 q, r;
+    [q, r] = divmod(17, 5);
+    
+    print_string("Quotient: ");
+    print_number(q);
+    print_char(10);
+    print_string("Remainder: ");
+    print_number(r);
+    print_char(10);
+    
+    return(0);
+}
+```
+
+---
+
+## Compile-Time Reflection
+
+This example shows compile-time type information.
+
+```
+sc.true
+
+#import <io>
+
+struct Config version 2 {
+    u32 version version 1;
+    u64 flags version 1;
+    u8* name version 2;
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    print_string("Config size: ");
+    print_number(sizeof(Config));
+    print_char(10);
+    
+    print_string("Config alignment: ");
+    print_number(alignof(Config));
+    print_char(10);
+    
+    print_string("Config fields: ");
+    print_number(fieldsof(Config));
+    print_char(10);
+    
+    print_string("flags offset: ");
+    print_number(offsetof(Config:flags));
+    print_char(10);
+    
+    return(0);
+}
+```
+
+---
+
+## Atomic Operations
+
+This example shows atomic operations for thread safety.
+
+```
+sc.true
+
+#import <io>
+
+sect.shared
+    atomic u64 counter = 0;
+EOS
+
+fn increment_atomic() {
+    atomic_add(shared:counter*adr, 1);
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    increment_atomic();
+    increment_atomic();
+    increment_atomic();
+    
+    u64 val = atomic_load(shared:counter*adr);
+    print_number(val);
+    print_char(10);
+    
+    return(0);
+}
+```
+
+---
+
 ## Inline Assembly
 
 This example uses inline assembly to read a CPU timestamp.
 
-```wandc
+```
 sc.false
 
 #import <io>
@@ -308,5 +552,89 @@ fn get_ticks() -> u64 {
 
 fn kmain() {
     u64 ticks = get_ticks();
+}
+```
+
+---
+
+## Critical Sections (Bare Metal)
+
+This example shows critical sections for interrupt-safe code.
+
+```
+sc.false
+
+sect.kernel
+    u64 tick_count = 0;
+EOS
+
+fn update_ticks() {
+    critical {
+        kernel:tick_count = kernel:tick_count + 1;
+    }
+}
+
+fn kmain() {
+    update_ticks();
+}
+```
+
+---
+
+## IRQ Handlers
+
+This example shows interrupt handler functions.
+
+```
+sc.false
+
+irq fn timer_interrupt() {
+    // Handle timer interrupt
+}
+
+fn kmain() {
+    // Setup interrupt vector to point to timer_interrupt
+}
+```
+
+---
+
+## Export Functions
+
+This example shows exported functions for modules.
+
+```
+sc.true
+
+#import <io>
+
+export fn public_api(u64 value) -> u64 {
+    return(value * 2);
+}
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    u64 result = public_api(21);
+    print_number(result);
+    print_char(10);
+    return(0);
+}
+```
+
+---
+
+## Extern Functions
+
+This example shows external function declarations.
+
+```
+sc.true
+
+#import <io>
+
+extern fn external_lib_func(u64 a, u64 b) -> u64;
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    print_string("External function declared\n");
+    return(0);
 }
 ```
