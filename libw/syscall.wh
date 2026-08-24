@@ -1,5 +1,8 @@
 sc.true
 
+#import <syscall_constants>
+#import <syscall_structs>
+
 extern fn sys_read(u64 fd, u8* buf, u64 size) -> u64;
 extern fn sys_write(u64 fd, u8* buf, u64 size) -> u64;
 extern fn sys_open(u8* path, u64 flags, u64 mode) -> u64;

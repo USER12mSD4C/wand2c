@@ -53,11 +53,15 @@ fn strvec_init(StrVec* v) {
 }
 
 fn strvec_add(StrVec* v, u64 str_ptr) {
+    u64 dup = xstrdup(str_ptr);
+
     if (v->count >= v->capacity) {
         u64 new_capacity = v->capacity * 2;
+
         if (new_capacity == 0) {
             new_capacity = 4;
         }
+
         u64 new_size = new_capacity * 8;
         u64 old_ptr = v->items;
         u64 new_ptr = 0;
@@ -74,7 +78,9 @@ fn strvec_add(StrVec* v, u64 str_ptr) {
 
     u64 idx = v->count;
     u64 items_ptr = v->items;
-    write_u64_ptr(items_ptr + idx * 8, str_ptr);
+
+    write_u64_ptr(items_ptr + idx * 8, dup);
+
     v->count = v->count + 1;
 }
 

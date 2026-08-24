@@ -215,11 +215,14 @@ export fn sys_epoll_wait(u64 epfd, u8* events, u64 maxevents, u64 timeout) -> u6
 export fn mloc(u64 hint, u64 size) -> u8* {
     u64 total = size + 8;
     u64 addr = syscall6(9, hint, total, 3, 34, 4294967295, 0);
-    if (addr == 18446744073709551615) {
+
+    if (syscall_error(addr) == 1) {
         return(null);
     }
+
     u64* header = addr;
     header[0] = total;
+
     return(addr + 8);
 }
 

@@ -10,6 +10,11 @@ EOS
 
 fn mem_init(u64 initial_size) {
     void* raw_mem = mloc(null, initial_size);
+
+    if (raw_mem == null) {
+        sys_exit(1);
+    }
+
     heap:arena_start = raw_mem;
     heap:arena_size = initial_size;
     heap:offset = 0;

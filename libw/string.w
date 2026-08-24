@@ -8,12 +8,14 @@ fn strlen(u8* s) -> u64 {
 
     while (active_char != 0) {
         active_char = p;
+
         if (active_char != 0) {
             p++;
             len = len + 1;
         }
     }
-    return(u64 len);
+
+    return(len);
 }
 
 fn strcmp(u8* s1, u8* s2) {
@@ -71,25 +73,46 @@ fn strcat(u8* dest, u8* src) {
 
 fn memcpy(u8* dest, u8* src, u64 n) {
     u64 i = 0;
+
+    while ((i + 8) <= n) {
+        u64* d = dest + i;
+        u64* s = src + i;
+
+        d[0] = s[0];
+
+        i = i + 8;
+    }
+
     while (i < n) {
-        u8* p_out*o = dest;
-        u8* p_in*i = src;
-        p_out = p_in;
-        dest++;
-        src++;
+        dest[i] = src[i];
         i = i + 1;
     }
+
     return(dest);
 }
 
 fn memset(u8* s, u8 c, u64 n) {
+    u64 v = c;
+
+    v = v | (v << 8);
+    v = v | (v << 16);
+    v = v | (v << 32);
+
     u64 i = 0;
+
+    while ((i + 8) <= n) {
+        u64* p = s + i;
+
+        p[0] = v;
+
+        i = i + 8;
+    }
+
     while (i < n) {
-        u8* p_out*o = s;
-        p_out = c;
-        s++;
+        s[i] = c;
         i = i + 1;
     }
+
     return(s);
 }
 

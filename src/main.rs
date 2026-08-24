@@ -255,6 +255,8 @@ fn main() {
                 program.imports.extend(parsed.imports);
                 program.typedefs.extend(parsed.typedefs);
                 program.structs.extend(parsed.structs);
+                program.enums.extend(parsed.enums);
+                program.constants.extend(parsed.constants);
                 program.sections.extend(parsed.sections);
                 program.functions.extend(parsed.functions);
             }
@@ -293,6 +295,8 @@ fn main() {
                     program.structs.extend(wh_program.structs);
                     program.functions.extend(wh_program.functions);
                     program.sections.extend(wh_program.sections);
+                    program.constants.extend(wh_program.constants);
+                    program.enums.extend(wh_program.enums);
 
                     for sub_imp in wh_program.imports {
                         if !resolved_imports.contains(&sub_imp) {
@@ -344,6 +348,8 @@ fn main() {
                     program.structs.extend(w_program.structs);
                     program.sections.extend(w_program.sections);
                     program.typedefs.extend(w_program.typedefs);
+                    program.constants.extend(w_program.constants);
+                    program.enums.extend(w_program.enums);
                 }
                 Err(err) => {
                     report_parse_error(&w_filename, &w_source, &err.message, &err.span);
