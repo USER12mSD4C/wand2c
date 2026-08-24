@@ -19,30 +19,30 @@ pub struct Parser {
 }
 
 impl Parser {
-pub fn new(lexer: Lexer) -> Self {
-    let mut p = Self {
-        lexer,
-        current_token: Token::EOF,
-        current_span: Span {
-            line: 1,
-            col: 1,
-            start: 0,
-            end: 0,
-        },
-        peek_token: Token::EOF,
-        peek_span: Span {
-            line: 1,
-            col: 1,
-            start: 0,
-            end: 0,
-        },
-        constants: HashMap::new(),
-    };
+    pub fn new(lexer: Lexer) -> Self {
+        let mut p = Self {
+            lexer,
+            current_token: Token::EOF,
+            current_span: Span {
+                line: 1,
+                col: 1,
+                start: 0,
+                end: 0,
+            },
+            peek_token: Token::EOF,
+            peek_span: Span {
+                line: 1,
+                col: 1,
+                start: 0,
+                end: 0,
+            },
+            constants: HashMap::new(),
+        };
 
-    p.step();
-    p.step();
-    p
-}
+        p.step();
+        p.step();
+        p
+    }
 
     fn step(&mut self) {
         self.current_token = self.peek_token.clone();
@@ -188,7 +188,10 @@ pub fn new(lexer: Lexer) -> Self {
             | Token::TypeF64
             | Token::TypeVoid => true,
             Token::Ident(_) => match &self.peek_token {
-                Token::Ident(_) | Token::PtrInputModifier(_) | Token::PtrOutputModifier(_) | Token::PtrInputOutputModifier(_) => true,
+                Token::Ident(_)
+                | Token::PtrInputModifier(_)
+                | Token::PtrOutputModifier(_)
+                | Token::PtrInputOutputModifier(_) => true,
                 _ => false,
             },
             _ => false,
@@ -374,7 +377,9 @@ pub fn new(lexer: Lexer) -> Self {
                             version_removed,
                         });
                         next_value = value.wrapping_add(1);
-                        if self.current_token == Token::Semicolon || self.current_token == Token::Comma {
+                        if self.current_token == Token::Semicolon
+                            || self.current_token == Token::Comma
+                        {
                             self.step();
                         }
                     }
@@ -546,10 +551,7 @@ pub fn new(lexer: Lexer) -> Self {
             self.step();
         }
 
-        Err(self.err(&format!(
-            "Function {} not found for second pass",
-            name
-        )))
+        Err(self.err(&format!("Function {} not found for second pass", name)))
     }
 
     pub fn parse_function_body(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -663,6 +665,21 @@ pub fn new(lexer: Lexer) -> Self {
                     self.step();
                 }
                 Ok(Stmt::VarDefinition(var_decl))
+            }
+
+            Token::Continue => {
+                self.step();
+                if self.current_token == Token::Semicolon {
+                    self.step();
+                }
+                Ok(Stmt::Continue)
+            }
+            Token::Break => {
+                self.step();
+                if self.current_token == Token::Semicolon {
+                    self.step();
+                }
+                Ok(Stmt::Break)
             }
 
             Token::Ident(ref name) => {
@@ -1641,6 +1658,21 @@ pub fn new(lexer: Lexer) -> Self {
             Token::TypeVoid => {
                 self.step();
                 Ok(Expr::Variable("void".to_string()))
+            }
+            Token::LBrace => {
+                self.step();
+                let mut elements = Vec::new();
+                while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                    elements.push(self.parse_expr()?);
+                    if self.current_token == Token::Comma {
+                        self.step();
+                    }
+                }
+                if self.current_token != Token::RBrace {
+                    return Err(self.err("Expected '}' after array initializer"));
+                }
+                self.step();
+                Ok(Expr::ArrayInit(elements))
             }
             _ => Err(self.err("Unexpected primary expression")),
         }

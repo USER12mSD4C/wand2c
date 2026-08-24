@@ -428,6 +428,8 @@ impl Lexer {
             "match" => Token::Match,
             "case" => Token::Case,
             "default" => Token::Default,
+            "continue" => Token::Continue,
+            "break" => Token::Break,
             "u8" => Token::TypeU8,
             "u16" => Token::TypeU16,
             "u32" => Token::TypeU32,

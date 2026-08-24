@@ -34,6 +34,9 @@ pub enum Token {
     Ro,
     Noinit,
 
+    Continue,
+    Break,
+
     TypeU8,
     TypeU16,
     TypeU32,

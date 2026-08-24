@@ -125,6 +125,7 @@ pub enum Expr {
         index: Box<Expr>,
     },
     FloatLit(String),
+    ArrayInit(Vec<Expr>),
     Null,
 }
 
@@ -163,6 +164,8 @@ pub enum Stmt {
         default: Option<Vec<Stmt>>,
     },
     Expr(Expr),
+    Continue,
+    Break,
 }
 
 #[derive(Debug, Clone)]

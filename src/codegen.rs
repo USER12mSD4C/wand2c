@@ -45,6 +45,12 @@ pub struct NativeGenerator {
     struct_alignments: HashMap<String, u32>,
     struct_versions: HashMap<String, u32>,
     struct_volatile_fields: HashMap<String, std::collections::HashSet<String>>,
+    loop_stack: Vec<LoopContext>,
+}
+
+struct LoopContext {
+    continue_patches: Vec<usize>,
+    break_patches: Vec<usize>,
 }
 
 impl NativeGenerator {
@@ -78,6 +84,7 @@ impl NativeGenerator {
             struct_alignments: HashMap::new(),
             struct_versions: HashMap::new(),
             struct_volatile_fields: HashMap::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -353,18 +360,32 @@ impl NativeGenerator {
                 }
                 self.section_var_sizes.insert(key.clone(), var_size);
 
-                let init_val = match &var.initial_value {
-                    Some(expr) => self.eval_const_expr(expr).unwrap_or(0),
-                    None => 0,
-                };
-
-                let init_bytes = init_val.to_le_bytes();
-                for i in 0..(var_size as usize) {
-                    if i < init_bytes.len() {
-                        global_data_bytes.push(init_bytes[i]);
+                let start_len = global_data_bytes.len();
+                if let Some(init_expr) = &var.initial_value {
+                    if let Expr::ArrayInit(elements) = &**init_expr {
+                        for elem in elements {
+                            let val = self.eval_const_expr(elem).unwrap_or(0);
+                            global_data_bytes.push((val & 0xFF) as u8);
+                        }
                     } else {
+                        let init_val = self.eval_const_expr(init_expr).unwrap_or(0);
+                        let init_bytes = init_val.to_le_bytes();
+                        for i in 0..(var_size as usize) {
+                            if i < init_bytes.len() {
+                                global_data_bytes.push(init_bytes[i]);
+                            } else {
+                                global_data_bytes.push(0);
+                            }
+                        }
+                    }
+                } else {
+                    for _ in 0..var_size {
                         global_data_bytes.push(0);
                     }
+                }
+
+                while (global_data_bytes.len() - start_len) < var_size as usize {
+                    global_data_bytes.push(0);
                 }
             }
         }
@@ -1229,23 +1250,32 @@ impl NativeGenerator {
             }
             Stmt::While { cond, body } => {
                 let loop_start_pos = self.code.len();
+                self.loop_stack.push(LoopContext {
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                });
                 let jump_op = self.compile_condition_helper(cond);
-
                 self.code.push(0x0F);
                 self.code.push(jump_op);
                 let exit_patch_pos = self.code.len();
                 self.code.extend_from_slice(&[0, 0, 0, 0]);
-
                 for body_stmt in body {
                     self.compile_stmt(body_stmt);
                 }
-
+                let ctx = self.loop_stack.pop().unwrap();
+                for patch_pos in &ctx.continue_patches {
+                    let rel = (loop_start_pos as i32) - ((*patch_pos + 4) as i32);
+                    self.patch_address(*patch_pos, rel);
+                }
                 let jmp_offset = (loop_start_pos as i32) - ((self.code.len() + 5) as i32);
                 self.code.push(0xE9);
                 self.code.extend_from_slice(&jmp_offset.to_le_bytes());
-
                 let exit_offset = (self.code.len() - (exit_patch_pos + 4)) as i32;
                 self.patch_address(exit_patch_pos, exit_offset);
+                for patch_pos in &ctx.break_patches {
+                    let rel = (self.code.len() as i32) - ((*patch_pos + 4) as i32);
+                    self.patch_address(*patch_pos, rel);
+                }
             }
             Stmt::For {
                 init,
@@ -1256,29 +1286,37 @@ impl NativeGenerator {
                 if let Some(init_stmt) = init {
                     self.compile_stmt(init_stmt);
                 }
-
                 let loop_start_pos = self.code.len();
+                self.loop_stack.push(LoopContext {
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                });
                 let jump_op = self.compile_condition_helper(cond);
-
                 self.code.push(0x0F);
                 self.code.push(jump_op);
                 let exit_patch_pos = self.code.len();
                 self.code.extend_from_slice(&[0; 4]);
-
                 for body_stmt in body {
                     self.compile_stmt(body_stmt);
                 }
-
+                let post_pos = self.code.len();
                 if let Some(post_stmt) = post {
                     self.compile_stmt(post_stmt);
                 }
-
+                let ctx = self.loop_stack.pop().unwrap();
+                for patch_pos in &ctx.continue_patches {
+                    let rel = (post_pos as i32) - ((*patch_pos + 4) as i32);
+                    self.patch_address(*patch_pos, rel);
+                }
                 let jmp_offset = (loop_start_pos as i32) - ((self.code.len() + 5) as i32);
                 self.code.push(0xE9);
                 self.code.extend_from_slice(&jmp_offset.to_le_bytes());
-
                 let exit_offset = (self.code.len() - (exit_patch_pos + 4)) as i32;
                 self.patch_address(exit_patch_pos, exit_offset);
+                for patch_pos in &ctx.break_patches {
+                    let rel = (self.code.len() as i32) - ((*patch_pos + 4) as i32);
+                    self.patch_address(*patch_pos, rel);
+                }
             }
             Stmt::Jmpto { module_name, args } => {
                 let mut compiled_inline = false;
@@ -1601,6 +1639,22 @@ impl NativeGenerator {
                 for p in end_jmps {
                     let rel = (end_pos as i32) - ((p + 4) as i32);
                     self.patch_address(p, rel);
+                }
+            }
+            Stmt::Continue => {
+                if let Some(ctx) = self.loop_stack.last_mut() {
+                    self.code.push(0xE9);
+                    let patch_pos = self.code.len();
+                    self.code.extend_from_slice(&[0, 0, 0, 0]);
+                    ctx.continue_patches.push(patch_pos);
+                }
+            }
+            Stmt::Break => {
+                if let Some(ctx) = self.loop_stack.last_mut() {
+                    self.code.push(0xE9);
+                    let patch_pos = self.code.len();
+                    self.code.extend_from_slice(&[0, 0, 0, 0]);
+                    ctx.break_patches.push(patch_pos);
                 }
             }
             Stmt::Expr(ref expr) => {
@@ -2348,8 +2402,10 @@ impl NativeGenerator {
                     self.call_patches.push((patch_pos, name.clone()));
                 }
             }
+            Expr::ArrayInit(_) => {
+                self.compile_expr(&Expr::Null, reg, _deref_ptr);
+            }
         }
-
         if reg != 0 {
             match expr {
                 Expr::Variable(_)
@@ -3023,6 +3079,7 @@ impl NativeGenerator {
                 }
                 _ => Err(format!("unsupported constant function '{}'", name)),
             },
+            Expr::ArrayInit(_) => Err("array initializer is not a scalar constant".to_string()),
             _ => Err("unsupported constant expression".to_string()),
         }
     }
