@@ -247,3 +247,7 @@ export fn syscall_error(u64 ret) -> u64 {
     }
     return(0);
 }
+
+fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64 {
+    return(syscall6(9, addr, length, prot, flags, fd, offset));
+}

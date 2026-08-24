@@ -1074,6 +1074,35 @@ WandC expects logical module names.",
             });
         }
 
+        let compound_op = match &self.current_token {
+            Token::OpAddAssign => Some("OpAdd"),
+            Token::OpSubAssign => Some("OpSub"),
+            Token::OpMulAssign => Some("OpMul"),
+            Token::OpDivAssign => Some("OpDiv"),
+            Token::OpModAssign => Some("OpMod"),
+            Token::OpBitAndAssign => Some("OpBitAnd"),
+            Token::OpBitOrAssign => Some("OpBitOr"),
+            Token::OpBitXorAssign => Some("OpBitXor"),
+            Token::OpShlAssign => Some("OpShl"),
+            Token::OpShrAssign => Some("OpShr"),
+            _ => None,
+        };
+        if let Some(op) = compound_op {
+            self.step();
+            let right = self.parse_expr()?;
+            if self.current_token == Token::Semicolon {
+                self.step();
+            }
+            return Ok(Stmt::Assignment {
+                targets: vec![left.clone()],
+                value: Expr::Binary {
+                    left: Box::new(left),
+                    op: op.to_string(),
+                    right: Box::new(right),
+                },
+            });
+        }
+
         if self.current_token == Token::OpAssign {
             self.step();
             let right = self.parse_expr()?;
@@ -1133,7 +1162,12 @@ WandC expects logical module names.",
 
             let mut field_type = self.parse_data_type()?;
             let field_name = match &self.current_token {
-                Token::Ident(n) => n.clone(),
+                Token::Ident(n) => {
+                    if n == "_" {
+                        return Err(self.err("'_' cannot be used as a field name"));
+                    }
+                    n.clone()
+                }
                 _ => return Err(self.err("Expected field name")),
             };
             self.step();
@@ -1255,7 +1289,12 @@ WandC expects logical module names.",
         while self.current_token != Token::RParen && self.current_token != Token::EOF {
             let p_type = self.parse_data_type()?;
             let (p_name, p_access) = match &self.current_token {
-                Token::Ident(n) => (n.clone(), PtrAccess::Normal),
+                Token::Ident(n) => {
+                    if n == "_" {
+                        return Err(self.err("'_' cannot be used as a parameter name"));
+                    }
+                    (n.clone(), PtrAccess::Normal)
+                }
                 Token::PtrInputModifier(n) => (n.clone(), PtrAccess::Input),
                 Token::PtrOutputModifier(n) => (n.clone(), PtrAccess::Output),
                 Token::PtrInputOutputModifier(n) => (n.clone(), PtrAccess::InputOutput),
@@ -1318,7 +1357,12 @@ WandC expects logical module names.",
 
     fn parse_var_decl_tail(&mut self, mut base_type: DataType) -> Result<VarDecl, ParseError> {
         let (name, modifier) = match &self.current_token {
-            Token::Ident(n) => (n.clone(), PtrAccess::Normal),
+            Token::Ident(n) => {
+                if n == "_" {
+                    return Err(self.err("'_' cannot be used as a variable name"));
+                }
+                (n.clone(), PtrAccess::Normal)
+            }
             Token::PtrInputModifier(n) => (n.clone(), PtrAccess::Input),
             Token::PtrOutputModifier(n) => (n.clone(), PtrAccess::Output),
             Token::PtrInputOutputModifier(n) => (n.clone(), PtrAccess::InputOutput),

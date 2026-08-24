@@ -27,14 +27,11 @@ fn sqrt(i64 x) -> i64 {
     if (x <= 0) {
         return(0);
     }
-    // Масштабируем число для извлечения корня с точностью до 10^3
     i64 val = x * 1000000;
     i64 res = val / 2;
     if (res == 0) {
         res = 1;
     }
-
-    // Итерационная формула Ньютона (вавилонский метод)
     u64 i = 0;
     while (i < 40) {
         i64 next_res = (res + (val / res)) / 2;
@@ -48,21 +45,17 @@ fn sqrt(i64 x) -> i64 {
 }
 
 fn sin(i64 rad) -> i64 {
-    // 1. Нормализация угла в диапазон [0, 2*PI]
     i64 x = rad % math_const:TWO_PI;
     if (x < 0) {
         x = x + math_const:TWO_PI;
     }
 
-    // 2. Определение знака квадранта
     i64 sign = 1;
     if (x > math_const:PI) {
         x = x - math_const:PI;
         sign = 0 - 1;
     }
 
-    // 3. Формула Бхаскары I для sin(x) на интервале [0, PI]:
-    // sin(x) ~= 16 * x * (PI - x) / (5 * PI^2 - 4 * x * (PI - x))
     i64 pi_minus_x = math_const:PI - x;
     i64 x_prod = x * pi_minus_x;
 
@@ -74,7 +67,6 @@ fn sin(i64 rad) -> i64 {
 }
 
 fn cos(i64 rad) -> i64 {
-    // cos(x) = sin(x + PI/2)
     return(sin(rad + math_const:HALF_PI));
 }
 
@@ -82,7 +74,6 @@ fn tan(i64 rad) -> i64 {
     i64 s = sin(rad);
     i64 c = cos(rad);
     if (c == 0) {
-        // Защита от деления на ноль (возвращаем условную бесконечность)
         return(999999999);
     }
     return((s * math_const:FIXED_ONE) / c);

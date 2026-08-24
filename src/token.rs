@@ -87,15 +87,24 @@ pub enum Token {
     Comma,     // ,
 
     OpAddrOf,
-
     Enum,
     Union,
-    OpBitAnd, // &
-    OpBitOr,  // |
-    OpBitXor, // ^
-    OpBitNot, // ~
-    OpShl,    // <<
-    OpShr,    // >>
+    OpBitAnd,       // &
+    OpBitOr,        // |
+    OpBitXor,       // ^
+    OpBitNot,       // ~
+    OpShl,          // <<
+    OpShr,          // >>
+    OpAddAssign,    // +=
+    OpSubAssign,    // -=
+    OpMulAssign,    // *=
+    OpDivAssign,    // /=
+    OpModAssign,    // %=
+    OpBitAndAssign, // &=
+    OpBitOrAssign,  // |=
+    OpBitXorAssign, // ^=
+    OpShlAssign,    // <<=
+    OpShrAssign,    // >>=
     TypeF64,
     FloatLiteral(String),
 

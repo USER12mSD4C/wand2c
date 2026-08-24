@@ -61,6 +61,7 @@ extern fn mfree(u8* ptr);
 extern fn sys_mkdir(u8* path, u64 mode) -> u64;
 extern fn sys_rmdir(u8* path) -> u64;
 export fn syscall_error(u64 ret) -> u64;
+fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64;
 
 struct Stat version 1 {
     u64 dev version 1;

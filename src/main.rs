@@ -40,6 +40,7 @@ fn main() {
     let mut output_file = None;
     let mut output_format: Option<OutputFormat> = None;
     let mut entry_name: Option<String> = None;
+    let mut verbose = false;
     let mut i = 1;
 
     while i < args.len() {
@@ -124,6 +125,9 @@ fn main() {
                 eprintln!("\x1b[31;1merror\x1b[0m: --entry requires an argument.");
                 std::process::exit(1);
             }
+        } else if args[i] == "-v" || args[i] == "--verbose" {
+            verbose = true;
+            i += 1;
         } else if args[i].starts_with('-') {
             eprintln!("\x1b[31;1merror\x1b[0m: unknown option '{}'", args[i]);
             print_usage();
@@ -198,8 +202,10 @@ fn main() {
         };
     }
 
-    println!("\x1b[32;1m[wand2c]\x1b[0m Starting multi-file compilation pipeline...");
-    println!("  \x1b[34;1mStage 1:\x1b[0m Lexing and Parsing");
+    if verbose {
+        println!("\x1b[32;1m[wand2c]\x1b[0m Starting multi-file compilation pipeline...");
+        println!("  \x1b[34;1mStage 1:\x1b[0m Lexing and Parsing");
+    }
 
     let mut program = ast::Program {
         use_os: true,
@@ -215,10 +221,12 @@ fn main() {
     let mut function_sources = HashMap::new();
 
     for filename in &input_files {
-        println!(
-            "    \x1b[37;1mSource:\x1b[0m Processing file: '{}'",
-            filename
-        );
+        if verbose {
+            println!(
+                "    \x1b[37;1mSource:\x1b[0m Processing file: '{}'",
+                filename
+            );
+        }
         let source_code = match fs::read_to_string(filename) {
             Ok(content) => content,
             Err(e) => {
@@ -275,10 +283,12 @@ fn main() {
 
         if std::path::Path::new(&wh_filename).exists() {
             resolved = true;
-            println!(
-                "    \x1b[36mHeader Dependency:\x1b[0m Loaded and parsed '{}'",
-                wh_filename
-            );
+            if verbose {
+                println!(
+                    "    \x1b[36mHeader Dependency:\x1b[0m Loaded and parsed '{}'",
+                    wh_filename
+                );
+            }
             let wh_source = fs::read_to_string(&wh_filename).expect("Failed to read header file");
             let wh_lexer = Lexer::new(&wh_source);
             let mut wh_parser = Parser::new(wh_lexer);
@@ -307,10 +317,12 @@ fn main() {
 
         if std::path::Path::new(&w_filename).exists() {
             resolved = true;
-            println!(
-                "    \x1b[36mSource Dependency (Auto-Load):\x1b[0m Loaded and parsed '{}'",
-                w_filename
-            );
+            if verbose {
+                println!(
+                    "    \x1b[36mSource Dependency (Auto-Load):\x1b[0m Loaded and parsed '{}'",
+                    w_filename
+                );
+            }
             let w_source =
                 fs::read_to_string(&w_filename).expect("Failed to read implementation file");
             let w_lexer = Lexer::new(&w_source);
@@ -384,13 +396,15 @@ fn main() {
         }
     }
 
-    println!(
-        "    \x1b[32mSymbols Merged:\x1b[0m structs={}, sections={}, functions={}, typedefs={}",
-        program.structs.len(),
-        program.sections.len(),
-        program.functions.len(),
-        program.typedefs.len()
-    );
+    if verbose {
+        println!(
+            "    \x1b[32mSymbols Merged:\x1b[0m structs={}, sections={}, functions={}, typedefs={}",
+            program.structs.len(),
+            program.sections.len(),
+            program.functions.len(),
+            program.typedefs.len()
+        );
+    }
 
     match output_format {
         OutputFormat::Program => {
@@ -423,14 +437,20 @@ fn main() {
         }
     }
 
-    println!("  \x1b[34;1mStage 2:\x1b[0m AST Optimization Pass");
+    if verbose {
+        println!("  \x1b[34;1mStage 2:\x1b[0m AST Optimization Pass");
+    }
     let folded_count = Optimizer::optimize_program(&mut program);
-    println!(
-        "    \x1b[32mOptimized:\x1b[0m Folded {} binary expressions into constant literals",
-        folded_count
-    );
+    if verbose {
+        println!(
+            "    \x1b[32mOptimized:\x1b[0m Folded {} binary expressions into constant literals",
+            folded_count
+        );
+    }
 
-    println!("  \x1b[34;1mStage 3:\x1b[0m Type Checking & Safety Analysis");
+    if verbose {
+        println!("  \x1b[34;1mStage 3:\x1b[0m Type Checking & Safety Analysis");
+    }
     let mut checker = TypeChecker::new();
     checker.populate_symbols(&program);
     if let Err(e) = checker.verify_calls(&program) {
@@ -488,29 +508,32 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");
+    if verbose {
+        println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");
+    }
     let mut generator = NativeGenerator::new();
     generator.output_format = output_format;
     generator.entry_name = entry_name.clone();
     generator.use_os = program.use_os;
     let raw_machine_code = generator.compile_program(&program);
 
-    println!("  \x1b[34;1mStage 5:\x1b[0m Binary Packaging & ABI Linking");
-
-    println!("    \x1b[37;1mLinking functions from source files:\x1b[0m");
-    for (func_name, offset) in &generator.function_offsets {
-        let origin = if let Some((file, _)) = function_sources.get(func_name) {
-            file.as_str()
-        } else {
-            "stdlib"
-        };
-        println!(
-            "      {}: '{}' -> offset: 0x{:x} (virtual addr: 0x{:x})",
-            origin,
-            func_name,
-            offset,
-            0x400078 + offset
-        );
+    if verbose {
+        println!("  \x1b[34;1mStage 5:\x1b[0m Binary Packaging & ABI Linking");
+        println!("    \x1b[37;1mLinking functions from source files:\x1b[0m");
+        for (func_name, offset) in &generator.function_offsets {
+            let origin = if let Some((file, _)) = function_sources.get(func_name) {
+                file.as_str()
+            } else {
+                "stdlib"
+            };
+            println!(
+                "      {}: '{}' -> offset: 0x{:x} (virtual addr: 0x{:x})",
+                origin,
+                func_name,
+                offset,
+                0x400078 + offset
+            );
+        }
     }
 
     let mut unresolved_calls = Vec::new();
@@ -521,7 +544,7 @@ fn main() {
             }
         }
     }
-    if !unresolved_calls.is_empty() {
+    if verbose && !unresolved_calls.is_empty() {
         println!("    \x1b[37;1mLinking unresolved symbols as external imports:\x1b[0m");
         for unresolved in &unresolved_calls {
             println!(
@@ -538,13 +561,15 @@ fn main() {
             raw_machine_code.clone()
         };
 
-    println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
-    println!("      .text          (0x400078) -> Executive payload");
-    println!("      .p46_header    (ABI Magic + Metadata)");
-    println!("      .p46_types     (TLV structures declarations)");
-    println!("      .p46_exports   (Exported symbols & signatures)");
-    println!("      .p46_deps      (Standard 4/6 dependencies)");
-    println!("      .p46_strtab    (Symbol names String Table)");
+    if verbose {
+        println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
+        println!("      .text          (0x400078) -> Executive payload");
+        println!("      .p46_header    (ABI Magic + Metadata)");
+        println!("      .p46_types     (TLV structures declarations)");
+        println!("      .p46_exports   (Exported symbols & signatures)");
+        println!("      .p46_deps      (Standard 4/6 dependencies)");
+        println!("      .p46_strtab    (Symbol names String Table)");
+    }
 
     if let Err(e) = fs::write(&final_output, &executable_image) {
         eprintln!(
@@ -574,7 +599,7 @@ fn main() {
     }
 
     println!(
-        "\x1b[32;1m[wand2c]\x1b[0m \x1b[32;1mSuccess:\x1b[0m Built '{}' ({} bytes).",
+        "\x1b[32;1m[wand2c]\x1b[0m Built '{}' ({} bytes).",
         final_output,
         executable_image.len()
     );
@@ -835,6 +860,7 @@ fn print_usage() {
     println!();
     println!("Options:");
     println!("  -o <filename>        Output file path");
+    println!("  -v, --verbose        Show detailed compilation output");
     println!("  --format=<name>      Set output format");
     println!("  -f <name>            Set output format");
     println!("  -fp                  Same as --format=program");

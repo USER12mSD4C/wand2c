@@ -187,7 +187,14 @@ impl Lexer {
             ':' => Token::Colon,
             '.' => Token::Dot,
             '~' => Token::OpBitNot,
-            '^' => Token::OpBitXor,
+            '^' => {
+                if self.current() == '=' {
+                    self.step();
+                    Token::OpBitXorAssign
+                } else {
+                    Token::OpBitXor
+                }
+            }
             '!' => {
                 if self.current() == '=' {
                     self.step();
@@ -210,7 +217,12 @@ impl Lexer {
                     Token::OpLtEq
                 } else if self.current() == '<' {
                     self.step();
-                    Token::OpShl
+                    if self.current() == '=' {
+                        self.step();
+                        Token::OpShlAssign
+                    } else {
+                        Token::OpShl
+                    }
                 } else {
                     Token::OpLt
                 }
@@ -221,7 +233,12 @@ impl Lexer {
                     Token::OpGtEq
                 } else if self.current() == '>' {
                     self.step();
-                    Token::OpShr
+                    if self.current() == '=' {
+                        self.step();
+                        Token::OpShrAssign
+                    } else {
+                        Token::OpShr
+                    }
                 } else {
                     Token::OpGt
                 }
@@ -230,6 +247,9 @@ impl Lexer {
                 if self.current() == '+' {
                     self.step();
                     Token::OpInc
+                } else if self.current() == '=' {
+                    self.step();
+                    Token::OpAddAssign
                 } else {
                     Token::OpAdd
                 }
@@ -241,17 +261,44 @@ impl Lexer {
                 } else if self.current() == '>' {
                     self.step();
                     Token::Arrow
+                } else if self.current() == '=' {
+                    self.step();
+                    Token::OpSubAssign
                 } else {
                     Token::OpSub
                 }
             }
-            '*' => Token::OpMul,
-            '/' => Token::OpDiv,
-            '%' => Token::OpMod,
+            '*' => {
+                if self.current() == '=' {
+                    self.step();
+                    Token::OpMulAssign
+                } else {
+                    Token::OpMul
+                }
+            }
+            '/' => {
+                if self.current() == '=' {
+                    self.step();
+                    Token::OpDivAssign
+                } else {
+                    Token::OpDiv
+                }
+            }
+            '%' => {
+                if self.current() == '=' {
+                    self.step();
+                    Token::OpModAssign
+                } else {
+                    Token::OpMod
+                }
+            }
             '&' => {
                 if self.current() == '&' {
                     self.step();
                     Token::OpAnd
+                } else if self.current() == '=' {
+                    self.step();
+                    Token::OpBitAndAssign
                 } else {
                     Token::OpBitAnd
                 }
@@ -260,6 +307,9 @@ impl Lexer {
                 if self.current() == '|' {
                     self.step();
                     Token::OpOr
+                } else if self.current() == '=' {
+                    self.step();
+                    Token::OpBitOrAssign
                 } else {
                     Token::OpBitOr
                 }
