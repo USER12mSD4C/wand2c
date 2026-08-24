@@ -250,11 +250,27 @@ impl Parser {
                     ));
                     }
                     let inner = &import_path[1..import_path.len() - 1];
-                    if inner.contains('.') {
-                        return Err(self.err(
-                        "Import path must not contain file extensions (such as .h, .w or .wlib). \
-WandC expects logical module names.",
-                    ));
+                    if inner.is_empty() {
+                        return Err(self.err("Import path cannot be empty"));
+                    }
+                    if is_system {
+                        if inner.contains('.') || inner.contains('/') {
+                            return Err(self.err(
+                            "system import must be a logical module name without path separators or extensions",
+                        ));
+                        }
+                    } else {
+                        let lower = inner.to_ascii_lowercase();
+                        if lower.ends_with(".w")
+                            || lower.ends_with(".wh")
+                            || lower.ends_with(".wlib")
+                            || lower.ends_with(".wexp")
+                            || lower.ends_with(".h")
+                        {
+                            return Err(self.err(
+                            "Import path must not contain file extensions (such as .h, .w, .wh, .wlib or .wexp). WandC expects logical module names.",
+                        ));
+                        }
                     }
                     program.imports.push(import_path);
                     if self.current_token == Token::Semicolon {
@@ -582,7 +598,13 @@ WandC expects logical module names.",
             Token::If => self.parse_if_statement(),
             Token::While => self.parse_while_statement(),
             Token::For => self.parse_for_statement(),
-            Token::Jmpto => self.parse_jmpto_statement(),
+            Token::Jmpto => {
+                if self.peek_token == Token::LParen {
+                    self.parse_expr_statement()
+                } else {
+                    self.parse_jmpto_statement()
+                }
+            }
             Token::Match => self.parse_match_statement(),
             Token::Critical => {
                 self.step();
@@ -1567,23 +1589,25 @@ WandC expects logical module names.",
                 let name_val = name.clone();
                 self.step();
 
-                if self.current_token == Token::Colon {
+                let mut current_expr = if self.current_token == Token::Colon {
                     self.step();
-                    if let Token::Ident(var) = &self.current_token {
-                        let var_name = var.clone();
-                        self.step();
-                        return Ok(Expr::SectionAccess {
-                            section: name_val,
-                            variable: var_name,
-                        });
-                    } else if let Token::AddrOf(var) = &self.current_token {
-                        let var_name = var.clone();
-                        self.step();
-                        return Ok(Expr::AddrOf(format!("{}:{}", name_val, var_name)));
+                    match &self.current_token {
+                        Token::Ident(var) => {
+                            let var_name = var.clone();
+                            self.step();
+                            Expr::SectionAccess {
+                                section: name_val.clone(),
+                                variable: var_name,
+                            }
+                        }
+                        Token::AddrOf(var) => {
+                            let var_name = var.clone();
+                            self.step();
+                            Expr::AddrOf(format!("{}:{}", name_val, var_name))
+                        }
+                        _ => return Err(self.err("Expected section variable name")),
                     }
-                }
-
-                if self.current_token == Token::LParen {
+                } else if self.current_token == Token::LParen {
                     self.step();
                     let mut args = Vec::new();
                     while self.current_token != Token::RParen && self.current_token != Token::EOF {
@@ -1594,12 +1618,13 @@ WandC expects logical module names.",
                     }
                     self.step();
                     return Ok(Expr::Call {
-                        name: name_val,
+                        name: name_val.clone(),
                         args,
                     });
-                }
+                } else {
+                    Expr::Variable(name_val.clone())
+                };
 
-                let mut current_expr = Expr::Variable(name_val);
                 while self.current_token == Token::Arrow
                     || self.current_token == Token::Dot
                     || self.current_token == Token::LBracket
@@ -1618,7 +1643,6 @@ WandC expects logical module names.",
                     } else {
                         let is_arrow = self.current_token == Token::Arrow;
                         self.step();
-
                         match &self.current_token {
                             Token::Ident(member) => {
                                 current_expr = Expr::MemberAccess {
@@ -1626,22 +1650,17 @@ WandC expects logical module names.",
                                     member: member.clone(),
                                     is_arrow,
                                 };
-
                                 self.step();
                             }
-
                             Token::AddrOf(member) => {
                                 current_expr = Expr::MemberAccess {
                                     expr: Box::new(current_expr),
                                     member: member.clone(),
                                     is_arrow,
                                 };
-
                                 self.step();
-
                                 current_expr = Expr::AddrOfExpr(Box::new(current_expr));
                             }
-
                             _ => return Err(self.err("Expected member identifier")),
                         }
                     }
@@ -1722,6 +1741,22 @@ WandC expects logical module names.",
                 }
                 self.step();
                 Ok(Expr::ArrayInit(elements))
+            }
+            Token::Jmpto => {
+                self.step();
+                if self.current_token != Token::LParen {
+                    return Err(self.err("Expected '(' after jmpto"));
+                }
+                self.step();
+                let path_expr = self.parse_expr()?;
+                if self.current_token != Token::RParen {
+                    return Err(self.err("Expected ')' after jmpto path"));
+                }
+                self.step();
+                Ok(Expr::Call {
+                    name: "jmpto".to_string(),
+                    args: vec![path_expr],
+                })
             }
             _ => Err(self.err("Unexpected primary expression")),
         }

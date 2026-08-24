@@ -250,16 +250,12 @@ impl TypeChecker {
                     "atomic_cas",
                     "memory_barrier",
                     "compiler_barrier",
+                    "jmpto",
                 ];
 
                 let hosted_only = [
-                    "syscall0",
-                    "syscall1",
-                    "syscall2",
-                    "syscall3",
-                    "syscall4",
-                    "syscall5",
-                    "syscall6",
+                    "syscall0", "syscall1", "syscall2", "syscall3", "syscall4", "syscall5",
+                    "syscall6", "jmpto",
                 ];
 
                 if hosted_only.contains(&name.as_str()) && !self.use_os {

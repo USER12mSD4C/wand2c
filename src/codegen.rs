@@ -23,7 +23,7 @@ pub struct NativeGenerator {
     pub global_data_size: u32,
     section_volatile: std::collections::HashSet<String>,
     section_var_sizes: HashMap<String, u32>,
-
+    section_types: HashMap<String, DataType>,
     struct_layouts: HashMap<String, (u32, HashMap<String, u32>)>,
     typedefs_map: HashMap<String, DataType>,
 
@@ -67,6 +67,7 @@ impl NativeGenerator {
             global_data_size: 0,
             section_volatile: std::collections::HashSet::new(),
             section_var_sizes: HashMap::new(),
+            section_types: HashMap::new(),
             struct_layouts: HashMap::new(),
             typedefs_map: HashMap::new(),
             string_constants: HashMap::new(),
@@ -97,18 +98,34 @@ impl NativeGenerator {
         self.address_patches.push((patch_pos, patch_key, true));
     }
 
+    fn peel_typedefs(&self, dt: DataType) -> DataType {
+        let mut current = dt;
+        while let DataType::Typedef(_, inner) = current {
+            current = *inner;
+        }
+        current
+    }
+
     fn resolve_expr_type(&self, expr: &Expr) -> Option<DataType> {
         match expr {
             Expr::Variable(name) => self.local_types.get(name).cloned(),
+            Expr::SectionAccess { section, variable } => {
+                if self.enums.contains_key(section) {
+                    return Some(DataType::U64);
+                }
+                self.section_types
+                    .get(&format!("{}:{}", section, variable))
+                    .cloned()
+            }
             Expr::MemberAccess {
                 expr: base_expr,
                 member,
                 ..
             } => {
-                let base_type = self.resolve_expr_type(base_expr)?;
+                let base_type = self.peel_typedefs(self.resolve_expr_type(base_expr)?);
                 let struct_name = match base_type {
                     DataType::Struct(n) => n,
-                    DataType::Pointer(boxed) => match *boxed {
+                    DataType::Pointer(boxed) => match self.peel_typedefs(*boxed) {
                         DataType::Struct(n) => n,
                         _ => return None,
                     },
@@ -119,26 +136,17 @@ impl NativeGenerator {
             Expr::Index {
                 expr: base_expr, ..
             } => {
-                let base_type = self.resolve_expr_type(base_expr)?;
+                let base_type = self.peel_typedefs(self.resolve_expr_type(base_expr)?);
                 match base_type {
                     DataType::Array(elem, _) => Some(*elem),
                     DataType::Pointer(elem) => Some(*elem),
-                    DataType::Typedef(name, _) => {
-                        if let Some(DataType::Array(elem, _)) = self.typedefs_map.get(&name) {
-                            Some(*elem.clone())
-                        } else {
-                            None
-                        }
-                    }
                     _ => None,
                 }
             }
-
             Expr::AddrOfExpr(inner) => {
                 let inner_type = self.resolve_expr_type(inner)?;
                 Some(DataType::Pointer(Box::new(inner_type)))
             }
-
             _ => None,
         }
     }
@@ -263,6 +271,9 @@ impl NativeGenerator {
         self.string_constants.clear();
         self.float_constants.clear();
         self.address_patches.clear();
+        self.section_volatile.clear();
+        self.section_var_sizes.clear();
+        self.section_types.clear();
         self.struct_layouts.clear();
         self.typedefs_map.clear();
 
@@ -359,7 +370,8 @@ impl NativeGenerator {
                     self.section_volatile.insert(key.clone());
                 }
                 self.section_var_sizes.insert(key.clone(), var_size);
-
+                self.section_types
+                    .insert(key.clone(), var.data_type.clone());
                 let start_len = global_data_bytes.len();
                 if let Some(init_expr) = &var.initial_value {
                     if let Expr::ArrayInit(elements) = &**init_expr {
@@ -1183,7 +1195,35 @@ impl NativeGenerator {
                 }
             }
             Stmt::Assignment { targets, value } => {
-                if let Some(target_expr) = targets.first() {
+                if targets.len() == 1 {
+                    if let Some(target_expr) = targets.first() {
+                        let copied = self.try_compile_string_copy_to_u8_array(target_expr, value);
+                        if !copied {
+                            self.compile_expr(value, 0, true);
+                            self.store_assignment_target_from_rax(target_expr);
+                        }
+                        if let Expr::Variable(name) = target_expr {
+                            if let Some(modifier) = self.local_access.get(name) {
+                                if *modifier == PtrAccess::Volatile
+                                    || *modifier == PtrAccess::Atomic
+                                {
+                                    self.code.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
+                                }
+                            }
+                        }
+                        if copied && self.is_volatile_member_expr(target_expr) {
+                            self.code.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
+                        }
+                        if copied {
+                            if let Expr::SectionAccess { section, variable } = target_expr {
+                                let key = format!("{}:{}", section, variable);
+                                if self.section_volatile.contains(&key) {
+                                    self.code.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(target_expr) = targets.first() {
                     self.compile_expr(value, 0, true);
                     self.store_assignment_target_from_rax(target_expr);
                     if let Expr::Variable(name) = target_expr {
@@ -1193,7 +1233,6 @@ impl NativeGenerator {
                             }
                         }
                     }
-
                     if targets.len() > 1 {
                         if let Some(target_expr2) = targets.get(1) {
                             self.code.extend_from_slice(&[0x48, 0x89, 0xD0]);
@@ -1319,145 +1358,189 @@ impl NativeGenerator {
                 }
             }
             Stmt::Jmpto { module_name, args } => {
-                let mut compiled_inline = false;
-                let mut source_code = None;
-
-                if let Ok(code) = std::fs::read_to_string(&module_name) {
-                    source_code = Some(code);
-                } else {
-                    let source_filename = module_name.replace(".wexp", ".w");
-                    if let Ok(code) = std::fs::read_to_string(&source_filename) {
-                        source_code = Some(code);
+                if self.local_offsets.contains_key(module_name) {
+                    let mut result_targets: Vec<String> = Vec::new();
+                    for arg in args {
+                        if let Stmt::Return(values) = arg {
+                            for (_, expr) in values {
+                                if let Expr::Variable(name) = expr {
+                                    result_targets.push(name.clone());
+                                }
+                            }
+                            continue;
+                        }
+                        self.compile_stmt(arg);
                     }
-                }
-
-                if let Some(code) = source_code {
-                    let lexer = crate::lexer::Lexer::new(&code);
-                    let mut parser = crate::parser::Parser::new(lexer);
-                    if let Ok(parsed_program) = parser.parse_program() {
-                        if parsed_program.functions.iter().any(|f| f.name == "main") {
-                            let local_lexer = crate::lexer::Lexer::new(&code);
-                            let mut local_parser = crate::parser::Parser::new(local_lexer);
-                            if local_parser.seek_to_function("main").is_ok() {
-                                if let Ok(body) = local_parser.parse_function_body() {
-                                    let prefix = format!(
-                                        "__jmpto_{}_",
-                                        module_name.replace(
-                                            |c: char| !c.is_alphanumeric() && c != '_',
-                                            "_"
-                                        )
-                                    );
-
-                                    for arg in args {
-                                        self.compile_stmt(arg);
-                                    }
-
-                                    for stmt in &body {
-                                        if let Stmt::Return(values) = stmt {
-                                            if let Some((dt, Expr::Variable(ref var_name))) =
-                                                values.first()
-                                            {
-                                                let prefixed_name =
-                                                    format!("{}{}", prefix, var_name);
-                                                let lookup_name = if self
-                                                    .local_offsets
-                                                    .contains_key(var_name.as_str())
+                    self.compile_expr(&Expr::Variable(module_name.clone()), 7, false);
+                    self.code.push(0xE8);
+                    let patch_pos_call = self.code.len();
+                    self.code.extend_from_slice(&[0, 0, 0, 0]);
+                    self.call_patches
+                        .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
+                    for target_name in result_targets {
+                        let mut var_size = if let Some(dt) = self.local_types.get(&target_name) {
+                            self.get_type_size_internal(dt)
+                        } else {
+                            8
+                        };
+                        if var_size == 0 {
+                            var_size = 8;
+                        }
+                        if let Some(&offset) = self.local_offsets.get(&target_name) {
+                            self.emit_mem_store(0, offset, var_size);
+                        } else {
+                            self.store_assignment_target_from_rax(&Expr::Variable(target_name));
+                        }
+                    }
+                } else {
+                    let mut compiled_inline = false;
+                    let mut source_code = None;
+                    if let Ok(code) = std::fs::read_to_string(&module_name) {
+                        source_code = Some(code);
+                    } else {
+                        let source_filename = module_name.replace(".wexp", ".w");
+                        if let Ok(code) = std::fs::read_to_string(&source_filename) {
+                            source_code = Some(code);
+                        }
+                    }
+                    if let Some(code) = source_code {
+                        let lexer = crate::lexer::Lexer::new(&code);
+                        let mut parser = crate::parser::Parser::new(lexer);
+                        if let Ok(parsed_program) = parser.parse_program() {
+                            if parsed_program.functions.iter().any(|f| f.name == "main") {
+                                let local_lexer = crate::lexer::Lexer::new(&code);
+                                let mut local_parser = crate::parser::Parser::new(local_lexer);
+                                if local_parser.seek_to_function("main").is_ok() {
+                                    if let Ok(body) = local_parser.parse_function_body() {
+                                        let prefix = format!(
+                                            "__jmpto_{}_",
+                                            module_name.replace(
+                                                |c: char| !c.is_alphanumeric() && c != '_',
+                                                "_"
+                                            )
+                                        );
+                                        for arg in args {
+                                            self.compile_stmt(arg);
+                                        }
+                                        for stmt in &body {
+                                            if let Stmt::Return(values) = stmt {
+                                                if let Some((dt, Expr::Variable(ref var_name))) =
+                                                    values.first()
                                                 {
-                                                    var_name.clone()
-                                                } else if self
-                                                    .local_offsets
-                                                    .contains_key(&prefixed_name)
-                                                {
-                                                    prefixed_name.clone()
-                                                } else {
-                                                    let mut is_global = false;
-                                                    for key in self.global_offsets.keys() {
-                                                        if key.ends_with(&format!(":{}", var_name))
-                                                        {
-                                                            is_global = true;
-                                                            break;
+                                                    let prefixed_name =
+                                                        format!("{}{}", prefix, var_name);
+                                                    let lookup_name = if self
+                                                        .local_offsets
+                                                        .contains_key(var_name.as_str())
+                                                    {
+                                                        var_name.clone()
+                                                    } else if self
+                                                        .local_offsets
+                                                        .contains_key(&prefixed_name)
+                                                    {
+                                                        prefixed_name.clone()
+                                                    } else {
+                                                        let mut is_global = false;
+                                                        for key in self.global_offsets.keys() {
+                                                            if key.ends_with(&format!(
+                                                                ":{}",
+                                                                var_name
+                                                            )) {
+                                                                is_global = true;
+                                                                break;
+                                                            }
                                                         }
-                                                    }
-                                                    if !is_global {
+                                                        if !is_global {
+                                                            let var_size =
+                                                                self.get_type_size_internal(dt);
+                                                            self.next_offset += var_size;
+                                                            let offset = self.next_offset;
+                                                            self.local_offsets
+                                                                .insert(var_name.clone(), offset);
+                                                            self.local_access.insert(
+                                                                var_name.clone(),
+                                                                PtrAccess::Normal,
+                                                            );
+                                                            self.local_types.insert(
+                                                                var_name.clone(),
+                                                                dt.clone(),
+                                                            );
+                                                        }
+                                                        var_name.clone()
+                                                    };
+                                                    if let Some(&offset) =
+                                                        self.local_offsets.get(&lookup_name)
+                                                    {
                                                         let var_size =
                                                             self.get_type_size_internal(dt);
-                                                        self.next_offset += var_size;
-                                                        let offset = self.next_offset;
-                                                        self.local_offsets
-                                                            .insert(var_name.clone(), offset);
-                                                        self.local_access.insert(
-                                                            var_name.clone(),
-                                                            PtrAccess::Normal,
-                                                        );
-                                                        self.local_types
-                                                            .insert(var_name.clone(), dt.clone());
+                                                        self.emit_mem_store(0, offset, var_size);
                                                     }
-                                                    var_name.clone()
+                                                }
+                                            } else if let Stmt::VarDefinition(ref decl) = stmt {
+                                                let _prefixed_name =
+                                                    format!("{}{}", prefix, decl.name);
+                                                let var_size = self
+                                                    .get_type_size_internal(&decl.data_type)
+                                                    .max(1);
+                                                let align = if decl.alignment > 0 {
+                                                    decl.alignment
+                                                } else {
+                                                    self.resolve_type_alignment_for_datatype(
+                                                        &decl.data_type,
+                                                    )
+                                                    .unwrap_or(1)
                                                 };
-                                                if let Some(&offset) =
-                                                    self.local_offsets.get(&lookup_name)
-                                                {
-                                                    let var_size = self.get_type_size_internal(dt);
+                                                self.next_offset = ((self.next_offset + align - 1)
+                                                    / align)
+                                                    * align;
+                                                self.next_offset += var_size;
+                                                let offset = self.next_offset;
+                                                self.local_offsets
+                                                    .insert(decl.name.clone(), offset);
+                                                self.local_access.insert(
+                                                    decl.name.clone(),
+                                                    decl.modifier.clone(),
+                                                );
+                                                self.local_types.insert(
+                                                    decl.name.clone(),
+                                                    decl.data_type.clone(),
+                                                );
+                                                if let Some(init) = &decl.initial_value {
+                                                    self.compile_expr(init, 0, true);
                                                     self.emit_mem_store(0, offset, var_size);
                                                 }
-                                            }
-                                        } else if let Stmt::VarDefinition(ref decl) = stmt {
-                                            let _prefixed_name = format!("{}{}", prefix, decl.name);
-                                            let var_size =
-                                                self.get_type_size_internal(&decl.data_type).max(1);
-                                            let align = if decl.alignment > 0 {
-                                                decl.alignment
                                             } else {
-                                                self.resolve_type_alignment_for_datatype(
-                                                    &decl.data_type,
-                                                )
-                                                .unwrap_or(1)
-                                            };
-                                            self.next_offset =
-                                                ((self.next_offset + align - 1) / align) * align;
-                                            self.next_offset += var_size;
-                                            let offset = self.next_offset;
-                                            self.local_offsets.insert(decl.name.clone(), offset);
-                                            self.local_access
-                                                .insert(decl.name.clone(), decl.modifier.clone());
-                                            self.local_types
-                                                .insert(decl.name.clone(), decl.data_type.clone());
-                                            if let Some(init) = &decl.initial_value {
-                                                self.compile_expr(init, 0, true);
-                                                self.emit_mem_store(0, offset, var_size);
+                                                self.compile_stmt(stmt);
                                             }
-                                        } else {
-                                            self.compile_stmt(stmt);
                                         }
+                                        compiled_inline = true;
                                     }
-                                    compiled_inline = true;
                                 }
                             }
                         }
                     }
-                }
-
-                if !compiled_inline {
-                    if self.use_os {
-                        for arg in args {
-                            self.compile_stmt(arg);
+                    if !compiled_inline {
+                        if self.use_os {
+                            for arg in args {
+                                self.compile_stmt(arg);
+                            }
+                            self.emit_rip_relative_lea(7, format!("str:{}", module_name));
+                            self.code.push(0xE8);
+                            let patch_pos_call = self.code.len();
+                            self.code.extend_from_slice(&[0, 0, 0, 0]);
+                            self.call_patches
+                                .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
+                        } else {
+                            for arg in args {
+                                self.compile_stmt(arg);
+                            }
+                            self.emit_rip_relative_lea(7, format!("str:{}", module_name));
+                            self.code.push(0xE8);
+                            let patch_pos_call = self.code.len();
+                            self.code.extend_from_slice(&[0, 0, 0, 0]);
+                            self.call_patches
+                                .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
                         }
-                        self.emit_rip_relative_lea(7, format!("str:{}", module_name));
-                        self.code.push(0xE8);
-                        let patch_pos_call = self.code.len();
-                        self.code.extend_from_slice(&[0, 0, 0, 0]);
-                        self.call_patches
-                            .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
-                    } else {
-                        for arg in args {
-                            self.compile_stmt(arg);
-                        }
-                        self.emit_rip_relative_lea(7, format!("str:{}", module_name));
-                        self.code.push(0xE8);
-                        let patch_pos_call = self.code.len();
-                        self.code.extend_from_slice(&[0, 0, 0, 0]);
-                        self.call_patches
-                            .push((patch_pos_call, "__wand_jmpto_loader".to_string()));
                     }
                 }
             }
@@ -2043,6 +2126,21 @@ impl NativeGenerator {
                     return;
                 }
 
+                if name == "jmpto" {
+                    if let Some(path_expr) = args.first() {
+                        self.compile_expr(path_expr, 7, false);
+                    } else {
+                        self.emit_mov_imm64(7, 0);
+                    }
+                    self.code.push(0xE8);
+                    let patch_pos = self.code.len();
+                    self.code.extend_from_slice(&[0, 0, 0, 0]);
+                    self.call_patches
+                        .push((patch_pos, "__wand_jmpto_loader".to_string()));
+                    self.move_rax_to_reg(reg);
+                    return;
+                }
+
                 if name == "memory_barrier" {
                     self.code.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
                     self.code.extend_from_slice(&[0x48, 0x31, 0xC0]);
@@ -2493,40 +2591,38 @@ impl NativeGenerator {
                 index,
             } => {
                 let mut elem_size = 8u32;
-
                 if let Some(base_type) = self.resolve_expr_type(base_expr) {
-                    match base_type {
+                    match self.peel_typedefs(base_type) {
                         DataType::Array(elem, _) => {
                             elem_size = self.get_type_size_internal(&elem);
                         }
                         DataType::Pointer(elem) => {
                             elem_size = self.get_type_size_internal(&elem);
                         }
-                        DataType::Typedef(name, _) => {
-                            if let Some(DataType::Array(elem, _)) = self.typedefs_map.get(&name) {
-                                elem_size = self.get_type_size_internal(elem);
-                            }
-                        }
                         _ => {}
                     }
                 }
-
                 self.compile_address(base_expr, 3);
                 self.code.push(0x53);
-
                 self.compile_expr(index, 0, true);
-
-                if elem_size == 8 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]);
-                } else if elem_size == 4 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x02]);
-                } else if elem_size == 2 {
-                    self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x01]);
+                match elem_size {
+                    1 => {}
+                    2 => {
+                        self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x01]);
+                    }
+                    4 => {
+                        self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x02]);
+                    }
+                    8 => {
+                        self.code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]);
+                    }
+                    _ => {
+                        self.code.extend_from_slice(&[0x48, 0x0F, 0x69, 0xC0]);
+                        self.code.extend_from_slice(&elem_size.to_le_bytes());
+                    }
                 }
-
                 self.code.push(0x5B);
                 self.code.extend_from_slice(&[0x48, 0x01, 0xC3]);
-
                 if internal_reg == 0 {
                     self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
                 }
@@ -2537,15 +2633,13 @@ impl NativeGenerator {
                 is_arrow,
             } => {
                 self.compile_address(base_expr, internal_reg);
-
                 if *is_arrow {
                     let mut is_base_pointer = false;
                     if let Some(base_type) = self.resolve_expr_type(base_expr) {
-                        if let DataType::Pointer(_) = base_type {
+                        if let DataType::Pointer(_) = self.peel_typedefs(base_type) {
                             is_base_pointer = true;
                         }
                     }
-
                     if !is_base_pointer {
                         let deref_op = if internal_reg == 0 {
                             &[0x48, 0x8B, 0x00][..]
@@ -2555,19 +2649,18 @@ impl NativeGenerator {
                         self.code.extend_from_slice(deref_op);
                     }
                 }
-
                 let mut struct_name = String::new();
                 if let Some(base_type) = self.resolve_expr_type(base_expr) {
-                    struct_name = match base_type {
+                    let peeled = self.peel_typedefs(base_type);
+                    struct_name = match peeled {
                         DataType::Struct(n) => n,
-                        DataType::Pointer(boxed) => match *boxed {
+                        DataType::Pointer(boxed) => match self.peel_typedefs(*boxed) {
                             DataType::Struct(n) => n,
                             _ => String::new(),
                         },
                         _ => String::new(),
                     };
                 }
-
                 if let Some((_, fields)) = self.struct_layouts.get(&struct_name) {
                     if let Some(&field_offset) = fields.get(member) {
                         let add_opcode = if internal_reg == 0 { 0xC0 } else { 0xC3 };
@@ -2872,6 +2965,38 @@ impl NativeGenerator {
             _ => {}
         }
     }
+
+    fn try_compile_string_copy_to_u8_array(&mut self, target: &Expr, value: &Expr) -> bool {
+        if let Expr::StringLit(s) = value {
+            let resolved = self
+                .resolve_expr_type(target)
+                .map(|dt| self.peel_typedefs(dt));
+            if let Some(DataType::Array(elem, count)) = resolved {
+                if matches!(*elem, DataType::U8 | DataType::I8) && count > 0 {
+                    self.compile_address(target, 3);
+                    let bytes = Self::unescape_wand_string(s);
+                    let copy_len = if bytes.len() + 1 <= count {
+                        bytes.len() + 1
+                    } else {
+                        count - 1
+                    };
+                    self.code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                    if copy_len > 0 {
+                        self.emit_rip_relative_lea(6, format!("str:{}", s));
+                        self.emit_mov_imm64(1, copy_len as u64);
+                        self.code.push(0xFC);
+                        self.code.extend_from_slice(&[0xF3, 0xA4]);
+                    }
+                    if bytes.len() + 1 > count {
+                        self.code.extend_from_slice(&[0xC6, 0x07, 0x00]);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn get_primitive_size(&self, name: &str) -> Option<u32> {
         match name {
             "u8" | "i8" => Some(1),
