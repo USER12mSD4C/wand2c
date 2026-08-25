@@ -419,11 +419,6 @@ Constants must be declared before use.
 
 #### Multiple assignment
 
-```
-u64 a = 1, b = 2, c = 3;
-```
-
-Wait, actually WandC does not support this syntax. Each variable needs its own declaration:
 
 ```
 u64 a = 1;
