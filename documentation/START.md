@@ -1,7 +1,25 @@
 # WandC Getting Started Guide
 
 This guide helps you start with WandC.
-You will learn the basic workflow and file structure.
+It shows the basic workflow and file structure.
+
+---
+
+## Environment Token
+
+Every WandC file must start with an environment token.
+
+Use `sc.true` for programs that run under an operating system.
+Use `sc.false` for bare metal code.
+
+`sc.true` requires a `main` function.
+`sc.false` requires a `kmain` function.
+
+Example:
+
+```wandc
+sc.true
+```
 
 ---
 
@@ -14,15 +32,15 @@ WandC uses two file types.
 Source files contain executable code.
 Use `.w` files for implementation.
 
-Example structure:
+Example:
 
-```
+```wandc
 sc.true
-
 #import <io>
 
 fn main(u64 argc, u64 argv, u64 envp) -> u64 {
-    print_string("Hello, WandC!\n");
+    print_string("Hello, WandC!");
+    print_char(10);
     return(0);
 }
 ```
@@ -33,6 +51,7 @@ Header files contain declarations.
 Use `.wh` files for interfaces.
 
 Header files declare:
+
 - Function signatures
 - Structure definitions
 - Constants
@@ -40,9 +59,8 @@ Header files declare:
 
 Example header:
 
-```
+```wandc
 sc.true
-
 #import <syscall>
 
 fn file_open(u8* path, u64 flags, u64 mode) -> i64;
@@ -64,7 +82,7 @@ Organize your project with separate header and source files.
 
 For small programs, use one `.w` file:
 
-```
+```text
 wand2c program.w -o program -fp
 ```
 
@@ -72,22 +90,22 @@ wand2c program.w -o program -fp
 
 For larger projects, split code into modules:
 
-```
+```text
 project/
-├── main.w          (main program)
-├── utils.wh        (utility declarations)
-├── utils.w         (utility implementation)
-├── parser.wh       (parser declarations)
-└── parser.w        (parser implementation)
+    main.w
+    utils.wh
+    utils.w
+    parser.wh
+    parser.w
 ```
 
 Compile with:
 
-```
+```text
 wand2c main.w -o program -fp
 ```
 
-The compiler automatically loads `.wh` and `.w` dependencies.
+The compiler loads `.wh` and `.w` dependencies.
 
 ---
 
@@ -99,7 +117,7 @@ Use `#import` to include modules.
 
 Import system libraries with angle brackets:
 
-```
+```wandc
 #import <io>
 #import <mem>
 #import <string>
@@ -110,34 +128,51 @@ Import system libraries with angle brackets:
 
 Import local modules with double quotes:
 
-```
+```wandc
 #import "utils"
 #import "parser"
 ```
 
 The compiler searches for:
-1. `module.wh` (header)
-2. `module.w` (source)
+
+1. `module.wh`
+2. `module.w`
+
+Import paths must not contain file extensions.
+
+Correct:
+
+```wandc
+#import <io>
+#import "utils"
+```
+
+Incorrect:
+
+```wandc
+#import <io.w>
+#import "utils.wh"
+```
 
 ---
 
 ## Correct Practices
 
-### Do: Separate Interface and Implementation
+### Separate Interface and Implementation
 
-Create a header file for public API:
+Create a header file for the public API.
 
-```
-// api.wh
+Header file:
+
+```wandc
 sc.true
 
 export fn public_function(u64 value) -> u64;
 ```
 
-Implement in source file:
+Source file:
 
-```
-// api.w
+```wandc
 sc.true
 
 export fn public_function(u64 value) -> u64 {
@@ -145,11 +180,11 @@ export fn public_function(u64 value) -> u64 {
 }
 ```
 
-### Do: Use Explicit Exports
+### Use Explicit Exports
 
 Mark public functions with `export`:
 
-```
+```wandc
 export fn visible_function() -> u64 {
     return(1);
 }
@@ -159,71 +194,57 @@ fn internal_function() -> u64 {
 }
 ```
 
-### Do: Initialize Memory Before Use
+### Initialize Memory Before Use
 
-Always call `mem_init` before `malloc`:
+Call `mem_init` before `malloc`:
 
-```
+```wandc
+sc.true
 #import <mem>
 
-fn main() -> u64 {
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     mem_init(1048576);
-    u8* ptr = malloc(256);
-    mfree(ptr);
+    u8* ptr = (u8*)malloc(256);
+    if (ptr != null) {
+        mfree(ptr);
+    }
     return(0);
 }
 ```
 
-### Do: Check Pointers for Null
+### Check Pointers for Null
 
 Always verify allocation success:
 
-```
-u8* buffer = malloc(1024);
+```wandc
+u8* buffer = (u8*)malloc(1024);
 if (buffer == null) {
-    print_string("Allocation failed\n");
+    print_string("Allocation failed");
+    print_char(10);
     return(1);
 }
 ```
 
-### Do: Free Allocated Memory
+### Free Allocated Memory
 
-Always free memory before function exit:
+Free allocated memory before function exit:
 
-```
-u8* data = malloc(512);
-// Use data
-mfree(data);
+```wandc
+u8* data = (u8*)malloc(512);
+if (data != null) {
+    mfree(data);
+}
 ```
 
 ---
 
 ## Incorrect Practices
 
-### Do Not: Put Implementation in Headers
+### Do Not Put Implementation in Headers
 
-Incorrect:
+Incorrect header:
 
-```
-// bad.wh
-sc.true
-
-fn calculate(u64 a, u64 b) -> u64 {
-    return(a + b);  // Wrong: implementation in header
-}
-```
-
-Correct:
-
-```
-// good.wh
-sc.true
-
-fn calculate(u64 a, u64 b) -> u64;
-```
-
-```
-// good.w
+```wandc
 sc.true
 
 fn calculate(u64 a, u64 b) -> u64 {
@@ -231,39 +252,95 @@ fn calculate(u64 a, u64 b) -> u64 {
 }
 ```
 
-### Do Not: Use Memory Without Initialization
+Correct header:
+
+```wandc
+sc.true
+
+fn calculate(u64 a, u64 b) -> u64;
+```
+
+Correct source file:
+
+```wandc
+sc.true
+
+fn calculate(u64 a, u64 b) -> u64 {
+    return(a + b);
+}
+```
+
+### Do Not Use Memory Without Initialization
 
 Incorrect:
 
-```
+```wandc
+sc.true
 #import <mem>
 
-fn main() -> u64 {
-    u8* ptr = malloc(256);  // Wrong: mem_init not called
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    u8* ptr = (u8*)malloc(256);
     return(0);
 }
 ```
 
-### Do Not: Forget to Free Memory
+Correct:
 
-Incorrect:
+```wandc
+sc.true
+#import <mem>
 
-```
-fn process_data() {
-    u8* buffer = malloc(1024);
-    // Use buffer
-    // Wrong: buffer never freed
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    mem_init(1048576);
+    u8* ptr = (u8*)malloc(256);
+    if (ptr != null) {
+        mfree(ptr);
+    }
+    return(0);
 }
 ```
 
-### Do Not: Use Freed Pointers
+### Do Not Forget to Free Memory
 
 Incorrect:
 
+```wandc
+fn process_data() {
+    u8* buffer = (u8*)malloc(1024);
+}
 ```
-u8* data = malloc(512);
-mfree(data);
-data[0] = 42;  // Wrong: use-after-free
+
+Correct:
+
+```wandc
+fn process_data() {
+    u8* buffer = (u8*)malloc(1024);
+    if (buffer != null) {
+        mfree(buffer);
+    }
+}
+```
+
+### Do Not Use Freed Pointers
+
+Incorrect:
+
+```wandc
+u8* data = (u8*)malloc(512);
+if (data != null) {
+    mfree(data);
+    data[0] = 42;
+}
+```
+
+Correct:
+
+```wandc
+u8* data = (u8*)malloc(512);
+if (data != null) {
+    mfree(data);
+    data = null;
+}
 ```
 
 ---
@@ -272,41 +349,41 @@ data[0] = 42;  // Wrong: use-after-free
 
 ### Program Format (-fp)
 
-Creates a hosted executable file:
+Create a hosted executable file:
 
-```
+```text
 wand2c main.w -o program -fp
 ```
 
 ### Object Format (-fo)
 
-Creates a relocatable ELF object:
+Create a relocatable object file:
 
-```
+```text
 wand2c module.w -o module.o -fo
 ```
 
 ### Raw Format (-fr)
 
-Creates a flat binary image:
+Create a flat binary image:
 
-```
+```text
 wand2c kernel.w -o kernel.bin -fr
 ```
 
 ### Kernel Format (-fk)
 
-Creates a freestanding kernel or kernel module image:
+Create a freestanding kernel image:
 
-```
+```text
 wand2c kernel.w -o kernel.img -fk
 ```
 
 ### Wexp Format (-fw)
 
-Creates a dynamic execution module:
+Create a dynamic execution module:
 
-```
+```text
 wand2c module.w -o module.wexp -fw
 ```
 
@@ -316,42 +393,45 @@ wand2c module.w -o module.wexp -fw
 
 Install the standard library:
 
-```
+```text
 wand2c -il libw
 ```
 
 Available modules:
-- `<io>` - Console and file I/O
-- `<mem>` - Memory allocation
-- `<string>` - String operations
-- `<syscall>` - System calls
-- `<args>` - Command-line arguments
-- `<path>` - Path utilities
-- `<fileio>` - File reader
-- `<vector>` - Dynamic arrays
-- `<unistd>` - Process utilities
-- `<math>` - Floating-point math
-- `<fpmath>` - Fixed-point math
-- `<keyboard>` - Terminal input
-- `<tui>` - Terminal UI
-- `<std>` - Basic utilities
+
+- `<io>`: Console and file I/O
+- `<mem>`: Memory allocation
+- `<string>`: String operations
+- `<syscall>`: System calls
+- `<args>`: Command-line arguments
+- `<path>`: Path utilities
+- `<fileio>`: File reader
+- `<vector>`: Dynamic arrays
+- `<unistd>`: Process utilities
+- `<math>`: Floating-point math
+- `<fpmath>`: Fixed-point math
+- `<keyboard>`: Terminal input
+- `<tui>`: Terminal UI
+- `<std>`: Basic utilities
 
 ---
 
 ## Complete Example
 
-Create a simple calculator:
+Create a simple calculator.
 
-```
-// calc.wh
+File `calc.wh`:
+
+```wandc
 sc.true
 
 fn add(u64 a, u64 b) -> u64;
 fn subtract(u64 a, u64 b) -> u64;
 ```
 
-```
-// calc.w
+File `calc.w`:
+
+```wandc
 sc.true
 
 fn add(u64 a, u64 b) -> u64 {
@@ -363,10 +443,10 @@ fn subtract(u64 a, u64 b) -> u64 {
 }
 ```
 
-```
-// main.w
-sc.true
+File `main.w`:
 
+```wandc
+sc.true
 #import <io>
 #import "calc"
 
@@ -375,26 +455,26 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     print_string("10 + 20 = ");
     print_number(result);
     print_char(10);
-    
+
     result = subtract(50, 25);
     print_string("50 - 25 = ");
     print_number(result);
     print_char(10);
-    
+
     return(0);
 }
 ```
 
 Compile and run:
 
-```
+```text
 wand2c main.w -o calc -fp
 ./calc
 ```
 
 Output:
 
-```
+```text
 10 + 20 = 30
 50 - 25 = 25
 ```
@@ -403,20 +483,20 @@ Output:
 
 ## Next Steps
 
-1. Read SYNTAX.md for complete language reference
-2. Read STDLIB.md for standard library functions
-3. Read EXAMPLES.md for more code examples
-4. Read standart-46.md for binary interface specification
+1. Read `SYNTAX.md` for the language reference.
+2. Read `STDLIB.md` for the standard library reference.
+3. Read `EXAMPLES.md` for more code examples.
+4. Read `STANDARD_46.md` for the binary interface specification.
 
 ---
 
 ## Summary
 
-- Use `.w` files for implementation
-- Use `.wh` files for declarations
-- Import system libraries with `<module>`
-- Import local modules with `<module>`
-- Always initialize memory before allocation
-- Always check pointers for null
-- Always free allocated memory
-- Use `export` to mark public functions
+- Use `.w` files for implementation.
+- Use `.wh` files for declarations.
+- Import system libraries with `<module>`.
+- Import local modules with `"module"`.
+- Initialize memory before allocation.
+- Check pointers for null.
+- Free allocated memory.
+- Use `export` to mark public functions.
