@@ -231,3 +231,22 @@ fn memcmp(u8* s1, u8* s2, u64 n) -> i64 {
 
     return(0);
 }
+
+fn strncmp(u8* s1, u8* s2, u64 n) -> i64 {
+    u64 i = 0;
+    while (i < n) {
+        u8 c1 = s1[i];
+        u8 c2 = s2[i];
+        if (c1 != c2) {
+            if (c1 < c2) {
+                return(-1);
+            }
+            return(1);
+        }
+        if (c1 == 0) {
+            return(0);
+        }
+        i = i + 1;
+    }
+    return(0);
+}

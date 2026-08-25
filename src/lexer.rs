@@ -163,6 +163,17 @@ impl Lexer {
             return (tok, span);
         }
 
+        if ch == '\'' {
+            let tok = self.read_char_literal();
+            let span = Span {
+                line: start_line,
+                col: start_col,
+                start: start_pos,
+                end: self.pos,
+            };
+            return (tok, span);
+        }
+
         if ch == '"' {
             let tok = self.read_string_literal();
             let span = Span {
@@ -374,20 +385,19 @@ impl Lexer {
     fn read_number_or_float(&mut self) -> Token {
         let mut num_str = String::new();
         let mut is_float = false;
-
         if self.current() == '0' && (self.peek(1) == 'x' || self.peek(1) == 'X') {
-            num_str.push(self.current()); // '0'
+            num_str.push(self.current());
             self.step();
-            num_str.push(self.current()); // 'x' or 'X'
+            num_str.push(self.current());
             self.step();
             while self.pos < self.input.len() && self.current().is_ascii_hexdigit() {
                 num_str.push(self.current());
                 self.step();
             }
             let val = u64::from_str_radix(&num_str[2..], 16).unwrap_or(0);
-            return Token::Number(val);
+            let mult = self.parse_size_suffix();
+            return Token::Number(val.wrapping_mul(mult));
         }
-
         while self.pos < self.input.len()
             && (self.current().is_ascii_digit()
                 || (self.current() == '.' && self.peek(1).is_ascii_digit()))
@@ -398,12 +408,42 @@ impl Lexer {
             num_str.push(self.current());
             self.step();
         }
-
         if is_float {
             Token::FloatLiteral(num_str)
         } else {
             let val = num_str.parse::<u64>().unwrap_or(0);
-            Token::Number(val)
+            let mult = self.parse_size_suffix();
+            Token::Number(val.wrapping_mul(mult))
+        }
+    }
+
+    fn parse_size_suffix(&mut self) -> u64 {
+        if self.pos >= self.input.len() {
+            return 1;
+        }
+        let next_is_ident = self.pos + 1 < self.input.len()
+            && (self.input[self.pos + 1].is_alphanumeric() || self.input[self.pos + 1] == '_');
+        if next_is_ident {
+            return 1;
+        }
+        match self.current() {
+            'K' | 'k' => {
+                self.step();
+                1024
+            }
+            'M' | 'm' => {
+                self.step();
+                1024 * 1024
+            }
+            'G' | 'g' => {
+                self.step();
+                1024 * 1024 * 1024
+            }
+            'T' | 't' => {
+                self.step();
+                1024 * 1024 * 1024 * 1024
+            }
+            _ => 1,
         }
     }
 
@@ -499,5 +539,29 @@ impl Lexer {
             }
             _ => Token::Ident(name),
         }
+    }
+    fn read_char_literal(&mut self) -> Token {
+        self.step();
+        let val: u64;
+        if self.current() == '\\' {
+            self.step();
+            val = match self.current() {
+                'n' => 10,
+                't' => 9,
+                'r' => 13,
+                '0' => 0,
+                '\\' => 92,
+                '\'' => 39,
+                _ => self.current() as u64,
+            };
+            self.step();
+        } else {
+            val = self.current() as u64;
+            self.step();
+        }
+        if self.current() == '\'' {
+            self.step();
+        }
+        Token::Number(val)
     }
 }

@@ -2329,102 +2329,30 @@ impl NativeGenerator {
                     return;
                 }
 
-                if name == "syscall0" {
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
-                    }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall1" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
-                    }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall2" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(a2_expr) = args.get(2) {
-                        self.compile_expr(a2_expr, 6, true);
+                if name.starts_with("syscall")
+                    && name.len() == 8
+                    && name[7..].chars().all(|c| c.is_ascii_digit())
+                {
+                    let num_args: usize = name[7..].parse().unwrap_or(0);
+                    for i in (1..=num_args).rev() {
+                        if let Some(arg_expr) = args.get(i) {
+                            self.compile_expr(arg_expr, 0, true);
+                            self.code.push(0x50);
+                        }
                     }
                     if let Some(nr_expr) = args.first() {
                         self.compile_expr(nr_expr, 0, true);
                     }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall3" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(a2_expr) = args.get(2) {
-                        self.compile_expr(a2_expr, 6, true);
-                    }
-                    if let Some(a3_expr) = args.get(3) {
-                        self.compile_expr(a3_expr, 2, true);
-                    }
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
-                    }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall4" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(a2_expr) = args.get(2) {
-                        self.compile_expr(a2_expr, 6, true);
-                    }
-                    if let Some(a3_expr) = args.get(3) {
-                        self.compile_expr(a3_expr, 2, true);
-                    }
-                    if let Some(a4_expr) = args.get(4) {
-                        self.compile_expr(a4_expr, 10, true);
-                    }
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
-                    }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall5" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(a2_expr) = args.get(2) {
-                        self.compile_expr(a2_expr, 6, true);
-                    }
-                    if let Some(a3_expr) = args.get(3) {
-                        self.compile_expr(a3_expr, 2, true);
-                    }
-                    if let Some(a4_expr) = args.get(4) {
-                        self.compile_expr(a4_expr, 10, true);
-                    }
-                    if let Some(a5_expr) = args.get(5) {
-                        self.compile_expr(a5_expr, 8, true);
-                    }
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
-                    }
-                    self.code.extend_from_slice(&[0x0F, 0x05]);
-                } else if name == "syscall6" {
-                    if let Some(a1_expr) = args.get(1) {
-                        self.compile_expr(a1_expr, 7, true);
-                    }
-                    if let Some(a2_expr) = args.get(2) {
-                        self.compile_expr(a2_expr, 6, true);
-                    }
-                    if let Some(a3_expr) = args.get(3) {
-                        self.compile_expr(a3_expr, 2, true);
-                    }
-                    if let Some(a4_expr) = args.get(4) {
-                        self.compile_expr(a4_expr, 10, true);
-                    }
-                    if let Some(a5_expr) = args.get(5) {
-                        self.compile_expr(a5_expr, 8, true);
-                    }
-                    if let Some(a6_expr) = args.get(6) {
-                        self.compile_expr(a6_expr, 9, true);
-                    }
-                    if let Some(nr_expr) = args.first() {
-                        self.compile_expr(nr_expr, 0, true);
+                    for i in 1..=num_args {
+                        match i {
+                            1 => self.code.push(0x5F),
+                            2 => self.code.push(0x5E),
+                            3 => self.code.push(0x5A),
+                            4 => self.code.extend_from_slice(&[0x41, 0x5A]),
+                            5 => self.code.extend_from_slice(&[0x41, 0x58]),
+                            6 => self.code.extend_from_slice(&[0x41, 0x59]),
+                            _ => {}
+                        }
                     }
                     self.code.extend_from_slice(&[0x0F, 0x05]);
                 } else if name == "inb" {
@@ -3451,7 +3379,7 @@ impl NativeGenerator {
         for (patch_pos, target) in &self.call_patches {
             let sym = func_sym.get(target).cloned().unwrap_or(0);
             Self::elf_push_u64(&mut rela, *patch_pos as u64);
-            Self::elf_push_u64(&mut rela, ((sym as u64) << 32) | 2u64);
+            Self::elf_push_u64(&mut rela, ((sym as u64) << 32) | 4u64);
             Self::elf_push_i64(&mut rela, -4);
         }
         for (patch_pos, key, is_rip) in &self.address_patches {

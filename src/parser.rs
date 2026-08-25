@@ -940,17 +940,17 @@ impl Parser {
         }
         self.step();
 
-        if self.current_token != Token::LBrace {
-            return Err(self.err("Expected '{' to start 'if' block"));
-        }
-        self.step();
-
         let mut then_branch = Vec::new();
-        while self.current_token != Token::RBrace && self.current_token != Token::EOF {
-            then_branch.push(self.parse_statement()?);
-        }
-        if self.current_token == Token::RBrace {
+        if self.current_token == Token::LBrace {
             self.step();
+            while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                then_branch.push(self.parse_statement()?);
+            }
+            if self.current_token == Token::RBrace {
+                self.step();
+            }
+        } else {
+            then_branch.push(self.parse_statement()?);
         }
 
         let mut else_branch = None;
@@ -991,17 +991,17 @@ impl Parser {
         }
         self.step();
 
-        if self.current_token != Token::LBrace {
-            return Err(self.err("Expected '{' to start 'while' block"));
-        }
-        self.step();
-
         let mut body = Vec::new();
-        while self.current_token != Token::RBrace && self.current_token != Token::EOF {
-            body.push(self.parse_statement()?);
-        }
-        if self.current_token == Token::RBrace {
+        if self.current_token == Token::LBrace {
             self.step();
+            while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                body.push(self.parse_statement()?);
+            }
+            if self.current_token == Token::RBrace {
+                self.step();
+            }
+        } else {
+            body.push(self.parse_statement()?);
         }
 
         Ok(Stmt::While { cond, body })
@@ -1042,17 +1042,17 @@ impl Parser {
         }
         self.step();
 
-        if self.current_token != Token::LBrace {
-            return Err(self.err("Expected '{' after 'for' clause"));
-        }
-        self.step();
-
         let mut body = Vec::new();
-        while self.current_token != Token::RBrace && self.current_token != Token::EOF {
-            body.push(self.parse_statement()?);
-        }
-        if self.current_token == Token::RBrace {
+        if self.current_token == Token::LBrace {
             self.step();
+            while self.current_token != Token::RBrace && self.current_token != Token::EOF {
+                body.push(self.parse_statement()?);
+            }
+            if self.current_token == Token::RBrace {
+                self.step();
+            }
+        } else {
+            body.push(self.parse_statement()?);
         }
 
         Ok(Stmt::For {
@@ -1472,7 +1472,6 @@ impl Parser {
         if self.current_token == Token::OpMul {
             self.step();
             dt = DataType::Pointer(Box::new(dt));
-
             if self.current_token == Token::OpMul {
                 return Err(self.err(
                     "multi-level pointers are not allowed in WandC; use a single pointer and pass array addresses with *adr",
