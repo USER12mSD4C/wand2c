@@ -34,6 +34,7 @@ pub struct NativeGenerator {
     address_patches: Vec<(usize, String, bool)>,
 
     function_signatures: HashMap<String, Vec<DataType>>,
+    function_return_types: HashMap<String, Vec<DataType>>,
 
     struct_fields: HashMap<String, HashMap<String, DataType>>,
     pub output_format: OutputFormat,
@@ -75,6 +76,7 @@ impl NativeGenerator {
             global_data_start_offset: 0,
             address_patches: Vec::new(),
             function_signatures: HashMap::new(),
+            function_return_types: HashMap::new(),
             struct_fields: HashMap::new(),
             output_format: OutputFormat::Program,
             entry_name: None,
@@ -282,10 +284,13 @@ impl NativeGenerator {
         }
 
         self.function_signatures.clear();
+        self.function_return_types.clear();
         for func in &program.functions {
             let param_types = func.params.iter().map(|(dt, _, _)| dt.clone()).collect();
             self.function_signatures
                 .insert(func.name.clone(), param_types);
+            self.function_return_types
+                .insert(func.name.clone(), func.return_types.clone());
         }
 
         self.struct_fields.clear();
@@ -1150,7 +1155,7 @@ impl NativeGenerator {
             false
         };
 
-        let final_stack_size = (self.next_offset + 15) & !15;
+        let final_stack_size = ((self.next_offset + 7) & !7) | 8;
         let bytes = final_stack_size.to_le_bytes();
         self.code[sub_rsp_offset + 3] = bytes[0];
         self.code[sub_rsp_offset + 4] = bytes[1];
@@ -1905,7 +1910,11 @@ impl NativeGenerator {
                             _deref_ptr,
                         );
                     } else if let Some(&off) = self.function_offsets.get(name) {
-                        self.emit_mov_imm64(reg, 0x400078 + off as u64);
+                        if self.output_format == OutputFormat::Object {
+                            self.emit_rip_relative_lea(reg, format!("fn:{}", name));
+                        } else {
+                            self.emit_mov_imm64(reg, 0x400078 + off as u64);
+                        }
                     }
                 }
             }
@@ -1934,7 +1943,11 @@ impl NativeGenerator {
 
                         self.compile_address(&Expr::SectionAccess { section, variable }, reg);
                     } else if let Some(&off) = self.function_offsets.get(name) {
-                        self.emit_mov_imm64(reg, 0x400078 + off as u64);
+                        if self.output_format == OutputFormat::Object {
+                            self.emit_rip_relative_lea(reg, format!("fn:{}", name));
+                        } else {
+                            self.emit_mov_imm64(reg, 0x400078 + off as u64);
+                        }
                     }
                 }
             }
@@ -2397,16 +2410,8 @@ impl NativeGenerator {
                     }
                     self.code.extend_from_slice(&[0x89, 0xCA, 0xEF]);
                 } else {
-                    let arg_registers_out = [
-                        &[0x48, 0x89, 0xC7][..], // rdi
-                        &[0x48, 0x89, 0xC6][..], // rsi
-                        &[0x48, 0x89, 0xC2][..], // rdx
-                        &[0x48, 0x89, 0xC1][..], // rcx
-                        &[0x49, 0x89, 0xC0][..], // r8
-                        &[0x49, 0x89, 0xC1][..], // r9
-                    ];
                     let param_types = self.function_signatures.get(name).cloned();
-
+                    let total_args = args.len();
                     for (idx, arg_expr) in args.iter().enumerate() {
                         let mut deref_ptr_arg = true;
                         if let Some(ref types) = param_types {
@@ -2417,15 +2422,78 @@ impl NativeGenerator {
                             }
                         }
                         self.compile_expr(arg_expr, 0, deref_ptr_arg);
-                        if idx < arg_registers_out.len() {
-                            self.code.extend_from_slice(arg_registers_out[idx]);
+                        self.code.push(0x50);
+                    }
+                    let mut arg_reg_info: Vec<(usize, bool)> = Vec::new();
+                    let mut int_count: usize = 0;
+                    let mut float_count: usize = 0;
+                    for idx in 0..total_args {
+                        let mut is_float = false;
+                        if let Some(ref types) = param_types {
+                            if let Some(param_type) = types.get(idx) {
+                                if matches!(param_type, DataType::F64) {
+                                    is_float = true;
+                                }
+                            }
+                        }
+                        if is_float {
+                            arg_reg_info.push((float_count, true));
+                            float_count += 1;
+                        } else {
+                            arg_reg_info.push((int_count, false));
+                            int_count += 1;
                         }
                     }
-
+                    for idx in (0..total_args).rev() {
+                        let (reg_idx, is_float) = arg_reg_info[idx];
+                        if is_float {
+                            if reg_idx < 8 {
+                                self.code.push(0x58);
+                                let modrm: u8 = 0xC0 + ((reg_idx as u8) << 3);
+                                self.code
+                                    .extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, modrm]);
+                            }
+                        } else {
+                            if reg_idx < 6 {
+                                let pop_bytes: &[u8] = match reg_idx {
+                                    0 => &[0x5F],
+                                    1 => &[0x5E],
+                                    2 => &[0x5A],
+                                    3 => &[0x59],
+                                    4 => &[0x41, 0x58],
+                                    5 => &[0x41, 0x59],
+                                    _ => &[0x5F],
+                                };
+                                self.code.extend_from_slice(pop_bytes);
+                            }
+                        }
+                    }
+                    let stack_arg_count = if total_args > 6 { total_args - 6 } else { 0 };
+                    let padding_needed = stack_arg_count % 2 != 0;
+                    if padding_needed {
+                        self.code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
+                    }
                     self.code.push(0xE8);
                     let patch_pos = self.code.len();
                     self.code.extend_from_slice(&[0, 0, 0, 0]);
                     self.call_patches.push((patch_pos, name.clone()));
+                    let cleanup =
+                        ((stack_arg_count + if padding_needed { 1 } else { 0 }) * 8) as u32;
+                    if cleanup > 0 {
+                        self.code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                        self.code.extend_from_slice(&cleanup.to_le_bytes());
+                    }
+                    if let Some(ref types) = param_types {
+                        let _ = types;
+                    }
+                    if let Some(ret_types) = self.function_return_types.get(name) {
+                        if ret_types
+                            .first()
+                            .map_or(false, |t| matches!(t, DataType::F64))
+                        {
+                            self.code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
+                        }
+                    }
                 }
             }
             Expr::ArrayInit(_) => {
@@ -3335,7 +3403,7 @@ impl NativeGenerator {
             if func.is_extern || func.body.is_none() {
                 continue;
             }
-            let is_global = !has_explicit_exports || func.is_export;
+            let is_global = !has_explicit_exports || func.is_export || func.name == "main";
             if is_global {
                 continue;
             }
@@ -3383,6 +3451,14 @@ impl NativeGenerator {
             Self::elf_push_i64(&mut rela, -4);
         }
         for (patch_pos, key, is_rip) in &self.address_patches {
+            if key.starts_with("fn:") {
+                let func_name = &key[3..];
+                let sym = func_sym.get(func_name).cloned().unwrap_or(0);
+                Self::elf_push_u64(&mut rela, *patch_pos as u64);
+                Self::elf_push_u64(&mut rela, ((sym as u64) << 32) | 4u64);
+                Self::elf_push_i64(&mut rela, -4);
+                continue;
+            }
             let sym = data_sym.get(key).cloned().unwrap_or(0);
             let typ = if *is_rip { 2u64 } else { 1u64 };
             let addend = if *is_rip { -4i64 } else { 0i64 };
@@ -3474,7 +3550,7 @@ impl NativeGenerator {
         Self::elf_push_u16(&mut elf, 0);
         Self::elf_push_u16(&mut elf, 64);
         Self::elf_push_u16(&mut elf, num_sect_headers as u16);
-        Self::elf_push_u16(&mut elf, 6);
+        Self::elf_push_u16(&mut elf, (6 + program.sections.len()) as u16);
 
         elf.extend_from_slice(&body);
 
