@@ -9,18 +9,16 @@ sect.heap
 EOS
 
 fn mem_init(u64 initial_size) {
-    void* raw_mem = mloc(null, initial_size);
-
+    u8* raw_mem = mloc(0, initial_size);
     if (raw_mem == null) {
         sys_exit(1);
     }
-
     heap:arena_start = raw_mem;
     heap:arena_size = initial_size;
     heap:offset = 0;
 }
 
-fn malloc(u64 size) {
+fn malloc(u64 size) -> u8* {
     u64 aligned_size = size;
     u64 rem = size % 8;
     if (rem != 0) {
@@ -28,7 +26,6 @@ fn malloc(u64 size) {
     }
     u64 total_block_size = aligned_size + 16;
 
-    // 1. Поиск свободного блока в списке (First-Fit)
     u8* current = heap:arena_start;
     u8* end = heap:arena_start + heap:offset;
     while (current < end) {
@@ -50,11 +47,9 @@ fn malloc(u64 size) {
     if ((heap:offset + total_block_size) <= heap:arena_size) {
         u8* block = heap:arena_start + heap:offset;
 
-        // Записываем заголовок: размер блока
         u64* p_size_out*o = block;
         p_size_out = total_block_size;
 
-        // Записываем заголовок: флаг свободы (0 = занят)
         u64* p_free_out*o = block + 8;
         p_free_out = 0;
 
@@ -64,25 +59,21 @@ fn malloc(u64 size) {
     return(null);
 }
 
-fn mfree(u8* ptr) {
-    if (ptr != null) {
-        u8* block = ptr - 16;
-        u64* p_free*o = block + 8;
-        p_free = 1;
-    }
-}
-
-fn calloc(u64 num, u64 size) {
+fn calloc(u64 num, u64 size) -> u8* {
     u64 total = num * size;
-    void* ptr = malloc(total);
+    u8* ptr = malloc(total);
     if (ptr != null) {
         memset(ptr, 0, total);
     }
     return(ptr);
 }
 
-fn mfree_all() {
-    heap:offset = 0;
+fn mfree(u8* ptr) {
+    if (ptr != null) {
+        u8* block = ptr - 16;
+        u64* p_free*o = block + 8;
+        p_free = 1;
+    }
 }
 
 fn mrealloc(u8* ptr, u64 new_size) -> u8* {
@@ -122,4 +113,8 @@ fn mrealloc(u8* ptr, u64 new_size) -> u8* {
     memcpy(new_ptr, ptr, copy_size);
     mfree(ptr);
     return(new_ptr);
+}
+
+fn mfree_all() {
+    heap:offset = 0;
 }

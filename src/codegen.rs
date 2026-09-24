@@ -735,22 +735,25 @@ impl NativeGenerator {
     fn is_signed_expr(&self, expr: &Expr) -> bool {
         match expr {
             Expr::SignedNumber(_) => true,
-            Expr::Variable(name) => {
-                if let Some(dt) = self.local_types.get(name) {
+            Expr::Number(_) => false,
+            Expr::Variable(_)
+            | Expr::MemberAccess { .. }
+            | Expr::Index { .. }
+            | Expr::AddrOfExpr(_) => {
+                if let Some(dt) = self.resolve_expr_type(expr) {
                     matches!(
-                        dt,
+                        self.peel_typedefs(dt),
                         DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64
                     )
                 } else {
                     false
                 }
             }
-            Expr::Number(_) => false,
             Expr::Binary { left, right, .. } => {
                 self.is_signed_expr(left) || self.is_signed_expr(right)
             }
             Expr::Call { name, .. } => {
-                if let Some(types) = self.function_signatures.get(name) {
+                if let Some(types) = self.function_return_types.get(name) {
                     !types.is_empty()
                         && matches!(
                             types[0],
@@ -980,6 +983,41 @@ impl NativeGenerator {
         }
     }
 
+    fn emit_store_xmm_param(&mut self, xmm: u8, offset: u32) {
+        let neg = -(offset as i32);
+
+        self.code.push(0xF2);
+
+        if xmm >= 8 {
+            self.code.push(0x44);
+        }
+
+        self.code.extend_from_slice(&[0x0F, 0x11]);
+
+        let modrm = if neg >= -128 && neg <= 127 {
+            0x45 | ((xmm & 7) << 3)
+        } else {
+            0x85 | ((xmm & 7) << 3)
+        };
+
+        self.code.push(modrm);
+
+        if neg >= -128 && neg <= 127 {
+            self.code.push(neg as u8);
+        } else {
+            self.code.extend_from_slice(&neg.to_le_bytes());
+        }
+    }
+
+    fn emit_load_stack_param(&mut self, offset: u32, size: u32, stack_index: usize) {
+        let disp = 16u32 + (stack_index as u32) * 8;
+
+        self.code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+
+        self.emit_mem_store(0, offset, size);
+    }
+
     fn emit_mem_store(&mut self, reg: u8, offset: u32, size: u32) {
         let low = reg & 7;
         let neg = -(offset as i32);
@@ -1102,10 +1140,15 @@ impl NativeGenerator {
         self.code
             .extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x00, 0x00]);
 
-        for (idx, (dt, name, access)) in func.params.iter().enumerate() {
+        let mut int_param_pos = 0usize;
+        let mut float_param_pos = 0usize;
+        let mut stack_param_pos = 0usize;
+
+        for (_idx, (dt, name, access)) in func.params.iter().enumerate() {
             let is_ptr_modifier = *access == PtrAccess::Input
                 || *access == PtrAccess::Output
                 || *access == PtrAccess::InputOutput;
+
             let var_size = if is_ptr_modifier {
                 8
             } else {
@@ -1121,6 +1164,7 @@ impl NativeGenerator {
             } else {
                 0
             };
+
             self.next_offset = (self.next_offset + align_mask) & !align_mask;
             self.next_offset += var_size;
             let offset = self.next_offset;
@@ -1136,16 +1180,33 @@ impl NativeGenerator {
             } else {
                 dt.clone()
             };
-            self.local_types.insert(name.clone(), actual_type);
 
-            if idx < 4 {
-                let reg_code = match idx {
+            self.local_types.insert(name.clone(), actual_type.clone());
+
+            let peeled_type = self.peel_typedefs(actual_type);
+            let is_float_param = matches!(peeled_type, DataType::F64);
+
+            if is_float_param && float_param_pos < 8 {
+                self.emit_store_xmm_param(float_param_pos as u8, offset);
+                float_param_pos += 1;
+            } else if !is_float_param && int_param_pos < 6 {
+                let reg_code = match int_param_pos {
                     0 => 7,
                     1 => 6,
                     2 => 2,
-                    _ => 1,
+                    3 => 1,
+                    4 => 8,
+                    5 => 9,
+                    _ => 0,
                 };
+
                 self.emit_mem_store(reg_code, offset, var_size);
+                int_param_pos += 1;
+            } else {
+                let store_size = if var_size == 0 { 8 } else { var_size };
+
+                self.emit_load_stack_param(offset, store_size, stack_param_pos);
+                stack_param_pos += 1;
             }
         }
 
@@ -1993,12 +2054,20 @@ impl NativeGenerator {
                         return;
                     }
                 }
-
                 let key = format!("{}:{}", section, variable);
-                self.emit_rip_relative_lea(0, key);
-                self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
+                let var_type = self
+                    .section_types
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(DataType::U64);
 
-                self.move_rax_to_reg(reg);
+                if matches!(var_type, DataType::Array(..)) {
+                    self.emit_rip_relative_lea(reg, key);
+                } else {
+                    self.emit_rip_relative_lea(0, key);
+                    self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
+                    self.move_rax_to_reg(reg);
+                }
             }
             Expr::Binary { left, op, right } => {
                 match op.as_str() {
@@ -2561,24 +2630,28 @@ impl NativeGenerator {
             Expr::Variable(name) => {
                 if let Some(&offset) = self.local_offsets.get(name) {
                     let reg_opcode = internal_reg;
-
                     let modifier = self
                         .local_access
                         .get(name)
                         .cloned()
                         .unwrap_or(PtrAccess::Normal);
-
                     let mut is_pointer = false;
+                    let mut is_array = false;
                     if let Some(dt) = self.local_types.get(name) {
                         match dt {
                             DataType::Pointer(_) => {
                                 is_pointer = true;
                             }
+                            DataType::Array(..) => {
+                                is_array = true;
+                            }
                             _ => {}
                         }
                     }
 
-                    if modifier == PtrAccess::Input
+                    if is_array {
+                        self.emit_mem_op(0x8D, reg_opcode, offset);
+                    } else if modifier == PtrAccess::Input
                         || modifier == PtrAccess::Output
                         || modifier == PtrAccess::InputOutput
                         || is_pointer
@@ -2622,7 +2695,7 @@ impl NativeGenerator {
                         _ => {}
                     }
                 }
-                self.compile_address(base_expr, 3);
+                self.compile_expr(base_expr, 3, true);
                 self.code.push(0x53);
                 self.compile_expr(index, 0, true);
                 match elem_size {
@@ -2704,24 +2777,21 @@ impl NativeGenerator {
 
             Expr::Binary { left, op, right } => match op.as_str() {
                 "OpAdd" => {
-                    self.compile_address(left, 3);
+                    self.compile_expr(left, 3, true);
                     self.code.push(0x53);
                     self.compile_expr(right, 0, true);
                     self.code.push(0x5B);
                     self.code.extend_from_slice(&[0x48, 0x01, 0xC3]);
-
                     if internal_reg == 0 {
                         self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
                     }
                 }
-
                 "OpSub" => {
-                    self.compile_address(left, 3);
+                    self.compile_expr(left, 3, true);
                     self.code.push(0x53);
                     self.compile_expr(right, 0, true);
                     self.code.push(0x5B);
                     self.code.extend_from_slice(&[0x48, 0x29, 0xC3]);
-
                     if internal_reg == 0 {
                         self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
                     }

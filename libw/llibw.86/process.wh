@@ -28,3 +28,5 @@ fn process_group_kill_all(ProcessGroup* group, u64 signum);
 fn process_group_free(ProcessGroup* group);
 fn process_exec_shell(u8* cmd) -> i64;
 fn process_exec_shell_wait(u8* cmd) -> i64;
+fn process_set_envp(u64 envp);
+fn process_get_envp() -> u64;

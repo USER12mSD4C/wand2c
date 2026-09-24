@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 enum VarState {
@@ -23,19 +24,19 @@ enum VarState {
 pub struct MemorySafetyAnalyzer {
     states: HashMap<String, VarState>,
     errors: Vec<String>,
-    source_lines: Vec<String>,
+    source_lines: Rc<Vec<String>>,
     base_line: usize,
 }
 
 impl MemorySafetyAnalyzer {
-pub fn new() -> Self {
-    Self {
-        states: HashMap::new(),
-        errors: Vec::new(),
-        source_lines: Vec::new(),
-        base_line: 0,
+    pub fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+            errors: Vec::new(),
+            source_lines: Rc::new(Vec::new()),
+            base_line: 0,
+        }
     }
-}
 
     fn format_data_type(dt: &DataType) -> String {
         match dt {
@@ -65,9 +66,7 @@ pub fn new() -> Self {
                 let base_path = self.get_expr_path(base)?;
                 Some(format!("{}.{}", base_path, member))
             }
-            Expr::Index { expr: base, .. } => {
-                self.get_expr_path(base)
-            }
+            Expr::Index { expr: base, .. } => self.get_expr_path(base),
             Expr::AddrOfExpr(inner) => self.get_expr_path(inner),
             _ => None,
         }
@@ -126,9 +125,11 @@ pub fn new() -> Self {
     ) -> Result<(), Vec<String>> {
         self.states.clear();
         self.errors.clear();
-        self.source_lines = source
-            .map(|s| s.lines().map(|l| l.to_string()).collect())
-            .unwrap_or_default();
+        self.source_lines = Rc::new(
+            source
+                .map(|s| s.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_default(),
+        );
         self.base_line = base_line;
 
         for (dt, name, _) in &func.params {
@@ -140,21 +141,26 @@ pub fn new() -> Self {
             self.analyze_statements(body, structs);
         }
 
-        let states_snapshot = self.states.clone();
-        for (path, state) in &states_snapshot {
+        let mut leak_warnings: Vec<(String, usize)> = Vec::new();
+
+        for (path, state) in &self.states {
             if let VarState::Allocated { allocated_line, .. } = state {
                 if !path.contains('.') {
-                    self.push_error(
-                        "warning",
-                        &format!(
-                            "potential memory leak in function '{}': pointer '{}' was never freed via 'mfree()'",
-                            func.name, path
-                        ),
-                        *allocated_line,
-                        "call mfree(ptr) before the function returns, or document that ownership is transferred",
-                    );
+                    leak_warnings.push((path.clone(), *allocated_line));
                 }
             }
+        }
+
+        for (path, allocated_line) in leak_warnings {
+            self.push_error(
+                "warning",
+                &format!(
+                    "potential memory leak in function '{}': pointer '{}' was never freed via 'mfree()'",
+                    func.name, path
+                ),
+                allocated_line,
+                "call mfree(ptr) before the function returns, or document that ownership is transferred",
+            );
         }
 
         if self.errors.is_empty() {
@@ -173,13 +179,6 @@ pub fn new() -> Self {
     ) {
         let struct_name = match dt {
             DataType::Struct(name) => name.clone(),
-            DataType::Pointer(inner) => {
-                if let DataType::Struct(name) = &**inner {
-                    name.clone()
-                } else {
-                    return;
-                }
-            }
             _ => return,
         };
 
@@ -205,8 +204,7 @@ pub fn new() -> Self {
 
     fn check_lhs_safety(&mut self, expr: &Expr, line: usize) {
         match expr {
-            Expr::Variable(_) => {
-            }
+            Expr::Variable(_) => {}
             Expr::MemberAccess { expr: base, .. } => {
                 self.check_expression_safety(base, line);
             }
@@ -270,26 +268,49 @@ pub fn new() -> Self {
             let current_line = idx + 1;
 
             match stmt {
-            Stmt::VarDefinition(decl) => {
-                let type_str = Self::format_data_type(&decl.data_type);
-                let is_pointer = matches!(&decl.data_type, DataType::Pointer(_));
+                Stmt::VarDefinition(decl) => {
+                    let type_str = Self::format_data_type(&decl.data_type);
+                    let is_pointer = matches!(&decl.data_type, DataType::Pointer(_));
 
-                if let Some(init_expr) = &decl.initial_value {
-                    self.check_expression_safety(init_expr, current_line);
+                    if let Some(init_expr) = &decl.initial_value {
+                        self.check_expression_safety(init_expr, current_line);
 
-                    if self.is_allocation_call(init_expr) {
-                        self.states.insert(
-                            decl.name.clone(),
-                            VarState::Allocated {
-                                allocated_line: current_line,
-                                checked_not_null: false,
-                                type_name: type_str.clone(),
-                            },
-                        );
+                        if self.is_allocation_call(init_expr) {
+                            self.states.insert(
+                                decl.name.clone(),
+                                VarState::Allocated {
+                                    allocated_line: current_line,
+                                    checked_not_null: false,
+                                    type_name: type_str.clone(),
+                                },
+                            );
+                        } else {
+                            self.states.insert(decl.name.clone(), VarState::Safe);
+
+                            if !is_pointer {
+                                self.register_struct_fields(
+                                    &decl.name,
+                                    &decl.data_type,
+                                    structs,
+                                    VarState::Uninitialized {
+                                        declared_line: current_line,
+                                        type_name: type_str.clone(),
+                                    },
+                                );
+                            }
+                        }
                     } else {
-                        self.states.insert(decl.name.clone(), VarState::Safe);
+                        if is_pointer {
+                            self.states.insert(
+                                decl.name.clone(),
+                                VarState::Uninitialized {
+                                    declared_line: current_line,
+                                    type_name: type_str.clone(),
+                                },
+                            );
+                        } else {
+                            self.states.insert(decl.name.clone(), VarState::Safe);
 
-                        if !is_pointer {
                             self.register_struct_fields(
                                 &decl.name,
                                 &decl.data_type,
@@ -301,30 +322,7 @@ pub fn new() -> Self {
                             );
                         }
                     }
-                } else {
-                    if is_pointer {
-                        self.states.insert(
-                            decl.name.clone(),
-                            VarState::Uninitialized {
-                                declared_line: current_line,
-                                type_name: type_str.clone(),
-                            },
-                        );
-                    } else {
-                        self.states.insert(decl.name.clone(), VarState::Safe);
-
-                        self.register_struct_fields(
-                            &decl.name,
-                            &decl.data_type,
-                            structs,
-                            VarState::Uninitialized {
-                                declared_line: current_line,
-                                type_name: type_str.clone(),
-                            },
-                        );
-                    }
                 }
-            }
                 Stmt::Assignment { targets, value } => {
                     self.check_expression_safety(value, current_line);
                     let is_alloc = self.is_allocation_call(value);
@@ -575,12 +573,18 @@ pub fn new() -> Self {
                                             parts[1], parts[0]
                                         ),
                                         line,
-                                        &format!("initialize the field before use: {}.{} = ...;", parts[0], parts[1]),
+                                        &format!(
+                                            "initialize the field before use: {}.{} = ...;",
+                                            parts[0], parts[1]
+                                        ),
                                     );
                                 } else {
                                     self.push_error(
                                         "error",
-                                        &format!("use of potentially uninitialized variable '{}'", path),
+                                        &format!(
+                                            "use of potentially uninitialized variable '{}'",
+                                            path
+                                        ),
                                         line,
                                         &format!("initialize it: '{} {} = null;'", type_name, path),
                                     );
@@ -660,10 +664,7 @@ pub fn new() -> Self {
                             path, member
                         ),
                         line,
-                        &format!(
-                            "wrap in null check: if ({} != null) {{ ... }}",
-                            path
-                        ),
+                        &format!("wrap in null check: if ({} != null) {{ ... }}", path),
                     );
                 }
             }
@@ -732,16 +733,14 @@ pub fn new() -> Self {
                         }
                     }
                 }
-                (Some(state), None) | (None, Some(state)) => {
-                    match state {
-                        VarState::Freed { .. } => {
-                            self.states.insert(name, state.clone());
-                        }
-                        _ => {
-                            self.states.insert(name, VarState::Safe);
-                        }
+                (Some(state), None) | (None, Some(state)) => match state {
+                    VarState::Freed { .. } => {
+                        self.states.insert(name, state.clone());
                     }
-                }
+                    _ => {
+                        self.states.insert(name, VarState::Safe);
+                    }
+                },
                 (None, None) => unreachable!(),
             }
         }

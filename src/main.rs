@@ -218,7 +218,8 @@ fn main() {
         functions: Vec::new(),
     };
 
-    let mut function_sources = HashMap::new();
+    let mut function_sources: HashMap<String, String> = HashMap::new();
+    let mut file_sources: HashMap<String, String> = HashMap::new();
 
     for filename in &input_files {
         if verbose {
@@ -227,6 +228,7 @@ fn main() {
                 filename
             );
         }
+
         let source_code = match fs::read_to_string(filename) {
             Ok(content) => content,
             Err(e) => {
@@ -238,22 +240,26 @@ fn main() {
             }
         };
 
-        let lexer = Lexer::new(&source_code);
-        let mut parser = Parser::new(lexer);
+        let parsed = {
+            let lexer = Lexer::new(&source_code);
+            let mut parser = Parser::new(lexer);
+            parser.parse_program()
+        };
 
-        match parser.parse_program() {
+        match parsed {
             Ok(parsed) => {
                 if program.functions.is_empty() && program.structs.is_empty() {
                     program.use_os = parsed.use_os;
                 } else if program.use_os != parsed.use_os {
                     eprintln!("\x1b[33;1mwarning\x1b[0m: conflicting sc.true/sc.false settings across files");
                 }
+
                 for func in &parsed.functions {
                     if !func.is_extern {
-                        function_sources
-                            .insert(func.name.clone(), (filename.clone(), source_code.clone()));
+                        function_sources.insert(func.name.clone(), filename.clone());
                     }
                 }
+
                 program.imports.extend(parsed.imports);
                 program.typedefs.extend(parsed.typedefs);
                 program.structs.extend(parsed.structs);
@@ -261,6 +267,8 @@ fn main() {
                 program.constants.extend(parsed.constants);
                 program.sections.extend(parsed.sections);
                 program.functions.extend(parsed.functions);
+
+                file_sources.insert(filename.clone(), source_code);
             }
             Err(err) => {
                 report_parse_error(filename, &source_code, &err.message, &err.span);
@@ -290,10 +298,13 @@ fn main() {
                 );
             }
             let wh_source = fs::read_to_string(&wh_filename).expect("Failed to read header file");
-            let wh_lexer = Lexer::new(&wh_source);
-            let mut wh_parser = Parser::new(wh_lexer);
+            let wh_parsed = {
+                let wh_lexer = Lexer::new(&wh_source);
+                let mut wh_parser = Parser::new(wh_lexer);
+                wh_parser.parse_program()
+            };
 
-            match wh_parser.parse_program() {
+            match wh_parsed {
                 Ok(wh_program) => {
                     program.typedefs.extend(wh_program.typedefs);
                     program.structs.extend(wh_program.structs);
@@ -301,12 +312,12 @@ fn main() {
                     program.sections.extend(wh_program.sections);
                     program.constants.extend(wh_program.constants);
                     program.enums.extend(wh_program.enums);
-
                     for sub_imp in wh_program.imports {
                         if !resolved_imports.contains(&sub_imp) {
                             imports_to_resolve.push(sub_imp);
                         }
                     }
+                    file_sources.entry(wh_filename.clone()).or_insert(wh_source);
                 }
                 Err(err) => {
                     report_parse_error(&wh_filename, &wh_source, &err.message, &err.span);
@@ -325,9 +336,13 @@ fn main() {
             }
             let w_source =
                 fs::read_to_string(&w_filename).expect("Failed to read implementation file");
-            let w_lexer = Lexer::new(&w_source);
-            let mut w_parser = Parser::new(w_lexer);
-            match w_parser.parse_program() {
+            let w_parsed = {
+                let w_lexer = Lexer::new(&w_source);
+                let mut w_parser = Parser::new(w_lexer);
+                w_parser.parse_program()
+            };
+
+            match w_parsed {
                 Ok(w_program) => {
                     for sub_imp in w_program.imports {
                         if !resolved_imports.contains(&sub_imp) {
@@ -336,8 +351,7 @@ fn main() {
                     }
                     for func in &w_program.functions {
                         if !func.is_extern {
-                            function_sources
-                                .insert(func.name.clone(), (w_filename.clone(), w_source.clone()));
+                            function_sources.insert(func.name.clone(), w_filename.clone());
                         }
                         let existing_pos =
                             program.functions.iter().position(|f| f.name == func.name);
@@ -354,6 +368,7 @@ fn main() {
                     program.typedefs.extend(w_program.typedefs);
                     program.constants.extend(w_program.constants);
                     program.enums.extend(w_program.enums);
+                    file_sources.entry(w_filename.clone()).or_insert(w_source);
                 }
                 Err(err) => {
                     report_parse_error(&w_filename, &w_source, &err.message, &err.span);
@@ -363,13 +378,38 @@ fn main() {
         }
 
         if !resolved {
-            eprintln!(
-                "\x1b[31;1merror\x1b[0m: failed to resolve import '{}'. \
-                Neither '{}' nor '{}' exists.",
-                imp_name, wh_filename, w_filename
-            );
+            eprintln!("\x1b[31;1merror\x1b[0m: failed to resolve import '{}'. Neither '{}' nor '{}' exists.", imp_name, wh_filename, w_filename);
             std::process::exit(1);
         }
+    }
+
+    {
+        let mut unique_functions: HashMap<String, ast::FuncDecl> = HashMap::new();
+        let mut function_order: Vec<String> = Vec::new();
+
+        for func in program.functions.drain(..) {
+            let name = func.name.clone();
+
+            let mut replace = false;
+
+            if let Some(existing) = unique_functions.get(&name) {
+                if existing.is_extern && !func.is_extern {
+                    replace = true;
+                }
+            } else {
+                function_order.push(name.clone());
+                replace = true;
+            }
+
+            if replace {
+                unique_functions.insert(name, func);
+            }
+        }
+
+        program.functions = function_order
+            .into_iter()
+            .filter_map(|name| unique_functions.remove(&name))
+            .collect();
     }
 
     for func in &mut program.functions {
@@ -377,13 +417,26 @@ fn main() {
             continue;
         }
 
-        if let Some((func_filename, func_source)) = function_sources.get(&func.name) {
+        if let Some(func_filename) = function_sources.get(&func.name) {
+            let func_source = match file_sources.get(func_filename) {
+                Some(source) => source.as_str(),
+                None => {
+                    eprintln!(
+                        "\x1b[31;1merror\x1b[0m: missing cached source for function '{}' from '{}'",
+                        func.name, func_filename
+                    );
+                    std::process::exit(1);
+                }
+            };
+
             let local_lexer = Lexer::new(func_source);
             let mut local_parser = Parser::new(local_lexer);
+
             if let Err(err) = local_parser.seek_to_function(&func.name) {
                 report_parse_error(func_filename, func_source, &err.message, &err.span);
                 std::process::exit(1);
             }
+
             match local_parser.parse_function_body() {
                 Ok(body) => {
                     func.body = Some(body);
@@ -474,21 +527,27 @@ fn main() {
     let mut safety_errors = 0;
 
     for func in &program.functions {
-        let (source, base_line) =
-            if let Some((_filename, func_source)) = function_sources.get(&func.name) {
-                let mut line = 1usize;
-                for (i, l) in func_source.lines().enumerate() {
-                    if l.contains(&format!("fn {}", func.name))
-                        || l.contains(&format!("export fn {}", func.name))
-                    {
-                        line = i + 1;
-                        break;
-                    }
+        let (source, base_line) = if let Some(func_filename) = function_sources.get(&func.name) {
+            let func_source = file_sources
+                .get(func_filename)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+
+            let mut line = 1usize;
+
+            for (i, l) in func_source.lines().enumerate() {
+                if l.contains(&format!("fn {}", func.name))
+                    || l.contains(&format!("export fn {}", func.name))
+                {
+                    line = i + 1;
+                    break;
                 }
-                (Some(func_source.as_str()), line)
-            } else {
-                (None, 0)
-            };
+            }
+
+            (Some(func_source), line)
+        } else {
+            (None, 0)
+        };
         if let Err(errors) = safety_analyzer.analyze_function(func, &structs_map, source, base_line)
         {
             for err in errors {
@@ -508,6 +567,9 @@ fn main() {
         std::process::exit(1);
     }
 
+    file_sources.clear();
+    file_sources.shrink_to_fit();
+
     if verbose {
         println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");
     }
@@ -521,7 +583,7 @@ fn main() {
         println!("  \x1b[34;1mStage 5:\x1b[0m Binary Packaging & ABI Linking");
         println!("    \x1b[37;1mLinking functions from source files:\x1b[0m");
         for (func_name, offset) in &generator.function_offsets {
-            let origin = if let Some((file, _)) = function_sources.get(func_name) {
+            let origin = if let Some(file) = function_sources.get(func_name) {
                 file.as_str()
             } else {
                 "stdlib"

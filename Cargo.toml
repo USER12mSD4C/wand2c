@@ -5,4 +5,5 @@ edition = "2021"
 authors = ["USER_12mS"]
 description = "Compiler for the Wand v2.0 programming language conforming to Standard 4/6 ABI"
 
-[dependencies]
+[build-dependencies]
+cc = "1.0"

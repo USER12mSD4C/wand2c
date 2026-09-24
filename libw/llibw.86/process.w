@@ -4,6 +4,18 @@ sc.true
 #import <mem>
 #import <vector>
 
+sect.process_env
+    u64 envp_ptr = 0;
+EOS
+
+fn process_set_envp(u64 envp) {
+    process_env:envp_ptr = envp;
+}
+
+fn process_get_envp() -> u64 {
+    return(process_env:envp_ptr);
+}
+
 struct ProcessInfo {
     i64 pid;
     i64 status;
@@ -165,10 +177,16 @@ fn process_exec_shell(u8* cmd) -> i64 {
         argv[2] = cmd;
         argv[3] = null;
 
-        u8* envp[1];
-        envp[0] = null;
+        u64 envp_val = process_get_envp();
 
-        process_exec("/bin/sh", argv*adr, envp*adr);
+        if (envp_val == 0) {
+            u8* empty_env[1];
+            empty_env[0] = null;
+            process_exec("/bin/sh", argv*adr, empty_env*adr);
+        } else {
+            process_exec("/bin/sh", argv*adr, (u8*)envp_val);
+        }
+
         process_exit(127);
     }
 

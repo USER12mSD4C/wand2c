@@ -1,8 +1,8 @@
 sc.true
 
-extern fn mloc(void* owner, u64 size) -> void*;
-extern fn mfree(void* ptr) -> void;
-extern fn malloc(u64 size) -> void*;
-extern fn calloc(u64 num, u64 size) -> void*;
-extern fn mfree_all() -> void;
-extern fn mrealloc(u8* ptr, u64 new_size) -> u8*;
+fn mem_init(u64 initial_size);
+fn malloc(u64 size) -> u8*;
+fn calloc(u64 num, u64 size) -> u8*;
+fn mfree(u8* ptr);
+fn mfree_all();
+fn mrealloc(u8* ptr, u64 new_size) -> u8*;
