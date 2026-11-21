@@ -7,6 +7,14 @@ It does not use LLVM or GCC.
 The compiler generates ELF64 executables, relocatable object files, flat binary images, and dynamic execution modules.
 It adds Standard 4/6 binary metadata to custom ELF sections.
 
+## Documentation
+
+- [Learning Wand](documentation/LEARN.md): tutorial and runnable examples.
+- [Documentation map](documentation/README.md): document index and reading order.
+- [Quick reference](documentation/CHEATSHEET.md): commands and syntax section index.
+- [Syntax reference](documentation/SYNTAX.md): authoritative language rules.
+- [Troubleshooting](documentation/TROUBLESHOOTING.md): errors and known limitations.
+
 ## Architecture
 
 The compiler uses a modular multi-pass pipeline:
@@ -16,10 +24,13 @@ The compiler uses a modular multi-pass pipeline:
 * `src/lexer.rs`: Scans source text into tokens. Tracks line and column numbers for error reporting.
 * `src/parser.rs`: Parses tokens into the AST. Uses a two-pass system for functions.
 * `src/checker.rs`: Checks types. Calculates structure sizes and field offsets.
-* `src/optimizer.rs`: Optimizes the AST. Folds constants, removes dead code, applies algebraic simplifications, and performs strength reduction.
-* `src/safety.rs`: Checks memory safety. Detects memory leaks, use-after-free errors, uninitialized variables, and null pointer dereferences.
-* `src/codegen.rs`: Generates x86_64 machine code. Patches call sites and string addresses. Builds the final binary.
-* `src/abi.rs`: Generates Standard 4/6 metadata. Builds string tables and type records.
+* `src/optimizer.rs`: Optimizes the AST. Folds constants, propagates immutable values, removes dead code, applies algebraic simplifications, and performs type-aware strength reduction.
+* `src/safety.rs`: Checks memory safety. Detects memory leaks, use-after-free errors, uninitialized pointers and struct fields, and null pointer dereferences.
+* `src/codegen.rs`: Serializes the checked AST and calls the C backend through a small FFI shim.
+* `src/backend/wand_backend.h`: Shared C/Rust ABI for serialized programs and generated output.
+* `src/backend/x86/codegen.c`: C x86_64 backend. Emits machine code from the serialized AST.
+* `src/backend/x86/abi.c`: C helpers for ELF/metadata generation using growable buffers with explicit cleanup.
+* `src/abi.rs`: Consumes backend output, builds string tables and type records, and writes Standard 4/6 metadata.
 * `src/main.rs`: Manages the command line interface. Resolves imports and installs libraries.
 
 ## Build the Compiler
@@ -32,30 +43,30 @@ cargo build --release
 
 The binary is located at `target/release/wand2c`.
 
+## Editor Support
+
+A Zed extension lives in [`zed-wand/`](zed-wand/README.md).
+It teaches Zed to recognize `.w` and `.wh` files and provides Wand highlighting, brackets, indentation, outline, and text objects.
+
+Install it in Zed with `zed: install dev extension` and select the `zed-wand` directory.
+
 ## Standard Library Installation
 
-The compiler has a package manager for the standard library (`libw`).
+The standard library sources are in `libw/llibw.86/`.
 
-Install all libraries:
-
-```bash
-wand2c -il libw
-```
-
-Install one library:
+Install all standard library modules:
 
 ```bash
-wand2c -il libw/io
+wand2c -il libw/llibw.86
 ```
 
-Install a directory of libraries:
+Install one module:
 
 ```bash
-wand2c -il sfa/
+wand2c -il libw/llibw.86/io
 ```
 
-The compiler validates the source code before installation.
-It copies the files to `~/.local/lib/libw/`.
+Directory installation is non-recursive. The compiler validates `.w` and `.wh` files before copying them to `~/.local/lib/libw/`, or to `$WAND_LIB_PATH` when that variable is set.
 
 ## Compilation Commands
 
@@ -80,13 +91,13 @@ wand2c module.w -o module.o -fo
 Compile to a flat binary:
 
 ```bash
-wand2c boot.w -o boot.bin -fr --entry=start
+wand2c boot.w -o boot.bin -fr --entry start
 ```
 
 Compile to a freestanding kernel image:
 
 ```bash
-wand2c kernel.w -o kernel.kbin -fk --entry=kmain
+wand2c kernel.w -o kernel.kbin -fk --entry kmain
 ```
 
 Compile to a dynamic execution module:
@@ -122,7 +133,7 @@ wand2c module.w -o module.wexp -fw
 Every Wand source file starts with an environment token:
 
 * `sc.true`: Hosted environment. The program runs under an operating system. Requires a `main` function. Allows system calls.
-* `sc.false`: Freestanding environment. The program runs on bare metal. Requires a `kmain` function. Allows `critical` blocks and IRQ handlers.
+* `sc.false`: Freestanding environment. The program runs on bare metal. Raw and kernel formats use `main` as the default entry; pass `--entry kmain` to select `kmain`. Allows `critical` blocks and IRQ handlers.
 
 ### Import System
 
@@ -185,6 +196,8 @@ Use `_` to ignore a return value:
 ```
 [_, r] = divmod(17, 5);
 ```
+
+> Current limitation: see [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md#multiple-return-values-give-the-same-result).
 
 ### Structures with Versioning
 
@@ -250,13 +263,15 @@ Errors abort compilation. Warnings are reported but do not stop the build.
 The optimizer runs up to 10 iterations per function. It performs:
 
 * Constant folding and propagation.
-* Dead variable elimination.
+* Copy propagation for variables that are never reassigned.
+* Dead variable and dead store elimination.
 * Algebraic simplifications (`x + 0`, `x * 1`, `x ^ x`, etc.).
-* Power-of-two strength reduction (multiply and divide to shifts).
+* Unsigned power-of-two division to shifts and modulo to masks.
+* Nested shift folding.
 * Commutative chain folding.
-* Loop and branch elimination for constant conditions.
+* Loop, branch, and unreachable statement elimination.
 
-Volatile and atomic variables are never optimized.
+Volatile and atomic variables are never optimized. Signed division and modulo are not strength-reduced. Calls and memory loads are never dropped or duplicated.
 
 ## Memory Allocation
 

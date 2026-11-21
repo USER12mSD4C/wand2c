@@ -1,5 +1,7 @@
 # WandC Standard Library Reference
 
+> Current implementation limitations in installed library sources are listed in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 This document describes the WandC standard library.
 The library contains ready functions for common tasks.
 You must import the necessary modules in your source file.
@@ -11,7 +13,7 @@ You must import the necessary modules in your source file.
 Run this command to install the library:
 
 ```text
-wand2c -il libw
+wand2c -il libw/llibw.86
 ```
 
 ---

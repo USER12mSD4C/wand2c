@@ -1,5 +1,9 @@
 # WandC Code Examples
 
+> For an introduction, read [Learning Wand](LEARN.md). The runnable examples for that tutorial are in [examples/](examples/README.md).
+>
+> Current implementation limitations are listed in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 This document contains practical examples of WandC code.
 Use these examples to learn the language syntax.
 
@@ -457,6 +461,8 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
     return(0);
 }
 ```
+
+> Current limitation: see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#multiple-return-values-give-the-same-result).
 
 ---
 

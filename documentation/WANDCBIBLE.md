@@ -2,6 +2,8 @@
 
 A complete guide from zero to systems programming.
 
+> For an introduction, read [Learning Wand](LEARN.md). This book is the detailed reference.
+
 This book assumes you know nothing about programming.
 It teaches you WandC from your first terminal command to writing kernel modules and GPU compute shaders.
 
@@ -31,7 +33,7 @@ What makes WandC different from C:
 - Explicit pointer data flow modifiers (`*i`, `*o`, `*io`)
 - Built-in optimizer with algebraic simplifications
 - Custom binary format (.wexp) with type metadata
-- No undefined behavior by design
+- Programmer-controlled low-level operations; current implementation limitations are listed in [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
 What WandC does NOT do:
 
@@ -39,7 +41,7 @@ What WandC does NOT do:
 - No runtime type information
 - No dynamic dispatch
 - No multi-level pointers (no `u8**`)
-- No implicit type conversions
+- Reject every implicit integer narrowing conversion; explicit casts are recommended
 
 ### Chapter 2: Installing the Compiler
 
@@ -91,7 +93,7 @@ wand2c --help
 #### Step 5: Install the standard library
 
 ```
-wand2c -il libw
+wand2c -il libw/llibw.86
 ```
 
 This copies all library files to `~/.local/lib/libw/`.
@@ -155,7 +157,7 @@ Let's break down every line.
 Every WandC file starts with an environment token.
 
 - `sc.true` means the program runs under an operating system. It requires a `main` function. System calls are available.
-- `sc.false` means the program runs on bare metal (no OS). It requires a `kmain` function. Critical sections and IRQ handlers are available.
+- `sc.false` means the program runs on bare metal (no OS). Raw and kernel formats use `main` as the default entry; pass `--entry kmain` to select `kmain`. Critical sections and IRQ handlers are available.
 
 For now, always use `sc.true`.
 
@@ -301,13 +303,13 @@ wand2c module.w -o module.o -fo
 Compile a flat binary for bare metal:
 
 ```
-wand2c boot.w -o boot.bin -fr --entry=start
+wand2c boot.w -o boot.bin -fr --entry start
 ```
 
 Compile a kernel:
 
 ```
-wand2c kernel.w -o kernel.img -fk --entry=kmain
+wand2c kernel.w -o kernel.img -fk --entry kmain
 ```
 
 Compile a dynamic module:
@@ -393,7 +395,7 @@ i64 temperature = -5;
 u8* name = "wand";
 ```
 
-You can declare without initialization, but the compiler will warn if you read it before writing:
+You can declare without initialization. The safety analyzer tracks uninitialized pointers and struct fields; scalar locals are not fully tracked:
 
 ```
 u64 y;
@@ -648,6 +650,8 @@ Use `_` to ignore a value:
 [_, remainder] = divmod(17, 5);
 ```
 
+> Current limitation: see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#multiple-return-values-give-the-same-result).
+
 #### Recursion
 
 ```
@@ -796,7 +800,7 @@ struct Config version 2 {
 Use `packed` to remove padding:
 
 ```
-packed align(1) struct Packet {
+align(1) packed struct Packet {
     u8 type version 1;
     u16 length version 1;
     u32 data version 1;
@@ -1883,7 +1887,7 @@ The epilogue restores them and executes `iretq`.
 
 Freestanding code runs without an operating system.
 Use `sc.false` as the environment token.
-The entry point must be named `kmain`.
+Raw and kernel images use `main` as the default entry. The example below passes `--entry kmain` to select `kmain`.
 
 ```
 sc.false
@@ -1905,14 +1909,14 @@ fn kmain() {
 Compile with:
 
 ```
-wand2c kernel.w -o kernel.img -fk --entry=kmain
+wand2c kernel.w -o kernel.img -fk --entry kmain
 ```
 
 Differences from `sc.true`:
 
 | Feature | sc.true | sc.false |
 |---------|---------|----------|
-| Entry point | `main` | `kmain` |
+| Entry point | `main` | `main` by default; `--entry kmain` selects `kmain` |
 | System calls | Allowed | Forbidden |
 | Critical sections | Forbidden | Allowed |
 | IRQ handlers | Forbidden | Allowed |
@@ -2253,7 +2257,7 @@ Use the stack for small, short-lived buffers.
 #### Use packed structures for wire formats
 
 ```
-packed align(1) struct Packet {
+align(1) packed struct Packet {
     u8 type version 1;
     u16 length version 1;
     u32 data version 1;
@@ -2419,7 +2423,7 @@ fn kmain() {
 Compile:
 
 ```
-wand2c kernel.w -o kernel.img -fk --entry=kmain
+wand2c kernel.w -o kernel.img -fk --entry kmain
 ```
 
 ## Appendix A: Complete Operator Reference

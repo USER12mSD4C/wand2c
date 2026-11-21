@@ -1,0 +1,6 @@
+id = "wand"
+name = "Wand"
+version = "0.0.1"
+schema_version = 1
+authors = ["wand2c contributors"]
+description = "Wand language support for Zed: .w/.wh recognition, syntax highlighting, brackets, indentation, and outline."

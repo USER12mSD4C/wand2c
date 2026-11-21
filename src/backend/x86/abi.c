@@ -46,17 +46,6 @@ static uint8_t read_u8(Reader* r) {
     return v;
 }
 
-static uint16_t read_u16(Reader* r) {
-    if (r->pos + 2 > r->len) {
-        return 0;
-    }
-    uint16_t v = 0;
-    v |= (uint16_t)r->base[r->pos];
-    v |= (uint16_t)r->base[r->pos + 1] << 8;
-    r->pos += 2;
-    return v;
-}
-
 static uint32_t read_u32(Reader* r) {
     if (r->pos + 4 > r->len) {
         return 0;
@@ -67,18 +56,6 @@ static uint32_t read_u32(Reader* r) {
     v |= (uint32_t)r->base[r->pos + 2] << 16;
     v |= (uint32_t)r->base[r->pos + 3] << 24;
     r->pos += 4;
-    return v;
-}
-
-static uint64_t read_u64(Reader* r) {
-    if (r->pos + 8 > r->len) {
-        return 0;
-    }
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) {
-        v |= (uint64_t)r->base[r->pos + i] << (i * 8);
-    }
-    r->pos += 8;
     return v;
 }
 
@@ -430,46 +407,6 @@ static void build_p46_sections(const PackInput* in,
     }
 }
 
-static void build_p46_header(Writer* hdr,
-                             uint64_t strtab_offset,
-                             uint64_t strtab_size,
-                             uint64_t sections_start) {
-    write_bytes(hdr, (const uint8_t[]){0x50, 0x34, 0x36, 0x00}, 4);
-    write_u8(hdr, 1);
-    write_u8(hdr, 6);
-    write_u8(hdr, 0);
-    write_u8(hdr, 1);
-    write_u8(hdr, POINTER_SIZE);
-    write_u8(hdr, ADDRESS_SIZE);
-    write_u8(hdr, 0);
-    write_u8(hdr, 0);
-    write_u32(hdr, 0x01000000u);
-    write_u32(hdr, 5);
-    write_u64(hdr, strtab_offset);
-    write_u64(hdr, strtab_size);
-
-    uint64_t offsets[5];
-    uint64_t sizes[5];
-    uint32_t stypes[5] = {
-        P46_SECTION_TYPES,
-        P46_SECTION_EXPORTS,
-        P46_SECTION_REFLECT,
-        P46_SECTION_IMPORTS,
-        P46_SECTION_DEPENDENCIES,
-    };
-
-    offsets[0] = sections_start;
-    for (int i = 1; i < 5; i++) {
-        offsets[i] = offsets[i - 1] + sizes[i - 1];
-    }
-
-    for (int i = 0; i < 5; i++) {
-        write_u64(hdr, offsets[i]);
-        write_u64(hdr, sizes[i]);
-        write_u32(hdr, stypes[i]);
-    }
-}
-
 static void build_elf64_image(const PackInput* in, Writer* out) {
     Writer types, exports, reflect, imports, deps;
     writer_init(&types);
@@ -510,31 +447,14 @@ static void build_elf64_image(const PackInput* in, Writer* out) {
     writer_init(&shstrtab);
     write_u8(&shstrtab, 0);
 
-    uint32_t n_text = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".text\0", 6);
-
-    uint32_t n_p46_hdr = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_header\0", 12);
-
-    uint32_t n_p46_typ = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_types\0", 11);
-
-    uint32_t n_p46_exp = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_exports\0", 13);
-
-    uint32_t n_p46_imp = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_imports\0", 13);
-
-    uint32_t n_p46_dep = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_deps\0", 10);
-
-    uint32_t n_p46_ref = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_reflect\0", 13);
-
-    uint32_t n_shstr = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".shstrtab\0", 10);
-
-    uint32_t n_p46_str = (uint32_t)shstrtab.len;
     write_bytes(&shstrtab, (const uint8_t*)".p46_strtab\0", 12);
 
     uint32_t shstrtab_offset = p46_strtab_offset + p46_strtab_size;

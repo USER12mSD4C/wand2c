@@ -1,5 +1,7 @@
 # WandC Getting Started Guide
 
+> For a tutorial, use [Learning Wand](LEARN.md). This page is a short setup and workflow guide.
+
 This guide helps you start with WandC.
 It shows the basic workflow and file structure.
 
@@ -13,7 +15,7 @@ Use `sc.true` for programs that run under an operating system.
 Use `sc.false` for bare metal code.
 
 `sc.true` requires a `main` function.
-`sc.false` requires a `kmain` function.
+Raw and kernel formats use `main` as the default entry. Pass `--entry kmain` to select a `kmain` function.
 
 Example:
 
@@ -394,7 +396,7 @@ wand2c module.w -o module.wexp -fw
 Install the standard library:
 
 ```text
-wand2c -il libw
+wand2c -il libw/llibw.86
 ```
 
 Available modules:

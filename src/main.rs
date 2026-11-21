@@ -11,7 +11,7 @@ mod token;
 
 use ast::Span;
 use checker::TypeChecker;
-use codegen::{NativeGenerator, OutputFormat};
+use codegen::OutputFormat;
 use lexer::Lexer;
 use optimizer::Optimizer;
 use parser::Parser;
@@ -573,11 +573,14 @@ fn main() {
     if verbose {
         println!("  \x1b[34;1mStage 4:\x1b[0m Direct x86_64 Code Generation");
     }
-    let mut generator = NativeGenerator::new();
-    generator.output_format = output_format;
-    generator.entry_name = entry_name.clone();
-    generator.use_os = program.use_os;
-    let raw_machine_code = generator.compile_program(&program);
+    let generator = match codegen::compile_program(&program, output_format, entry_name.as_deref())
+    {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("\n  \x1b[31;1m[codegen error]\x1b[0m {}", e);
+            std::process::exit(1);
+        }
+    };
 
     if verbose {
         println!("  \x1b[34;1mStage 5:\x1b[0m Binary Packaging & ABI Linking");
@@ -618,9 +621,9 @@ fn main() {
 
     let executable_image =
         if output_format == OutputFormat::Program || output_format == OutputFormat::Wexp {
-            generate_elf64_binary(&raw_machine_code, &program, &generator)
+            generate_elf64_binary(&generator.code, &program, &generator)
         } else {
-            raw_machine_code.clone()
+            generator.code
         };
 
     if verbose {

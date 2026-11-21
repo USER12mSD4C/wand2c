@@ -29,7 +29,7 @@ Every WandC file must start with one environment token.
 | Token | Environment | Required entry function |
 |---|---|---|
 | `sc.true` | Hosted | `main` |
-| `sc.false` | Freestanding | `kmain` |
+| `sc.false` | Freestanding | `main` by default; `--entry kmain` selects `kmain` |
 
 Hosted entry function:
 
@@ -237,8 +237,7 @@ Array indexing starts at zero.
 buffer[0] = 1;
 ```
 
-Arrays do not decay automatically.
-Use `*adr` to pass an array to a pointer parameter.
+An array name can be passed to a pointer parameter. `*adr` is the explicit address-taking form and is also valid.
 
 ```wandc
 fn process(u8* data, u64 size) {
@@ -613,9 +612,9 @@ These are postfix operators.
 
 ## 19. Type Conversions
 
-WandC does not perform implicit type conversions.
+Use explicit casts at narrowing boundaries.
 
-Use explicit casts.
+The checker currently accepts some integer assignments without a cast and truncates the value. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#implicit-integer-narrowing-is-accepted).
 
 Integer cast:
 
@@ -799,6 +798,8 @@ u64 q;
 u64 r;
 [q, r] = divmod(17, 5);
 ```
+
+> Current limitation: see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#multiple-return-values-give-the-same-result).
 
 ### Return Statement
 
@@ -1135,32 +1136,37 @@ It may perform:
 
 1. Constant folding.
 2. Constant propagation.
-3. Dead variable elimination.
-4. Algebraic simplification.
-5. Strength reduction.
-6. Branch elimination.
+3. Copy propagation for immutable variables.
+4. Dead variable and dead store elimination.
+5. Algebraic simplification.
+6. Strength reduction for unsigned division and modulo by powers of two.
+7. Nested shift folding.
+8. Branch elimination and unreachable statement removal.
 
 Rules:
 
 1. `volatile` variables are not optimized.
 2. `atomic` variables are not optimized.
 3. Inline assembly blocks are optimization barriers.
-4. Visible side effects must be preserved.
+4. Calls and memory loads are observable; the optimizer does not drop or duplicate them.
+5. Signed division and modulo are not strength-reduced to shifts or masks.
 
 Examples:
 
-| Expression | Result |
-|---|---|
-| `x + 0` | `x` |
-| `x * 1` | `x` |
-| `x * 0` | `0` |
-| `x - x` | `0` |
-| `x / 1` | `x` |
-| `x ^ x` | `0` |
-| `x & 0` | `0` |
-| `x \| 0` | `x` |
-| `x << 0` | `x` |
-| `x >> 0` | `x` |
+| Expression | Result | Condition |
+|---|---|---|
+| `x + 0` | `x` | none |
+| `x * 1` | `x` | none |
+| `x * 0` | `0` | `x` has no observable effects |
+| `x - x` | `0` | `x` has no observable effects |
+| `x / 1` | `x` | none |
+| `x ^ x` | `0` | `x` has no observable effects |
+| `x & 0` | `0` | `x` has no observable effects |
+| `x \| 0` | `x` | none |
+| `x << 0` | `x` | none |
+| `x >> 0` | `x` | none |
+| `u64 x % 8` | `x & 7` | `x` is unsigned |
+| `(x << a) << b` | `x << (a + b)` | both shifts use the same direction |
 
 ---
 

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::ast::{DataType, Program};
-use crate::codegen::NativeGenerator;
+use crate::codegen::CodegenOutput;
 use std::collections::HashMap;
 
 pub const P46_SECTION_TYPES: u32 = 1;
@@ -295,7 +295,7 @@ impl BinaryBuilder {
 pub fn generate_elf64_binary(
     payload_bytes: &[u8],
     program: &Program,
-    gen: &NativeGenerator,
+    gen: &CodegenOutput,
 ) -> Vec<u8> {
     let mut builder = BinaryBuilder::new();
 

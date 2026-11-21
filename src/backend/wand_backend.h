@@ -17,4 +17,27 @@ typedef struct {
     size_t size;
 } WandBinary;
 
+/* Metadata returned by the code generator. Strings are owned by the result. */
+typedef struct {
+    char* name;
+    uint64_t offset;
+} WandSymbol;
+
+typedef struct {
+    uint64_t position;
+    char* target;
+} WandCallPatch;
+
+typedef struct {
+    uint8_t* data;
+    size_t size;
+    WandSymbol* functions;
+    size_t function_count;
+    WandCallPatch* call_patches;
+    size_t call_patch_count;
+    uint32_t error; /* 0 = ok, 1 = malformed input, 2 = out of memory, 3 = depth limit */
+} WandCompileResult;
+
+void wand_compile_result_free(WandCompileResult* result);
+
 #endif
