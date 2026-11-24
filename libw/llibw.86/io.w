@@ -1,5 +1,6 @@
 sc.true
 #import <syscall>
+#import <string>
 
 fn print_char(u8 c) {
     sys_write(1, c*adr, 1);
@@ -53,7 +54,7 @@ fn print_string(u8* s) {
 }
 
 fn print_number(u64 num) {
-    u8[32] buf;
+    u8 buf[32];
     u64 pos = 30;
     buf[31] = 0;
 
@@ -72,8 +73,8 @@ fn print_number(u64 num) {
         pos = pos + 1;
     }
 
-    u8* base*i = buf*adr;
-    u8* result_str*i = base + pos;
+    u8* base = buf*adr;
+    u8* result_str = base + pos;
     print_string(result_str);
 }
 
@@ -197,7 +198,7 @@ fn parse_float(u8* s) -> f64 {
 }
 
 fn read_float() -> f64 {
-    u8[64] buf;
+    u8 buf[64];
     u8* p_buf = buf*adr;
     read_string(p_buf, 64);
     return(parse_float(p_buf));
@@ -411,4 +412,155 @@ fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
 
     buf[pos] = 0;
     return(pos);
+}
+
+fn eprint(u8* s) {
+    sys_write(2, s, strlen(s));
+}
+
+fn eprint_number(u64 n) {
+    u8 buf[32];
+    utoa(n, buf*adr);
+    eprint(buf*adr);
+}
+
+fn die(u64 code, u8* msg) {
+    eprint(msg);
+    eprint("\n");
+    sys_exit(code);
+}
+
+fn strerror(u64 err) -> u8* {
+    match (err) {
+        case 1 { return("Operation not permitted"); }
+        case 2 { return("No such file or directory"); }
+        case 3 { return("No such process"); }
+        case 4 { return("Interrupted system call"); }
+        case 5 { return("Input/output error"); }
+        case 6 { return("No such device or address"); }
+        case 7 { return("Argument list too long"); }
+        case 8 { return("Exec format error"); }
+        case 9 { return("Bad file descriptor"); }
+        case 10 { return("No child processes"); }
+        case 11 { return("Resource temporarily unavailable"); }
+        case 12 { return("Cannot allocate memory"); }
+        case 13 { return("Permission denied"); }
+        case 14 { return("Bad address"); }
+        case 15 { return("Block device required"); }
+        case 16 { return("Device or resource busy"); }
+        case 17 { return("File exists"); }
+        case 18 { return("Invalid cross-device link"); }
+        case 19 { return("No such device"); }
+        case 20 { return("Not a directory"); }
+        case 21 { return("Is a directory"); }
+        case 22 { return("Invalid argument"); }
+        case 23 { return("Too many open files in system"); }
+        case 24 { return("Too many open files"); }
+        case 25 { return("Inappropriate ioctl for device"); }
+        case 26 { return("Text file busy"); }
+        case 27 { return("File too large"); }
+        case 28 { return("No space left on device"); }
+        case 29 { return("Illegal seek"); }
+        case 30 { return("Read-only file system"); }
+        case 31 { return("Too many links"); }
+        case 32 { return("Broken pipe"); }
+        case 33 { return("Numerical argument out of domain"); }
+        case 34 { return("Numerical result out of range"); }
+        case 36 { return("File name too long"); }
+        case 37 { return("No locks available"); }
+        case 38 { return("Function not implemented"); }
+        case 39 { return("Directory not empty"); }
+        case 40 { return("Too many levels of symbolic links"); }
+        case 61 { return("No data available"); }
+        case 62 { return("Timer expired"); }
+        case 75 { return("Value too large for defined data type"); }
+        case 95 { return("Operation not supported"); }
+        default { return("Unknown error"); }
+    }
+    return("Unknown error");
+}
+
+fn write_all(u64 fd, u8* buf, u64 len) -> u64 {
+    u64 done = 0;
+    while (done < len) {
+        u64 r = sys_write(fd, buf + done, len - done);
+        if (syscall_error(r) == 1) {
+            u64 err = 0 - r;
+            if (err == EINTR) {
+                continue;
+            }
+            return(err);
+        }
+        if (r == 0) {
+            return(EIO);
+        }
+        done = done + r;
+    }
+    return(0);
+}
+
+fn read_full(u64 fd, u8* buf, u64 len) -> i64 {
+    u64 done = 0;
+    while (done < len) {
+        u64 r = sys_read(fd, buf + done, len - done);
+        if (syscall_error(r) == 1) {
+            u64 err = 0 - r;
+            if (err == EINTR) {
+                continue;
+            }
+            return(0 - err);
+        }
+        if (r == 0) {
+            return(done);
+        }
+        done = done + r;
+    }
+    return(done);
+}
+
+sect.iobuf
+    u8 out[65536];
+    u64 out_len = 0;
+EOS
+
+fn out_flush() {
+    if (iobuf:out_len > 0) {
+        write_all(1, iobuf:out*adr, iobuf:out_len);
+        iobuf:out_len = 0;
+    }
+}
+
+fn out_write(u8* s, u64 n) {
+    if (n == 0) { return; }
+    if (iobuf:out_len + n > 65536) {
+        out_flush();
+    }
+    if (n >= 65536) {
+        write_all(1, s, n);
+        return;
+    }
+    memcpy(iobuf:out*adr + iobuf:out_len, s, n);
+    iobuf:out_len = iobuf:out_len + n;
+}
+
+fn out_char(u8 c) {
+    if (iobuf:out_len >= 65536) { out_flush(); }
+    iobuf:out[iobuf:out_len] = c;
+    iobuf:out_len = iobuf:out_len + 1;
+}
+
+fn out_str(u8* s) {
+    out_write(s, strlen(s));
+}
+
+fn out_num(u64 n) {
+    u8 buf[32];
+    utoa(n, buf*adr);
+    out_str(buf*adr);
+}
+
+fn out_i64(i64 n) {
+    u8 buf[32];
+    itoa(n, buf*adr);
+    out_str(buf*adr);
 }

@@ -1,0 +1,6 @@
+sc.true
+
+extern fn is_leap(u64 y) -> u64;
+extern fn days_in_month(u64 y, u64 m) -> u64;
+extern fn gmtime_sec(u64 t, u64* year, u64* mon, u64* day, u64* hour, u64* min, u64* sec);
+extern fn fmt_ls_time(u64 t, u8* out);

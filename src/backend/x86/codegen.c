@@ -1250,6 +1250,12 @@ static WType* type_u64(void) {
     return &u64_type;
 }
 
+static WType* type_u8(void) {
+    static WType u8_type;
+    u8_type.tag = 0;
+    return &u8_type;
+}
+
 static WType* type_pointer_to(WType* inner) {
     WType* t = (WType*)arena_alloc(g_arena, sizeof(WType));
     t->tag = 10;
@@ -1351,6 +1357,8 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
         return NULL;
     }
     switch (e->tag) {
+        case 2: /* StringLit: a string literal is a pointer to its bytes */
+            return type_pointer_to(type_u8());
         case 3: { /* Variable */
             uint64_t v;
             return map_get_str(&g->local_types, e->str, &v) ? AS_PTR(WType, v) : NULL;
@@ -1816,9 +1824,8 @@ static void collect_expr_literals(Gen* g, WExpr* e, int strings) {
             }
             break;
         case 10:
-            for (size_t i = 0; i < e->arg_count && i < 2; i++) {
-                collect_expr_literals(g, e->args[i], strings);
-            }
+            collect_expr_literals(g, e->a, strings);
+            collect_expr_literals(g, e->b, strings);
             break;
         case 6:
             collect_expr_literals(g, e->a, strings);
@@ -3098,6 +3105,12 @@ static void compile_nasm(Gen* g, WStr code) {
         }
         if (strcmp(t, "syscall") == 0) {
             buf_u8(b, 0x0F); buf_u8(b, 0x05);
+        } else if (strcmp(t, "rep movsb") == 0) {
+            buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+        } else if (strcmp(t, "rep stosb") == 0) {
+            buf_u8(b, 0xF3); buf_u8(b, 0xAA);
+        } else if (strcmp(t, "cld") == 0) {
+            buf_u8(b, 0xFC);
         } else if (strcmp(t, "ret") == 0) {
             buf_u8(b, 0xC3);
         } else if (strcmp(t, "push rbp") == 0) {
@@ -3364,9 +3377,12 @@ static void compile_stmt(Gen* g, WStmt* s) {
             break;
         case 9: { /* Match */
             compile_expr(g, s->e1, 0, 1);
+            buf_u8(b, 0x50); /* push rax - save scrutinee */
             SizeVec je_patches = {0};
             for (size_t i = 0; i < s->case_count; i++) {
-                emit_cmp_rax_imm(g, eval_const(g, s->cases[i].expr));
+                compile_expr(g, s->cases[i].expr, 0, 1);
+                /* cmp qword [rsp], rax */
+                buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0x04); buf_u8(b, 0x24);
                 buf_u8(b, 0x0F); buf_u8(b, 0x84);
                 size_t p = b->len;
                 buf_u32(b, 0);
@@ -3392,6 +3408,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             for (size_t i = 0; i < end_jmps.n; i++) {
                 patch_address(g, end_jmps.v[i], (int32_t)(b->len - (end_jmps.v[i] + 4)));
             }
+            buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xC4); buf_u8(b, 0x08); /* add rsp, 8 */
             break;
         }
         case 10: /* Expr */

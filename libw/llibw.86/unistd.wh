@@ -14,3 +14,5 @@ extern fn pclose(i64 fd) -> i64;
 extern fn opendir(u8* path) -> DIR*;
 extern fn readdir(DIR* dir) -> u8*;
 extern fn closedir(DIR* dir);
+extern fn isatty(u64 fd) -> u64;
+extern fn tty_width() -> u64;

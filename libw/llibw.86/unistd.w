@@ -202,3 +202,25 @@ fn closedir(DIR* dir) {
         mfree(dir);
     }
 }
+
+fn isatty(u64 fd) -> u64 {
+    u8 tbuf[64];
+    u64 r = sys_ioctl(fd, 0x5401, tbuf*adr);
+    if (syscall_error(r) == 1) {
+        return(0);
+    }
+    return(1);
+}
+
+fn tty_width() -> u64 {
+    u8 wbuf[8];
+    u64 r = sys_ioctl(1, 0x5413, wbuf*adr);
+    if (syscall_error(r) == 1) {
+        return(80);
+    }
+    u64 cols = (u64)wbuf[2] + (u64)wbuf[3] * 256;
+    if (cols == 0) {
+        return(80);
+    }
+    return(cols);
+}

@@ -9,3 +9,19 @@ struct FileReader {
 
 extern fn file_reader_init(FileReader* r, i64 fd);
 extern fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64;
+extern fn file_reader_read(FileReader* r, u8* out, u64 n) -> i64;
+
+struct FileWriter {
+    i64 fd;
+    u64 len;
+    u64 err;
+    u8 buf[16384];
+}
+
+extern fn file_writer_init(FileWriter* w, i64 fd);
+extern fn file_writer_flush(FileWriter* w) -> u64;
+extern fn file_writer_write(FileWriter* w, u8* data, u64 n);
+extern fn file_writer_str(FileWriter* w, u8* s);
+extern fn file_writer_char(FileWriter* w, u8 c);
+extern fn file_writer_num(FileWriter* w, u64 n);
+extern fn file_writer_signed(FileWriter* w, i64 n);

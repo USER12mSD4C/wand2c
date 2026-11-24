@@ -248,6 +248,242 @@ export fn syscall_error(u64 ret) -> u64 {
     return(0);
 }
 
-fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64 {
+export fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64 {
     return(syscall6(9, addr, length, prot, flags, fd, offset));
+}
+
+export fn sys_munmap(u64 addr, u64 length) -> u64 {
+    return(syscall2(11, addr, length));
+}
+
+export fn sys_poll(u8* fds, u64 nfds, i64 timeout) -> u64 {
+    return(syscall3(7, fds, nfds, timeout));
+}
+
+export fn sys_readv(u64 fd, u8* iov, u64 iovcnt) -> u64 {
+    return(syscall3(19, fd, iov, iovcnt));
+}
+
+export fn sys_writev(u64 fd, u8* iov, u64 iovcnt) -> u64 {
+    return(syscall3(20, fd, iov, iovcnt));
+}
+
+export fn sys_access(u8* path, u64 mode) -> u64 {
+    return(syscall2(21, path, mode));
+}
+
+export fn sys_pipe(u8* pipefd) -> u64 {
+    return(syscall1(22, pipefd));
+}
+
+export fn sys_pipe2(u8* pipefd, u64 flags) -> u64 {
+    return(syscall2(293, pipefd, flags));
+}
+
+export fn sys_dup(u64 fd) -> u64 {
+    return(syscall1(32, fd));
+}
+
+export fn sys_dup3(u64 oldfd, u64 newfd, u64 flags) -> u64 {
+    return(syscall3(292, oldfd, newfd, flags));
+}
+
+export fn sys_sendfile(u64 out_fd, u64 in_fd, u64* offset, u64 count) -> u64 {
+    return(syscall4(40, out_fd, in_fd, offset, count));
+}
+
+export fn sys_uname(u8* buf) -> u64 {
+    return(syscall1(63, buf));
+}
+
+export fn sys_fcntl(u64 fd, u64 cmd, u64 arg) -> u64 {
+    return(syscall3(72, fd, cmd, arg));
+}
+
+export fn sys_fsync(u64 fd) -> u64 {
+    return(syscall1(74, fd));
+}
+
+export fn sys_fdatasync(u64 fd) -> u64 {
+    return(syscall1(75, fd));
+}
+
+export fn sys_truncate(u8* path, u64 length) -> u64 {
+    return(syscall2(76, path, length));
+}
+
+export fn sys_ftruncate(u64 fd, u64 length) -> u64 {
+    return(syscall2(77, fd, length));
+}
+
+export fn sys_getcwd(u8* buf, u64 size) -> u64 {
+    return(syscall2(79, buf, size));
+}
+
+export fn sys_chdir(u8* path) -> u64 {
+    return(syscall1(80, path));
+}
+
+export fn sys_fchdir(u64 fd) -> u64 {
+    return(syscall1(81, fd));
+}
+
+export fn sys_rename(u8* oldpath, u8* newpath) -> u64 {
+    return(syscall2(82, oldpath, newpath));
+}
+
+export fn sys_creat(u8* path, u64 mode) -> u64 {
+    return(syscall2(85, path, mode));
+}
+
+export fn sys_link(u8* oldpath, u8* newpath) -> u64 {
+    return(syscall2(86, oldpath, newpath));
+}
+
+export fn sys_symlink(u8* target, u8* linkpath) -> u64 {
+    return(syscall2(88, target, linkpath));
+}
+
+export fn sys_fchmod(u64 fd, u64 mode) -> u64 {
+    return(syscall2(91, fd, mode));
+}
+
+export fn sys_fchown(u64 fd, u64 uid, u64 gid) -> u64 {
+    return(syscall3(93, fd, uid, gid));
+}
+
+export fn sys_lchown(u8* path, u64 uid, u64 gid) -> u64 {
+    return(syscall3(94, path, uid, gid));
+}
+
+export fn sys_umask(u64 mask) -> u64 {
+    return(syscall1(95, mask));
+}
+
+export fn sys_gettimeofday(u8* tv, u8* tz) -> u64 {
+    return(syscall2(96, tv, tz));
+}
+
+export fn sys_sysinfo(u8* info) -> u64 {
+    return(syscall1(99, info));
+}
+
+export fn sys_getppid() -> u64 {
+    return(syscall0(110));
+}
+
+export fn sys_gettid() -> u64 {
+    return(syscall0(186));
+}
+
+export fn sys_time(u64* tloc) -> u64 {
+    return(syscall1(201, tloc));
+}
+
+export fn sys_sched_yield() -> u64 {
+    return(syscall0(24));
+}
+
+export fn sys_tgkill(u64 tgid, u64 tid, u64 sig) -> u64 {
+    return(syscall3(234, tgid, tid, sig));
+}
+
+export fn sys_openat(u64 dirfd, u8* path, u64 flags, u64 mode) -> u64 {
+    return(syscall4(257, dirfd, path, flags, mode));
+}
+
+export fn sys_mkdirat(u64 dirfd, u8* path, u64 mode) -> u64 {
+    return(syscall3(258, dirfd, path, mode));
+}
+
+export fn sys_newfstatat(u64 dirfd, u8* path, u8* statbuf, u64 flags) -> u64 {
+    return(syscall4(262, dirfd, path, statbuf, flags));
+}
+
+export fn sys_unlinkat(u64 dirfd, u8* path, u64 flags) -> u64 {
+    return(syscall3(263, dirfd, path, flags));
+}
+
+export fn sys_renameat(u64 olddirfd, u8* oldpath, u64 newdirfd, u8* newpath) -> u64 {
+    return(syscall4(264, olddirfd, oldpath, newdirfd, newpath));
+}
+
+export fn sys_linkat(u64 olddirfd, u8* oldpath, u64 newdirfd, u8* newpath, u64 flags) -> u64 {
+    return(syscall5(265, olddirfd, oldpath, newdirfd, newpath, flags));
+}
+
+export fn sys_symlinkat(u8* target, u64 newdirfd, u8* linkpath) -> u64 {
+    return(syscall3(266, target, newdirfd, linkpath));
+}
+
+export fn sys_readlinkat(u64 dirfd, u8* path, u8* buf, u64 size) -> u64 {
+    return(syscall4(267, dirfd, path, buf, size));
+}
+
+export fn sys_fchmodat(u64 dirfd, u8* path, u64 mode, u64 flags) -> u64 {
+    return(syscall4(268, dirfd, path, mode, flags));
+}
+
+export fn sys_faccessat(u64 dirfd, u8* path, u64 mode, u64 flags) -> u64 {
+    return(syscall4(269, dirfd, path, mode, flags));
+}
+
+export fn sys_utimensat(u64 dirfd, u8* path, u8* times, u64 flags) -> u64 {
+    return(syscall4(280, dirfd, path, times, flags));
+}
+
+export fn sys_renameat2(u64 olddirfd, u8* oldpath, u64 newdirfd, u8* newpath, u64 flags) -> u64 {
+    return(syscall5(316, olddirfd, oldpath, newdirfd, newpath, flags));
+}
+
+export fn sys_getrandom(u8* buf, u64 len, u64 flags) -> u64 {
+    return(syscall3(318, buf, len, flags));
+}
+
+export fn sys_copy_file_range(u64 fd_in, u64* off_in, u64 fd_out, u64* off_out, u64 len, u64 flags) -> u64 {
+    return(syscall6(326, fd_in, off_in, fd_out, off_out, len, flags));
+}
+
+export fn sys_pread64(u64 fd, u8* buf, u64 count, u64 offset) -> u64 {
+    return(syscall4(17, fd, buf, count, offset));
+}
+
+export fn sys_pwrite64(u64 fd, u8* buf, u64 count, u64 offset) -> u64 {
+    return(syscall4(18, fd, buf, count, offset));
+}
+
+export fn sys_futimens(u64 fd, u8* times) -> u64 {
+    return(syscall4(280, fd, null, times, 0));
+}
+
+export fn sys_sync() -> u64 {
+    return(syscall0(162));
+}
+
+export fn sys_fsync(u64 fd) -> u64 {
+    return(syscall1(74, fd));
+}
+
+export fn sys_statfs(u8* path, u8* buf) -> u64 {
+    return(syscall2(137, path, buf));
+}
+
+export fn sys_fstatfs(u64 fd, u8* buf) -> u64 {
+    return(syscall2(138, fd, buf));
+}
+
+export fn sys_mknod(u8* pathname, u64 mode, u64 dev) -> u64 {
+    return(syscall3(133, pathname, mode, dev));
+}
+
+export fn sys_mkfifo(u8* pathname, u64 mode) -> u64 {
+    return(sys_mknod(pathname, mode | S_IFIFO, 0));
+}
+
+export fn sys_getpriority(u64 which, u64 who) -> u64 {
+    return(syscall2(140, which, who));
+}
+
+export fn sys_setpriority(u64 which, u64 who, i64 prio) -> u64 {
+    return(syscall3(141, which, who, prio));
 }

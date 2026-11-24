@@ -95,5 +95,123 @@ const F_SETLK = 6;
 const F_SETLKW = 7;
 const F_GETOWN = 9;
 const F_SETOWN = 8;
+const F_DUPFD = 0;
+const F_DUPFD_CLOEXEC = 1030;
 
 const FD_CLOEXEC = 1;
+
+const SEEK_SET = 0;
+const SEEK_CUR = 1;
+const SEEK_END = 2;
+
+const CLOCK_REALTIME = 0;
+const CLOCK_MONOTONIC = 1;
+const CLOCK_PROCESS_CPUTIME_ID = 2;
+const CLOCK_THREAD_CPUTIME_ID = 3;
+const CLOCK_MONOTONIC_RAW = 4;
+const CLOCK_REALTIME_COARSE = 5;
+const CLOCK_MONOTONIC_COARSE = 6;
+const CLOCK_BOOTTIME = 7;
+
+const PROT_NONE = 0;
+const PROT_READ = 1;
+const PROT_WRITE = 2;
+const PROT_EXEC = 4;
+
+const MAP_SHARED = 1;
+const MAP_PRIVATE = 2;
+const MAP_FIXED = 16;
+const MAP_ANONYMOUS = 32;
+const MAP_POPULATE = 32768;
+const MAP_NORESERVE = 16384;
+
+const S_IFMT = 61440;
+const S_IFSOCK = 49152;
+const S_IFLNK = 40960;
+const S_IFREG = 32768;
+const S_IFBLK = 24576;
+const S_IFDIR = 16384;
+const S_IFCHR = 8192;
+const S_IFIFO = 4096;
+const S_ISUID = 2048;
+const S_ISGID = 1024;
+const S_ISVTX = 512;
+const S_IRWXU = 448;
+const S_IRUSR = 256;
+const S_IWUSR = 128;
+const S_IXUSR = 64;
+const S_IRWXG = 56;
+const S_IRGRP = 32;
+const S_IWGRP = 16;
+const S_IXGRP = 8;
+const S_IRWXO = 7;
+const S_IROTH = 4;
+const S_IWOTH = 2;
+const S_IXOTH = 1;
+
+const R_OK = 4;
+const W_OK = 2;
+const X_OK = 1;
+const F_OK = 0;
+
+const AT_FDCWD = 18446744073709551516;
+const AT_SYMLINK_NOFOLLOW = 256;
+const AT_REMOVEDIR = 512;
+const AT_SYMLINK_FOLLOW = 1024;
+const AT_EMPTY_PATH = 4096;
+const AT_NO_AUTOMOUNT = 2048;
+
+const UTIME_NOW = 1073741823;
+const UTIME_OMIT = 1073741822;
+
+const GRND_NONBLOCK = 1;
+const GRND_RANDOM = 2;
+
+const RENAME_NOREPLACE = 1;
+const RENAME_EXCHANGE = 2;
+const RENAME_WHITEOUT = 4;
+
+const EPERM = 1;
+const ENOENT = 2;
+const ESRCH = 3;
+const EINTR = 4;
+const EIO = 5;
+const ENXIO = 6;
+const E2BIG = 7;
+const ENOEXEC = 8;
+const EBADF = 9;
+const ECHILD = 10;
+const EAGAIN = 11;
+const ENOMEM = 12;
+const EACCES = 13;
+const EFAULT = 14;
+const ENOTBLK = 15;
+const EBUSY = 16;
+const EEXIST = 17;
+const EXDEV = 18;
+const ENODEV = 19;
+const ENOTDIR = 20;
+const EISDIR = 21;
+const EINVAL = 22;
+const ENFILE = 23;
+const EMFILE = 24;
+const ENOTTY = 25;
+const ETXTBSY = 26;
+const EFBIG = 27;
+const ENOSPC = 28;
+const ESPIPE = 29;
+const EROFS = 30;
+const EMLINK = 31;
+const EPIPE = 32;
+const EDOM = 33;
+const ERANGE = 34;
+const ENAMETOOLONG = 36;
+const ENOLCK = 37;
+const ENOSYS = 38;
+const ENOTEMPTY = 39;
+const ELOOP = 40;
+const ENODATA = 61;
+const ETIME = 62;
+const EOVERFLOW = 75;
+const ENOTSUP = 95;
+const EOPNOTSUPP = 95;

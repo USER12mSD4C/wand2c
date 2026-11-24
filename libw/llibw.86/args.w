@@ -36,3 +36,19 @@ fn get_arg_value(u64 argc, u64 argv, u8* name) -> u8* {
     }
     return(get_arg(argv, idx + 1));
 }
+
+fn getenv(u64 envp, u8* name) -> u8* {
+    u64 nlen = strlen(name);
+    u64* table = envp;
+    u64 i = 0;
+    while (table[i] != 0) {
+        u8* entry = table[i];
+        if (strncmp(entry, name, nlen) == 0) {
+            if (entry[nlen] == 61) {
+                return(entry + nlen + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return(null);
+}
