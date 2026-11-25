@@ -1,0 +1,16 @@
+# Paste into lib/linguist/languages.yml (alphabetical order, near "Wasm").
+# Note: ".w" is already listed under CWeb and OpenEdge ABL; a heuristics rule is
+# required. ".wh" is currently unclaimed. Do not add language_id: upstream's
+# script/update-ids generates it.
+Wand:
+  type: programming
+  color: "#FFB86C"
+  aliases:
+  - wandc
+  extensions:
+  - ".w"
+  - ".wh"
+  tm_scope: source.c
+  ace_mode: c_cpp
+  codemirror_mode: clike
+  codemirror_mime_type: text/x-csrc
