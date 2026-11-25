@@ -966,6 +966,7 @@ struct Gen {
     Map locals;
     Map local_access;
     Map local_types;
+    Map local_is_param; /* set for function parameters; array-typed params are pointers */
     Map next_offsets; /* not used; kept for symmetry with function state */
     uint32_t next_offset;
 
@@ -1007,6 +1008,7 @@ struct Gen {
 
 /* Forward declarations for mutually recursive helpers. */
 static WStr wstr_pair(WStr a, WStr b);
+static WStr find_global_key(Gen* g, WStr name);
 static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth);
 static void compile_stmt(Gen* g, WStmt* s);
 static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr);
@@ -1361,7 +1363,16 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
             return type_pointer_to(type_u8());
         case 3: { /* Variable */
             uint64_t v;
-            return map_get_str(&g->local_types, e->str, &v) ? AS_PTR(WType, v) : NULL;
+            if (map_get_str(&g->local_types, e->str, &v)) {
+                return AS_PTR(WType, v);
+            }
+            /* Global/section variables are referenced by their bare name;
+             * their type is recorded under "section:variable". */
+            WStr key = find_global_key(g, e->str);
+            if (key.ptr && map_get_str(&g->section_types, key, &v)) {
+                return AS_PTR(WType, v);
+            }
+            return NULL;
         }
         case 7: { /* SectionAccess */
             if (map_has(&g->enums, e->str.ptr, e->str.len)) {
@@ -1661,7 +1672,9 @@ static WStr find_global_key(Gen* g, WStr name) {
         if (wstr_eq(key, name)) {
             return key;
         }
-        if (key.len == name.len + 1 && key.ptr[key.len - name.len - 1] == ':' &&
+        /* Section keys are "section:variable"; the section name can be any
+         * length, so compare only the suffix after the final colon. */
+        if (key.len > name.len && key.ptr[key.len - name.len - 1] == ':' &&
             memcmp(key.ptr + key.len - name.len, name.ptr, name.len) == 0) {
             return key;
         }
@@ -1916,6 +1929,13 @@ static WFunc* func_by_name(Gen* g, WStr name) {
     return &g->prog.funcs[v - 1];
 }
 
+static int is_float_type(WType* t) {
+    while (t && (t->tag == 10 || t->tag == 12 || t->tag == 13)) {
+        t = t->inner;
+    }
+    return t && t->tag == 8;
+}
+
 static int is_float_expr(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -1935,6 +1955,20 @@ static int is_float_expr(Gen* g, WExpr* e) {
         }
         case 8:
             return is_float_expr(g, e->a) || is_float_expr(g, e->b);
+        case 10: { /* Index: classify by the element type of the base object.
+                    * Without this, x[j] - x[i] was compiled as an integer
+                    * subtraction of the raw IEEE-754 bit patterns. */
+            if (e->a && e->a->tag == 3) {
+                uint64_t v;
+                if (map_get_str(&g->local_types, e->a->str, &v)) {
+                    WType* t = AS_PTR(WType, v);
+                    if (t && (t->tag == 10 || t->tag == 12 || t->tag == 13)) {
+                        return is_float_type(t->inner);
+                    }
+                }
+            }
+            return 0;
+        }
         case 9:
             return wstr_eq_c(e->str, "sin") || wstr_eq_c(e->str, "cos") ||
                    wstr_eq_c(e->str, "tan") || wstr_eq_c(e->str, "sqrt");
@@ -2028,12 +2062,20 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                                       ? AS_PTR(WType, type_ptr)
                                       : NULL;
                 uint32_t var_size = type_size(g, var_type);
-                if (var_type && var_type->tag == 12) {
+                uint64_t is_param = 0;
+                map_get_str(&g->local_is_param, e->str, &is_param);
+                if (var_type && var_type->tag == 12 && !is_param) {
                     emit_mem_op(b, 0x8D, reg, (uint32_t)off);
-                } else if ((access == 0 && deref_ptr) || access == 2) {
+                } else if ((access == 0 || access == 2) && deref_ptr) {
+                    /* Input and input/output pointer parameters read through
+                     * the pointer only in value context. In address context
+                     * (deref_ptr=0) they must remain the pointer itself, so
+                     * they can be passed on to another function or indexed. */
                     emit_mem_load(b, reg, (uint32_t)off, 8);
                     uint32_t elem_size =
-                        (var_type && var_type->tag == 10) ? type_size(g, var_type->inner) : var_size;
+                        (var_type && (var_type->tag == 10 || var_type->tag == 12))
+                            ? type_size(g, var_type->inner)
+                            : var_size;
                     uint8_t low = reg & 7;
                     int use_sib = low == 4 || low == 5;
                     uint8_t modrm = use_sib ? (uint8_t)((low == 5 ? 0x40 : 0) | (low << 3) | 0x04)
@@ -2067,7 +2109,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                             break;
                     }
                 } else {
-                    emit_mem_load(b, reg, (uint32_t)off, var_size);
+                    /* Array parameters hold a pointer in the stack slot. */
+                    uint32_t load_size =
+                        (var_type && var_type->tag == 12) ? 8 : var_size;
+                    emit_mem_load(b, reg, (uint32_t)off, load_size);
                 }
             } else {
                 uint64_t expr_ptr;
@@ -2243,7 +2288,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             if (wstr_eq_c(op, "OpCastInt")) {
                 compile_expr(g, e->a, reg, deref_ptr);
                 if (is_float_expr(g, e->a)) {
-                    static const uint8_t seq[] = {0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF3, 0x48, 0x0F, 0x2C, 0xC0};
+                    /* cvttsd2si (F2), not cvttss2si (F3): the source is an
+                     * IEEE-754 double. The old prefix truncated a double as
+                     * if it were a float, producing 0 for ordinary values. */
+                    static const uint8_t seq[] = {0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF2, 0x48, 0x0F, 0x2C, 0xC0};
                     buf_bytes(b, seq, sizeof(seq));
                 }
                 return;
@@ -2503,13 +2551,21 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             uint8_t* is_float = (uint8_t*)arena_alloc(g_arena, argc ? argc : 1);
             size_t* class_pos = (size_t*)arena_alloc(g_arena, (argc ? argc : 1) * sizeof(size_t));
             int int_count = 0, float_count = 0;
+            uint8_t* want_pointer = (uint8_t*)arena_alloc(g_arena, argc ? argc : 1);
             for (size_t i = 0; i < argc; i++) {
                 int f = 0;
+                int p = 0;
                 if (callee && i < callee->param_count) {
-                    WType* pt = callee->params[i].type;
+                    WType* pt = peel_typedefs(callee->params[i].type);
+                    uint8_t access = callee->params[i].access;
                     f = pt && pt->tag == 8;
+                    /* A modifier (*i/*o/*io) makes a pointer parameter even
+                     * when its declared type is a plain scalar. */
+                    p = (access == 0 || access == 1 || access == 2) ||
+                        (pt && (pt->tag == 10 || pt->tag == 12));
                 }
                 is_float[i] = (uint8_t)f;
+                want_pointer[i] = (uint8_t)p;
                 class_pos[i] = (size_t)(f ? float_count : int_count);
                 if (f) float_count++; else int_count++;
             }
@@ -2520,7 +2576,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             size_t reg_arg_count = argc - stack_arg_count;
             g->stack_depth += 8 * argc;
             for (size_t i = 0; i < argc; i++) {
-                compile_expr(g, e->args[i], 0, 1);
+                compile_expr(g, e->args[i], 0, want_pointer[i] ? 0 : 1);
                 buf_u8(b, 0x50);
             }
             static const uint8_t int_regs[6] = {7, 6, 2, 1, 8, 9};
@@ -2804,11 +2860,19 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 if (map_get_str(&g->local_types, e->str, &type_ptr)) {
                     type = AS_PTR(WType, type_ptr);
                 }
+                uint64_t is_param = 0;
+                map_get_str(&g->local_is_param, e->str, &is_param);
                 int is_pointer = type && type->tag == 10;
-                int is_array = type && type->tag == 12;
+                /* An array-typed parameter is really a pointer passed by the
+                 * caller, so its stack slot holds the address, not the array. */
+                int is_array = type && type->tag == 12 && !is_param;
                 if (is_array) {
                     emit_mem_op(b, 0x8D, internal_reg, (uint32_t)off);
-                } else if (access == 0 || access == 1 || access == 2 || is_pointer) {
+                } else if (access == 0 || access == 1 || access == 2 || is_pointer ||
+                           is_param || (type && type->tag == 12)) {
+                    /* Parameters store their incoming value/pointer in the
+                     * stack slot; use it as the base of an index instead of
+                     * the address of the slot itself. */
                     emit_mem_op(b, 0x8B, internal_reg, (uint32_t)off);
                 } else {
                     emit_mem_op(b, 0x8D, internal_reg, (uint32_t)off);
@@ -2833,7 +2897,11 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
             if (base_type && (base_type->tag == 12 || base_type->tag == 10)) {
                 elem_size = type_size(g, base_type->inner);
             }
-            compile_expr(g, e->a, 3, 1);
+            /* The base of an index is an address, not a value: compile it as
+             * an lvalue so pointer parameters (*i/*o/*io) and local pointer
+             * variables stay pointers. compile_expr(..., deref_ptr=1) used to
+             * load the first element here, turning a[j] into a[0][j]. */
+            compile_address(g, e->a, 3);
             buf_u8(b, 0x53);
             compile_expr(g, e->b, 0, 1);
             switch (elem_size) {
@@ -2849,7 +2917,10 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                     buf_u8(b, 0x48); buf_u8(b, 0xC1); buf_u8(b, 0xE0); buf_u8(b, 0x03);
                     break;
                 default:
-                    buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x69); buf_u8(b, 0xC0);
+                    /* imul rax, rax, imm32 is REX.W 69 C0 imm32; the old
+                     * 0F 69 prefix decoded as punpckhwd and corrupted the
+                     * instruction stream for struct arrays. */
+                    buf_u8(b, 0x48); buf_u8(b, 0x69); buf_u8(b, 0xC0);
                     buf_u32(b, elem_size);
                     break;
             }
@@ -3701,7 +3772,8 @@ static void compile_function(Gen* g, WFunc* f) {
     g->locals.slots = NULL;
     g->local_access.slots = NULL;
     g->local_types.slots = NULL;
-    g->locals.len = g->local_access.len = g->local_types.len = 0;
+    g->local_is_param.slots = NULL;
+    g->locals.len = g->local_access.len = g->local_types.len = g->local_is_param.len = 0;
     g->next_offset = 16;
     g->current_is_irq = f->is_irq;
     g->stack_depth = 0;
@@ -3738,6 +3810,7 @@ static void compile_function(Gen* g, WFunc* f) {
 
         map_put_str(&g->locals, p->name, off);
         map_put_str(&g->local_access, p->name, p->access);
+        map_put_str(&g->local_is_param, p->name, 1);
 
         WType* actual = p->type;
         if (is_ptr_modifier && (!actual || actual->tag != 10)) {
@@ -3928,6 +4001,7 @@ WandCompileResult wand_x86_compile_program(
     map_init(&g->locals, 32);
     map_init(&g->local_access, 32);
     map_init(&g->local_types, 32);
+    map_init(&g->local_is_param, 32);
     g->format = format;
     g->entry_name = wstr_make(entry_name ? (const void*)entry_name : (const void*)"", entry_name ? entry_len : 0);
 
