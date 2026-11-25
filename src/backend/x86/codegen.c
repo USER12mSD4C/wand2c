@@ -1761,23 +1761,14 @@ static int emit_float_op_xmm1(Buf* b, WStr op) {
     return 1;
 }
 
-/* True if evaluating e may issue a call, which is allowed to clobber xmm1. */
-static int expr_has_call(WExpr* e) {
+/* The xmm1 scratch must survive evaluation of the RHS. A nested binary
+ * expression may itself use xmm1 for its own float op, so only leaf-like
+ * operands are safe here. */
+static int float_rhs_safe(WExpr* e) {
     if (!e) {
-        return 0;
-    }
-    if (e->tag == 9) {
         return 1;
     }
-    if (expr_has_call(e->a) || expr_has_call(e->b)) {
-        return 1;
-    }
-    for (size_t i = 0; i < e->arg_count; i++) {
-        if (expr_has_call(e->args[i])) {
-            return 1;
-        }
-    }
-    return 0;
+    return e->tag != 8 && e->tag != 9;
 }
 
 /* Start a float op with the LHS bit pattern already in rax: stash it in xmm1
@@ -2456,7 +2447,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
-            if (float_op && !expr_has_call(e->b) && emit_float_op_xmm1(NULL, op)) {
+            if (float_op && float_rhs_safe(e->b) && emit_float_op_xmm1(NULL, op)) {
                 /* General case: stash LHS in xmm1, evaluate RHS into rax.
                  * Avoids push/pop and the rbx mov; safe because no call can
                  * clobber the stashed xmm1. */
