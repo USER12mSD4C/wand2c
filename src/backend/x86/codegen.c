@@ -1761,6 +1761,53 @@ static int emit_float_op_xmm1(Buf* b, WStr op) {
     return 1;
 }
 
+/* True if evaluating e may issue a call, which is allowed to clobber xmm1. */
+static int expr_has_call(WExpr* e) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 9) {
+        return 1;
+    }
+    if (expr_has_call(e->a) || expr_has_call(e->b)) {
+        return 1;
+    }
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_has_call(e->args[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Start a float op with the LHS bit pattern already in rax: stash it in xmm1
+ * so the RHS can be evaluated without a push/pop shuffle. The caller must
+ * emit the RHS into rax, then call emit_float_op_after_rhs(). */
+static void emit_float_op_stash_lhs(Buf* b) {
+    /* movq %rax,%xmm1 */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC8);
+}
+
+/* Finish a float op whose LHS is in xmm1 and RHS bit pattern is in rax. */
+static void emit_float_op_after_rhs(Buf* b, WStr op) {
+    uint8_t code;
+    if (wstr_eq_c(op, "OpAdd")) code = 0x58;
+    else if (wstr_eq_c(op, "OpSub")) code = 0x5C;
+    else if (wstr_eq_c(op, "OpMul")) code = 0x59;
+    else code = 0x5E; /* OpDiv */
+    /* movq %rax,%xmm0 */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC0);
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
+    if (code == 0x5C || code == 0x5E) {
+        /* Non-commutative: xmm1 (LHS) op xmm0 (RHS) */
+        buf_u8(b, 0xC8);
+        buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC8);
+    } else {
+        buf_u8(b, 0xC1);
+        buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
+    }
+}
+
 static int has_binary_imm(WStr op) {
     return wstr_eq_c(op, "OpAdd") || wstr_eq_c(op, "OpSub") ||
            wstr_eq_c(op, "OpBitAnd") || wstr_eq_c(op, "OpBitOr") ||
@@ -2400,6 +2447,26 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            if (float_op && simple_left(g, e->a) && emit_float_op_xmm1(NULL, op)) {
+                /* Same shuffle removal as the integer path: evaluate the RHS
+                 * straight into rbx, then the simple LHS into rax. */
+                compile_expr(g, e->b, 3, 0);
+                compile_expr(g, e->a, 0, 0);
+                emit_float_op_xmm1(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
+            if (float_op && !expr_has_call(e->b) && emit_float_op_xmm1(NULL, op)) {
+                /* General case: stash LHS in xmm1, evaluate RHS into rax.
+                 * Avoids push/pop and the rbx mov; safe because no call can
+                 * clobber the stashed xmm1. */
+                compile_expr(g, e->a, 0, 0);
+                emit_float_op_stash_lhs(b);
+                compile_expr(g, e->b, 0, 0);
+                emit_float_op_after_rhs(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
             if (!float_op && e->b && (e->b->tag == 0 || e->b->tag == 1)) {
                 uint64_t uv = e->b->num;
                 int64_t sv = (int64_t)uv;
@@ -2907,8 +2974,8 @@ static int simple_left(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
     }
-    if (e->tag == 0 || e->tag == 1) {
-        return 1;
+    if (e->tag == 0 || e->tag == 1 || e->tag == 11) {
+        return 1; /* integer/float literal: never clobbers rbx */
     }
     if (e->tag == 3) {
         uint64_t access = 3;
