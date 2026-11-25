@@ -1,0 +1,21 @@
+# Current github-linguist format. Replace the existing `extensions: ['.w']`
+# block in lib/linguist/heuristics.yml with this, keeping the list alphabetical.
+# Run `script/check-regex-compatibility lib/linguist/heuristics.yml` upstream.
+#
+# Rules are evaluated in order. `sc.true` / `sc.false` is mandatory on line one
+# of every Wand file, so it is the strongest signal; the import + `fn main(`
+# pair covers files with a leading comment. CWeb uses `@` directives and ABL
+# uses `DEFINE ... .` blocks, so neither matches these patterns.
+- extensions: ['.w', '.wh']
+  rules:
+  - language: Wand
+    pattern: '\A[ \t\r\n]*sc\.(?:true|false)\b'
+  - language: Wand
+    and:
+    - pattern: '^[ \t]*#import[ \t]+[<"]'
+    - pattern: '^[ \t]*(?:export[ \t]+)?fn[ \t]+main\s*\('
+  # Existing upstream rules, retained as fallbacks for the shared ".w" suffix.
+  - language: OpenEdge ABL
+    pattern: '&ANALYZE-SUSPEND _UIB-CODE-BLOCK _CUSTOM _DEFINITIONS'
+  - language: CWeb
+    pattern: '^@(<|\w+\.)'

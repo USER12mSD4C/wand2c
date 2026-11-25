@@ -1,0 +1,34 @@
+# Legacy Ruby form of the Wand disambiguation heuristic (kept for the task brief).
+# Modern github-linguist reads lib/linguist/heuristics.yml instead; use
+# heuristics.yml.snippet for a real upstream PR.
+#
+# Paste this method into Linguist::Heuristics and call it from
+# find_by_heuristics when languages include Wand, CWeb and OpenEdge ABL.
+#
+# Why this is safe: Wand files start with the environment token `sc.true` or
+# `sc.false`, and their imports use `#import <name>` / `#import "name"` followed
+# by C-like `fn main(` definitions. CWeb files are built from `@` directives,
+# and OpenEdge ABL uses `DEFINE`/`END.` blocks and `:` statement endings; neither
+# uses `sc.true`/`sc.false` or `fn main(`. Requiring the distinctive token (or
+# the import + entry-function pair) avoids claiming ABL/CWeb files that merely
+# happen to contain a `main` identifier.
+#
+# `data` is the first 50 KiB of the blob (Linguist passes this to heuristics).
+
+def self.disambiguate_w(data, languages)
+  matches = []
+
+  # Every valid Wand file starts with exactly one environment token.
+  matches << Language["Wand"] if /\A[ \t\r\n]*sc\.(?:true|false)\b/.match(data)
+
+  # Fallback for a file whose first line is a comment or blank: an import plus
+  # a Wand-style entry function. `fn` (rather than C's `int main(`) is the
+  # discriminator.
+  if matches.empty? &&
+     /^[ \t]*#import[ \t]+[<"]/.match(data) &&
+     /^[ \t]*(?:export[ \t]+)?fn[ \t]+main\s*\(/.match(data)
+    matches << Language["Wand"]
+  end
+
+  matches
+end
