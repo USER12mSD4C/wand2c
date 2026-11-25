@@ -1014,6 +1014,7 @@ static void compile_stmt(Gen* g, WStmt* s);
 static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr);
 static void compile_address(Gen* g, WExpr* e, uint8_t reg);
 static void compile_bool_expr(Gen* g, WExpr* e);
+static int simple_left(Gen* g, WExpr* e);
 
 /* ------------------------------------------------------------------ */
 /* Emitters                                                            */
@@ -1690,6 +1691,61 @@ static void add_global_offset(Gen* g, WStr key, uint32_t offset) {
     map_put_str(&g->global_offsets, key, offset);
 }
 
+/* Emit <op> rax, imm when the operator has an immediate form.  The generic
+ * binary path saves rax on the stack, evaluates the RHS, moves it to rbx and
+ * pops rax back.  For the very common "variable op small constant" case that
+ * is 6 wasted instructions plus a memory round-trip per evaluation.  Returns
+ * 0 when the operator has no immediate encoding so the caller can fall back. */
+static int emit_binary_imm(Buf* b, WStr op, int64_t imm) {
+    uint8_t group;
+    if (wstr_eq_c(op, "OpAdd")) group = 0;
+    else if (wstr_eq_c(op, "OpSub")) group = 5;
+    else if (wstr_eq_c(op, "OpBitAnd")) group = 4;
+    else if (wstr_eq_c(op, "OpBitOr")) group = 1;
+    else if (wstr_eq_c(op, "OpBitXor")) group = 6;
+    else if (wstr_eq_c(op, "OpMul")) {
+        if (imm >= -128 && imm <= 127) {
+            buf_u8(b, 0x48); buf_u8(b, 0x6B); buf_u8(b, 0xC0); buf_u8(b, (uint8_t)imm);
+        } else {
+            buf_u8(b, 0x48); buf_u8(b, 0x69); buf_u8(b, 0xC0); buf_u32(b, (uint32_t)imm);
+        }
+        return 1;
+    } else {
+        return 0;
+    }
+    if (imm >= -128 && imm <= 127) {
+        buf_u8(b, 0x48); buf_u8(b, 0x83);
+        buf_u8(b, (uint8_t)(0xC0 | (group << 3)));
+        buf_u8(b, (uint8_t)imm);
+    } else {
+        buf_u8(b, 0x48); buf_u8(b, 0x81);
+        buf_u8(b, (uint8_t)(0xC0 | (group << 3)));
+        buf_u32(b, (uint32_t)imm);
+    }
+    return 1;
+}
+
+static int has_binary_imm(WStr op) {
+    return wstr_eq_c(op, "OpAdd") || wstr_eq_c(op, "OpSub") ||
+           wstr_eq_c(op, "OpBitAnd") || wstr_eq_c(op, "OpBitOr") ||
+           wstr_eq_c(op, "OpBitXor") || wstr_eq_c(op, "OpMul");
+}
+
+/* rax = rax <op> rbx for the operators with an immediate-capable form. */
+static void emit_binary_rbx(Buf* b, WStr op) {
+    uint8_t opcode;
+    if (wstr_eq_c(op, "OpAdd")) opcode = 0x01;
+    else if (wstr_eq_c(op, "OpSub")) opcode = 0x29;
+    else if (wstr_eq_c(op, "OpBitAnd")) opcode = 0x21;
+    else if (wstr_eq_c(op, "OpBitOr")) opcode = 0x09;
+    else if (wstr_eq_c(op, "OpBitXor")) opcode = 0x31;
+    else { /* OpMul */
+        buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xAF); buf_u8(b, 0xC3);
+        return;
+    }
+    buf_u8(b, 0x48); buf_u8(b, opcode); buf_u8(b, 0xD8); /* rax op rbx */
+}
+
 /* The old generator sanitized module names for jmpto-local lookups.  New
  * locals were always inserted under their unsanitized names, but preserve the
  * lookup for source code that happens to declare a matching local. */
@@ -2306,12 +2362,49 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
+            int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            if (!float_op && e->b && (e->b->tag == 0 || e->b->tag == 1)) {
+                uint64_t uv = e->b->num;
+                int64_t sv = (int64_t)uv;
+                if ((wstr_eq_c(op, "OpShl") || wstr_eq_c(op, "OpShr")) &&
+                    uv >= 1 && uv <= 63) {
+                    uint8_t group = wstr_eq_c(op, "OpShl") ? 4
+                                  : (is_signed_expr(g, e->a) ? 7 : 5);
+                    compile_expr(g, e->a, 0, 0);
+                    buf_u8(b, 0x48); buf_u8(b, 0xC1);
+                    buf_u8(b, (uint8_t)(0xC0 | (group << 3)));
+                    buf_u8(b, (uint8_t)uv);
+                    if (reg != 0) move_rax_to_reg(b, reg);
+                    return;
+                }
+                if (has_binary_imm(op)) {
+                    compile_expr(g, e->a, 0, 0);
+                    if (sv >= INT32_MIN && sv <= INT32_MAX) {
+                        emit_binary_imm(b, op, sv);
+                    } else {
+                        /* Large 64-bit constant: load straight into rbx
+                         * instead of push/pop round-tripping rax. */
+                        buf_u8(b, 0x48); buf_u8(b, 0xBB); buf_u64(b, uv);
+                        emit_binary_rbx(b, op);
+                    }
+                    if (reg != 0) move_rax_to_reg(b, reg);
+                    return;
+                }
+            }
+            if (!float_op && simple_left(g, e->a) && has_binary_imm(op)) {
+                /* Compile the RHS into rbx first; the simple LHS cannot
+                 * clobber it, so no push/pop is needed. */
+                compile_expr(g, e->b, 3, 0);
+                compile_expr(g, e->a, 0, 0);
+                emit_binary_rbx(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
             compile_expr(g, e->a, 0, 0);
             buf_u8(b, 0x50);
             compile_expr(g, e->b, 0, 0);
             buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
             buf_u8(b, 0x58);
-            int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
             if (wstr_eq_c(op, "OpAdd")) {
                 if (float_op) {
                     static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,0x66,0x48,0x0F,0x6E,0xCB,
@@ -2717,28 +2810,116 @@ static int has_return_statement(WStmt** stmts, size_t count) {
     return 0;
 }
 
-static void emit_cmp_rax_imm(Gen* g, uint64_t val) {
-    Buf* b = &g->code;
-    if (val <= 0x7FFFFFFFu) {
-        buf_u8(b, 0x48);
-        buf_u8(b, 0x3D);
-        buf_u32(b, (uint32_t)val);
+/* cmp rax, imm with the shortest encoding.  Used for the common loop case
+ * "i < constant" instead of mov/push/mov/mov/pop/cmp. */
+static void emit_cmp_rax_imm(Buf* b, int64_t imm) {
+    if (imm >= -128 && imm <= 127) {
+        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xF8); buf_u8(b, (uint8_t)imm);
     } else {
-        buf_u8(b, 0x48);
-        buf_u8(b, 0xBB);
-        buf_u64(b, val);
-        buf_u8(b, 0x48);
-        buf_u8(b, 0x39);
-        buf_u8(b, 0xD8);
+        buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xF8); buf_u32(b, (uint32_t)imm);
     }
 }
 
-static uint8_t compile_condition_helper(Gen* g, WExpr* cond) {
-    compile_bool_expr(g, cond);
-    buf_u8(&g->code, 0x48);
-    buf_u8(&g->code, 0x85);
-    buf_u8(&g->code, 0xC0);
-    return 0x84;
+/* Return 1 if e is a comparison; *setcc receives the setcc opcode. Shared by
+ * the boolean-materialization path and the direct-branch path so the two can
+ * never disagree on signedness or polarity. */
+static int comparison_setcc(Gen* g, WExpr* e, uint8_t* setcc) {
+    if (!e || e->tag != 8) {
+        return 0;
+    }
+    WStr op = e->str;
+    static const char* cmps[] = {
+        "OpEq", "OpEqEq", "==", "OpNotEq", "OpNe", "!=",
+        "OpLt", "Lt", "<", "OpLtEq", "OpLe", "<=",
+        "OpGt", "Gt", ">", "OpGtEq", "OpGe", ">="
+    };
+    int is_cmp = 0;
+    for (size_t i = 0; i < sizeof(cmps) / sizeof(cmps[0]); i++) {
+        if (wstr_eq_c(op, cmps[i])) { is_cmp = 1; break; }
+    }
+    if (!is_cmp) {
+        return 0;
+    }
+    int signed_cmp = is_signed_expr(g, e->a) || is_signed_expr(g, e->b);
+    if (wstr_eq_c(op, "OpEq") || wstr_eq_c(op, "OpEqEq") || wstr_eq_c(op, "==")) {
+        *setcc = 0x94;
+    } else if (wstr_eq_c(op, "OpNotEq") || wstr_eq_c(op, "OpNe") || wstr_eq_c(op, "!=")) {
+        *setcc = 0x95;
+    } else if (wstr_eq_c(op, "OpLt") || wstr_eq_c(op, "Lt") || wstr_eq_c(op, "<")) {
+        *setcc = signed_cmp ? 0x9C : 0x92;
+    } else if (wstr_eq_c(op, "OpLtEq") || wstr_eq_c(op, "OpLe") || wstr_eq_c(op, "<=")) {
+        *setcc = signed_cmp ? 0x9E : 0x96;
+    } else if (wstr_eq_c(op, "OpGt") || wstr_eq_c(op, "Gt") || wstr_eq_c(op, ">")) {
+        *setcc = signed_cmp ? 0x9F : 0x97;
+    } else {
+        *setcc = signed_cmp ? 0x9D : 0x93;
+    }
+    return 1;
+}
+
+/* Emit operands and cmp for a comparison expression, leaving flags set. */
+static void emit_cmp_operands(Gen* g, WExpr* e) {
+    Buf* b = &g->code;
+    if (e->b && (e->b->tag == 0 || e->b->tag == 1) &&
+        !is_float_expr(g, e->a)) {
+        int64_t sv = (int64_t)e->b->num;
+        compile_expr(g, e->a, 0, 1);
+        if (sv >= INT32_MIN && sv <= INT32_MAX) {
+            emit_cmp_rax_imm(b, sv);
+        } else {
+            buf_u8(b, 0x48); buf_u8(b, 0xBB); buf_u64(b, e->b->num);
+            buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
+        }
+    } else if (simple_left(g, e->a)) {
+        compile_expr(g, e->b, 3, 1);
+        compile_expr(g, e->a, 0, 1);
+        buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
+    } else {
+        compile_expr(g, e->a, 0, 1);
+        buf_u8(b, 0x50);
+        compile_expr(g, e->b, 0, 1);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
+        buf_u8(b, 0x58);
+        buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
+    }
+}
+
+/* True when e can be compiled into rax without touching rbx.  Lets the caller
+ * evaluate the RHS into rbx first, removing the push/pop stack shuffle. */
+static int simple_left(Gen* g, WExpr* e) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 0 || e->tag == 1) {
+        return 1;
+    }
+    if (e->tag == 3) {
+        uint64_t access = 3;
+        map_get_str(&g->local_access, e->str, &access);
+        return access == 3; /* plain stack slot; pointer locals load via rbx */
+    }
+    return 0;
+}
+
+/* Emit a conditional jump over the body when cond is false.  Returns the
+ * offset of the 4-byte displacement, which the caller patches.  A plain
+ * comparison branches straight off cmp flags: no setcc/movzbq/test. */
+static size_t compile_condition_jump(Gen* g, WExpr* cond) {
+    Buf* b = &g->code;
+    uint8_t setcc;
+    uint8_t jump_op = 0x84; /* jz */
+    if (comparison_setcc(g, cond, &setcc)) {
+        emit_cmp_operands(g, cond);
+        /* setcc = 0x90 + cc; the inverse jcc is 0x80 + (cc ^ 1). */
+        jump_op = (uint8_t)(0x80 + ((setcc - 0x90) ^ 1));
+    } else {
+        compile_bool_expr(g, cond);
+        buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0);
+    }
+    buf_u8(b, 0x0F); buf_u8(b, jump_op);
+    size_t patch = b->len;
+    buf_u32(b, 0);
+    return patch;
 }
 
 static void compile_bool_expr(Gen* g, WExpr* e) {
@@ -2791,44 +2972,9 @@ static void compile_bool_expr(Gen* g, WExpr* e) {
             return;
         }
 
-        WStr cmp_ops[] = {
-            wstr_lit("OpEq"), wstr_lit("OpEqEq"), wstr_lit("=="),
-            wstr_lit("OpNotEq"), wstr_lit("OpNe"), wstr_lit("!="),
-            wstr_lit("OpLt"), wstr_lit("Lt"), wstr_lit("<"),
-            wstr_lit("OpLtEq"), wstr_lit("OpLe"), wstr_lit("<="),
-            wstr_lit("OpGt"), wstr_lit("Gt"), wstr_lit(">"),
-            wstr_lit("OpGtEq"), wstr_lit("OpGe"), wstr_lit(">="),
-        };
-        int is_cmp = 0;
-        for (size_t i = 0; i < sizeof(cmp_ops) / sizeof(cmp_ops[0]); i++) {
-            if (wstr_eq(op, cmp_ops[i])) {
-                is_cmp = 1;
-                break;
-            }
-        }
-        if (is_cmp) {
-            compile_expr(g, e->a, 0, 1);
-            buf_u8(b, 0x50);
-            compile_expr(g, e->b, 0, 1);
-            buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
-            buf_u8(b, 0x58);
-            buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
-
-            int signed_cmp = is_signed_expr(g, e->a) || is_signed_expr(g, e->b);
-            uint8_t setcc;
-            if (wstr_eq_c(op, "OpEq") || wstr_eq_c(op, "OpEqEq") || wstr_eq_c(op, "==")) {
-                setcc = 0x94;
-            } else if (wstr_eq_c(op, "OpNotEq") || wstr_eq_c(op, "OpNe") || wstr_eq_c(op, "!=")) {
-                setcc = 0x95;
-            } else if (wstr_eq_c(op, "OpLt") || wstr_eq_c(op, "Lt") || wstr_eq_c(op, "<")) {
-                setcc = signed_cmp ? 0x9C : 0x92;
-            } else if (wstr_eq_c(op, "OpLtEq") || wstr_eq_c(op, "OpLe") || wstr_eq_c(op, "<=")) {
-                setcc = signed_cmp ? 0x9E : 0x96;
-            } else if (wstr_eq_c(op, "OpGt") || wstr_eq_c(op, "Gt") || wstr_eq_c(op, ">")) {
-                setcc = signed_cmp ? 0x9F : 0x97;
-            } else {
-                setcc = signed_cmp ? 0x9D : 0x93;
-            }
+        uint8_t setcc;
+        if (comparison_setcc(g, e, &setcc)) {
+            emit_cmp_operands(g, e);
             buf_u8(b, 0x0F); buf_u8(b, setcc); buf_u8(b, 0xC0);
             buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0);
             return;
@@ -3292,10 +3438,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             break;
         }
         case 2: { /* If */
-            uint8_t jump_op = compile_condition_helper(g, s->e1);
-            buf_u8(b, 0x0F); buf_u8(b, jump_op);
-            size_t false_patch = b->len;
-            buf_u32(b, 0);
+            size_t false_patch = compile_condition_jump(g, s->e1);
             for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
             if (s->flag) {
                 buf_u8(b, 0xE9);
@@ -3314,10 +3457,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
             LoopCtxVec_push(&g->loop_stack, ctx);
-            uint8_t jump_op = compile_condition_helper(g, s->e1);
-            buf_u8(b, 0x0F); buf_u8(b, jump_op);
-            size_t exit_patch = b->len;
-            buf_u32(b, 0);
+            size_t exit_patch = compile_condition_jump(g, s->e1);
             for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
             ctx = g->loop_stack.v[g->loop_stack.n - 1];
             g->loop_stack.n--;
@@ -3339,10 +3479,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
             LoopCtxVec_push(&g->loop_stack, ctx);
-            uint8_t jump_op = compile_condition_helper(g, s->e1);
-            buf_u8(b, 0x0F); buf_u8(b, jump_op);
-            size_t exit_patch = b->len;
-            buf_u32(b, 0);
+            size_t exit_patch = compile_condition_jump(g, s->e1);
             for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
             size_t post_pos = b->len;
             if (s->s2) compile_stmt(g, s->s2);
