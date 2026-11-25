@@ -1220,6 +1220,21 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
     AddrPatchVec_push(&g->address_patches, p);
 }
 
+/* movsd xmm<N>, [rip+key] — loads a float constant in one instruction
+ * instead of lea/movsd/movq through rax. */
+static void emit_rip_relative_movsd(Gen* g, uint8_t xmm, WStr key) {
+    Buf* b = &g->code;
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+    buf_u8(b, (uint8_t)(0x05 | ((xmm & 7) << 3)));
+    size_t pos = b->len;
+    buf_u32(b, 0);
+    AddrPatch p;
+    p.pos = pos;
+    p.key = key;
+    p.is_rip = 1;
+    AddrPatchVec_push(&g->address_patches, p);
+}
+
 static void emit_function_epilogue(Gen* g) {
     Buf* b = &g->code;
     if (g->current_is_irq) {
@@ -1725,6 +1740,65 @@ static int emit_binary_imm(Buf* b, WStr op, int64_t imm) {
     return 1;
 }
 
+/* xmm0 = xmm0 <float op> xmm1 for the four ops with float sequences. */
+static int emit_float_op_xmm1(Buf* b, WStr op) {
+    uint8_t code;
+    if (wstr_eq_c(op, "OpAdd")) code = 0x58;
+    else if (wstr_eq_c(op, "OpSub")) code = 0x5C;
+    else if (wstr_eq_c(op, "OpMul")) code = 0x59;
+    else if (wstr_eq_c(op, "OpDiv")) code = 0x5E;
+    else return 0;
+    if (b) {
+        /* movq %rax,%xmm0 ; movq %rbx,%xmm1 ; <op>sd %xmm1,%xmm0 ;
+         * movq %xmm0,%rax */
+        static const uint8_t head[] = {0x66,0x48,0x0F,0x6E,0xC0,
+                                       0x66,0x48,0x0F,0x6E,0xCB};
+        static const uint8_t tail[] = {0x66,0x48,0x0F,0x7E,0xC0};
+        buf_bytes(b, head, sizeof(head));
+        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code); buf_u8(b, 0xC1);
+        buf_bytes(b, tail, sizeof(tail));
+    }
+    return 1;
+}
+
+/* The xmm1 scratch must survive evaluation of the RHS. A nested binary
+ * expression may itself use xmm1 for its own float op, so only leaf-like
+ * operands are safe here. */
+static int float_rhs_safe(WExpr* e) {
+    if (!e) {
+        return 1;
+    }
+    return e->tag != 8 && e->tag != 9;
+}
+
+/* Start a float op with the LHS bit pattern already in rax: stash it in xmm1
+ * so the RHS can be evaluated without a push/pop shuffle. The caller must
+ * emit the RHS into rax, then call emit_float_op_after_rhs(). */
+static void emit_float_op_stash_lhs(Buf* b) {
+    /* movq %rax,%xmm1 */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC8);
+}
+
+/* Finish a float op whose LHS is in xmm1 and RHS bit pattern is in rax. */
+static void emit_float_op_after_rhs(Buf* b, WStr op) {
+    uint8_t code;
+    if (wstr_eq_c(op, "OpAdd")) code = 0x58;
+    else if (wstr_eq_c(op, "OpSub")) code = 0x5C;
+    else if (wstr_eq_c(op, "OpMul")) code = 0x59;
+    else code = 0x5E; /* OpDiv */
+    /* movq %rax,%xmm0 */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC0);
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
+    if (code == 0x5C || code == 0x5E) {
+        /* Non-commutative: xmm1 (LHS) op xmm0 (RHS) */
+        buf_u8(b, 0xC8);
+        buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC8);
+    } else {
+        buf_u8(b, 0xC1);
+        buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
+    }
+}
+
 static int has_binary_imm(WStr op) {
     return wstr_eq_c(op, "OpAdd") || wstr_eq_c(op, "OpSub") ||
            wstr_eq_c(op, "OpBitAnd") || wstr_eq_c(op, "OpBitOr") ||
@@ -2102,8 +2176,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
         }
         case 11: {
             WStr key = wstr_prefix("float:", e->str);
-            emit_rip_relative_lea(g, 0, key);
-            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10); buf_u8(b, 0x00);
+            /* movsd float:key(%rip),%xmm0 ; movq %xmm0,%rax — one fewer
+             * instruction than lea/movsd/movq through rax. */
+            emit_rip_relative_movsd(g, 0, key);
             buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
             move_rax_to_reg(b, reg);
             break;
@@ -2363,6 +2438,26 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            if (float_op && simple_left(g, e->a) && emit_float_op_xmm1(NULL, op)) {
+                /* Same shuffle removal as the integer path: evaluate the RHS
+                 * straight into rbx, then the simple LHS into rax. */
+                compile_expr(g, e->b, 3, 0);
+                compile_expr(g, e->a, 0, 0);
+                emit_float_op_xmm1(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
+            if (float_op && float_rhs_safe(e->b) && emit_float_op_xmm1(NULL, op)) {
+                /* General case: stash LHS in xmm1, evaluate RHS into rax.
+                 * Avoids push/pop and the rbx mov; safe because no call can
+                 * clobber the stashed xmm1. */
+                compile_expr(g, e->a, 0, 0);
+                emit_float_op_stash_lhs(b);
+                compile_expr(g, e->b, 0, 0);
+                emit_float_op_after_rhs(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
             if (!float_op && e->b && (e->b->tag == 0 || e->b->tag == 1)) {
                 uint64_t uv = e->b->num;
                 int64_t sv = (int64_t)uv;
@@ -2405,36 +2500,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             compile_expr(g, e->b, 0, 0);
             buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
             buf_u8(b, 0x58);
-            if (wstr_eq_c(op, "OpAdd")) {
-                if (float_op) {
-                    static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,0x66,0x48,0x0F,0x6E,0xCB,
-                                                 0xF2,0x0F,0x58,0xC1,0x66,0x48,0x0F,0x7E,0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
-                } else {
-                    buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xD8);
-                }
+            if (float_op && emit_float_op_xmm1(b, op)) {
+                /* Already emitted the float op via xmm registers. */
+            } else if (wstr_eq_c(op, "OpAdd")) {
+                buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xD8);
             } else if (wstr_eq_c(op, "OpSub")) {
-                if (float_op) {
-                    static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,0x66,0x48,0x0F,0x6E,0xCB,
-                                                 0xF2,0x0F,0x5C,0xC1,0x66,0x48,0x0F,0x7E,0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
-                } else {
-                    buf_u8(b, 0x48); buf_u8(b, 0x29); buf_u8(b, 0xD8);
-                }
+                buf_u8(b, 0x48); buf_u8(b, 0x29); buf_u8(b, 0xD8);
             } else if (wstr_eq_c(op, "OpMul")) {
-                if (float_op) {
-                    static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,0x66,0x48,0x0F,0x6E,0xCB,
-                                                 0xF2,0x0F,0x59,0xC1,0x66,0x48,0x0F,0x7E,0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
-                } else {
-                    buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xAF); buf_u8(b, 0xC3);
-                }
+                buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xAF); buf_u8(b, 0xC3);
             } else if (wstr_eq_c(op, "OpDiv")) {
-                if (float_op) {
-                    static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,0x66,0x48,0x0F,0x6E,0xCB,
-                                                 0xF2,0x0F,0x5E,0xC1,0x66,0x48,0x0F,0x7E,0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
-                } else if (is_signed_expr(g, e->a) || is_signed_expr(g, e->b)) {
+                if (is_signed_expr(g, e->a) || is_signed_expr(g, e->b)) {
                     buf_u8(b, 0x48); buf_u8(b, 0x99); buf_u8(b, 0x48); buf_u8(b, 0xF7); buf_u8(b, 0xFB);
                 } else {
                     buf_u8(b, 0x48); buf_u8(b, 0x31); buf_u8(b, 0xD2); buf_u8(b, 0x48); buf_u8(b, 0xF7); buf_u8(b, 0xF3);
@@ -2890,8 +2965,8 @@ static int simple_left(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
     }
-    if (e->tag == 0 || e->tag == 1) {
-        return 1;
+    if (e->tag == 0 || e->tag == 1 || e->tag == 11) {
+        return 1; /* integer/float literal: never clobbers rbx */
     }
     if (e->tag == 3) {
         uint64_t access = 3;
