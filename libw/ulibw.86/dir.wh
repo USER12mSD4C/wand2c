@@ -1,0 +1,17 @@
+sc.true
+
+#import <syscall_structs>
+
+struct Dir {
+    i64 fd;
+}
+
+struct Dirent {
+    u64 ino;
+    u8 type;
+    u8 name[256];
+}
+
+extern fn dir_open(u8* path) -> i64;
+extern fn dir_close(i64 fd) -> i64;
+extern fn dir_read(i64 fd, Dirent* out) -> i64;

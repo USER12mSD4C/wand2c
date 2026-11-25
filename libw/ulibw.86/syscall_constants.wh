@@ -1,0 +1,178 @@
+sc.true
+
+// File open flags - UTMS7 values (Linux-compatible subset) 
+const O_RDONLY = 0;
+const O_WRONLY = 1;
+const O_RDWR = 2;
+const O_CREAT = 64;
+const O_EXCL = 128;
+const O_NOCTTY = 256;
+const O_TRUNC = 512;
+const O_APPEND = 1024;
+const O_NONBLOCK = 2048;
+const O_DIRECTORY = 65536;
+const O_NOFOLLOW = 131072;
+const O_CLOEXEC = 524288;
+
+// Seek 
+const SEEK_SET = 0;
+const SEEK_CUR = 1;
+const SEEK_END = 2;
+
+// stat mode bits 
+const S_IFMT = 61440;
+const S_IFSOCK = 49152;
+const S_IFLNK = 40960;
+const S_IFREG = 32768;
+const S_IFBLK = 24576;
+const S_IFDIR = 16384;
+const S_IFCHR = 8192;
+const S_IFIFO = 4096;
+const S_IRWXU = 448;
+const S_IRUSR = 256;
+const S_IWUSR = 128;
+const S_IXUSR = 64;
+const S_IRWXG = 56;
+const S_IRGRP = 32;
+const S_IWGRP = 16;
+const S_IXGRP = 8;
+const S_IRWXO = 7;
+const S_IROTH = 4;
+const S_IWOTH = 2;
+const S_IXOTH = 1;
+
+// d_type 
+const DT_UNKNOWN = 0;
+const DT_FIFO = 1;
+const DT_CHR = 2;
+const DT_DIR = 4;
+const DT_BLK = 6;
+const DT_REG = 8;
+const DT_LNK = 10;
+const DT_SOCK = 12;
+
+// Signals - common Linux numbers, UTMS7 has basic support 
+const SIGHUP = 1;
+const SIGINT = 2;
+const SIGQUIT = 3;
+const SIGKILL = 9;
+const SIGPIPE = 13;
+const SIGTERM = 15;
+const SIGCHLD = 17;
+const SIGCONT = 18;
+const SIGSTOP = 19;
+
+// wait4 options 
+const WNOHANG = 1;
+const WUNTRACED = 2;
+const WCONTINUED = 8;
+
+// fcntl 
+const F_DUPFD = 0;
+const F_GETFD = 1;
+const F_SETFD = 2;
+const F_GETFL = 3;
+const F_SETFL = 4;
+const F_DUPFD_CLOEXEC = 1030;
+const FD_CLOEXEC = 1;
+
+// poll 
+const POLLIN = 1;
+const POLLOUT = 4;
+const POLLERR = 8;
+const POLLHUP = 16;
+const POLLNVAL = 32;
+
+// mmap prot/flags - supported by UTMS7 sys_mmap 
+const PROT_NONE = 0;
+const PROT_READ = 1;
+const PROT_WRITE = 2;
+const PROT_EXEC = 4;
+
+const MAP_SHARED = 1;
+const MAP_PRIVATE = 2;
+const MAP_FIXED = 16;
+const MAP_ANONYMOUS = 32;
+
+// ioctl - UTMS7 terminal/drm 
+const TCGETS = 21505;
+const TCSETS = 21506;
+const TCSETSW = 21507;
+const TCSETSF = 21508;
+const TIOCGPGRP = 21519;
+const TIOCSPGRP = 21520;
+const TIOCGWINSZ = 21523;
+const FIONREAD = 21531;
+
+// access 
+const F_OK = 0;
+const X_OK = 1;
+const W_OK = 2;
+const R_OK = 4;
+
+// openat 
+const AT_FDCWD = 18446744073709551516;
+const AT_REMOVEDIR = 512;
+const AT_SYMLINK_NOFOLLOW = 256;
+
+// Common errno values returned as -errno by syscalls 
+const EPERM = 1;
+const ENOENT = 2;
+const ESRCH = 3;
+const EINTR = 4;
+const EIO = 5;
+const ENXIO = 6;
+const E2BIG = 7;
+const ENOEXEC = 8;
+const EBADF = 9;
+const ECHILD = 10;
+const EAGAIN = 11;
+const EWOULDBLOCK = 11;
+const ENOMEM = 12;
+const EACCES = 13;
+const EFAULT = 14;
+const EBUSY = 16;
+const EEXIST = 17;
+const EXDEV = 18;
+const ENODEV = 19;
+const ENOTDIR = 20;
+const EISDIR = 21;
+const EINVAL = 22;
+const ENFILE = 23;
+const EMFILE = 24;
+const ENOTTY = 25;
+const EFBIG = 27;
+const ENOSPC = 28;
+const ESPIPE = 29;
+const EROFS = 30;
+const EPIPE = 32;
+const ERANGE = 34;
+const ENAMETOOLONG = 36;
+const ENOSYS = 38;
+const ENOTEMPTY = 39;
+const ELOOP = 40;
+const EOVERFLOW = 75;
+
+// UTMS7-specific syscall numbers (1000+) 
+const uSYS_disk_list = 1000;
+const uSYS_part_mount = 1001;
+const uSYS_part_umount = 1002;
+const uSYS_part_format = 1003;
+const uSYS_disk_table = 1004;
+const uSYS_part_create = 1005;
+const uSYS_part_delete = 1006;
+const uSYS_ps = 1008;
+const uSYS_gettime = 1009;
+const uSYS_clear = 1010;
+const uSYS_setcolor = 1011;
+const uSYS_meminfo = 1012;
+const uSYS_fs_register = 1013;
+const uSYS_pci_map = 1014;
+const uSYS_pci_unmap = 1015;
+const uSYS_irq_register = 1016;
+const uSYS_irq_wait = 1017;
+const uSYS_ioport_in = 1018;
+const uSYS_ioport_out = 1019;
+const uSYS_sleep = 1020;
+const uSYS_setpgid = 1021;
+const uSYS_set_term_pgid = 1022;

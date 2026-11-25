@@ -19,7 +19,12 @@ fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
     while (running == 1 && pos < max_size - 1) {
         if (r->pos >= r->len) {
             i64 n = sys_read(r->fd, r->buf, 4096);
-            if (n <= 0) {
+            if (n < 0) {
+                if (syscall_error((u64)n) == 1) {
+                    return(n);
+                }
+                running = 0;
+            } else if (n == 0) {
                 running = 0;
             } else {
                 r->pos = 0;
@@ -46,7 +51,7 @@ fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64 {
     if (pos == 0 && saw_any_data == 0) {
         return(-1);
     }
-    return(pos);
+    return((i64)pos);
 }
 
 fn file_reader_read(FileReader* r, u8* out, u64 n) -> i64 {
@@ -54,11 +59,17 @@ fn file_reader_read(FileReader* r, u8* out, u64 n) -> i64 {
     while (done < n) {
         if (r->pos >= r->len) {
             i64 got = sys_read(r->fd, r->buf, 4096);
-            if (got <= 0) {
-                if (done > 0) {
-                    return(done);
+            if (got < 0) {
+                if (syscall_error((u64)got) == 1) {
+                    if (done > 0) {
+                        return((i64)done);
+                    }
+                    return(got);
                 }
-                return(got);
+                return((i64)done);
+            }
+            if (got == 0) {
+                return((i64)done);
             }
             r->pos = 0;
             r->len = (u64)got;
@@ -72,7 +83,7 @@ fn file_reader_read(FileReader* r, u8* out, u64 n) -> i64 {
         r->pos = r->pos + take;
         done = done + take;
     }
-    return(done);
+    return((i64)done);
 }
 
 fn file_writer_init(FileWriter* w, i64 fd) {

@@ -1,0 +1,41 @@
+sc.true
+
+struct File {
+    i64 fd;
+    u64 flags;
+}
+
+extern fn file_open(u8* path, u64 flags, u64 mode) -> i64;
+extern fn file_close(i64 fd) -> i64;
+extern fn file_read(i64 fd, u8* buf, u64 size) -> i64;
+extern fn file_write(i64 fd, u8* buf, u64 size) -> i64;
+extern fn file_unlink(u8* path) -> i64;
+extern fn file_mkdir(u8* path, u64 mode) -> i64;
+extern fn file_rmdir(u8* path) -> i64;
+extern fn file_stat(u8* path, u8* statbuf) -> i64;
+extern fn file_exists(u8* path) -> i64;
+extern fn file_is_dir(u8* path) -> i64;
+extern fn file_seek(i64 fd, u64 offset, u64 whence) -> i64;
+
+struct FileReader {
+    i64 fd;
+    u8 buf[4096];
+    u64 pos;
+    u64 len;
+}
+
+extern fn file_reader_init(FileReader* r, i64 fd);
+extern fn file_reader_next_line(FileReader* r, u8* out, u64 max_size) -> i64;
+
+struct FileWriter {
+    i64 fd;
+    u64 len;
+    u64 err;
+    u8 buf[4096];
+}
+
+extern fn file_writer_init(FileWriter* w, i64 fd);
+extern fn file_writer_flush(FileWriter* w) -> u64;
+extern fn file_writer_write(FileWriter* w, u8* data, u64 n);
+extern fn file_writer_str(FileWriter* w, u8* s);
+extern fn file_writer_char(FileWriter* w, u8 c);

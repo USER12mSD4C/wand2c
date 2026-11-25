@@ -1,0 +1,80 @@
+sc.true
+
+// Linux x86_64-compatible layouts as used by UTMS7 kernel 
+
+struct linux_dirent64 version 1 {
+    u64 d_ino version 1;
+    u64 d_off version 1;
+    u16 d_reclen version 1;
+    u8 d_type version 1;
+    u8 d_name[256] version 1;
+}
+
+struct timespec version 1 {
+    i64 tv_sec version 1;
+    i64 tv_nsec version 1;
+}
+
+// Matches kernel linux_stat layout in UTMS7 syscall.c 
+struct stat version 1 {
+    u64 st_dev version 1;
+    u64 st_ino version 1;
+    u64 st_nlink version 1;
+    u32 st_mode version 1;
+    u32 st_uid version 1;
+    u32 st_gid version 1;
+    u32 __pad0 version 1;
+    u64 st_rdev version 1;
+    u64 st_size version 1;
+    i64 st_blksize version 1;
+    i64 st_blocks version 1;
+    u64 st_atime version 1;
+    u64 st_atime_nsec version 1;
+    u64 st_mtime version 1;
+    u64 st_mtime_nsec version 1;
+    u64 st_ctime version 1;
+    u64 st_ctime_nsec version 1;
+    i64 __unused[3] version 1;
+}
+
+struct pollfd version 1 {
+    i32 fd version 1;
+    i16 events version 1;
+    i16 revents version 1;
+}
+
+struct winsize version 1 {
+    u16 ws_row version 1;
+    u16 ws_col version 1;
+    u16 ws_xpixel version 1;
+    u16 ws_ypixel version 1;
+}
+
+// UTMS7 disk/partition info (from lib/libc.h). C structs are packed;
+// padding fields are added to match packed layout on x86_64.
+struct partition_info_t version 1 {
+    u8 present version 1;
+    u8 disk_num version 1;
+    u8 partition_num version 1;
+    u8 _pad0[5] version 1;
+    u64 start_lba version 1;
+    u64 end_lba version 1;
+    u64 size version 1;
+    u32 type version 1;
+    u8 name[32] version 1;
+    u8 _pad1[4] version 1;
+}
+
+struct disk_info_user_t version 1 {
+    u8 present version 1;
+    u8 disk_num version 1;
+    u8 model[41] version 1;
+    u8 _pad0[5] version 1;
+    u64 total_sectors version 1;
+    u32 sector_size version 1;
+    u8 partition_count version 1;
+    u8 _pad1[2] version 1;
+    partition_info_t partitions[16] version 1;
+    u8 is_gpt version 1;
+    u8 _pad2[7] version 1;
+}

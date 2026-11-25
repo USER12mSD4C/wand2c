@@ -23,39 +23,39 @@ struct ProcessInfo {
 }
 
 fn process_fork() -> i64 {
-    i64 pid = sys_fork();
+    u64 pid = sys_fork();
     if (syscall_error(pid) == 1) {
-        return(-1);
+        return(0 - (i64)(0 - pid));
     }
-    return(pid);
+    return((i64)pid);
 }
 
 fn process_exec(u8* path, u8* argv, u8* envp) -> i64 {
-    i64 ret = sys_execve(path, argv, envp);
+    u64 ret = sys_execve(path, argv, envp);
     if (syscall_error(ret) == 1) {
-        return(-1);
+        return(0 - (i64)(0 - ret));
     }
     return(0);
 }
 
 fn process_wait(i64 pid, ProcessInfo* info) -> i64 {
     u64 status = 0;
-    i64 ret = sys_wait4(pid, status*adr, 0, null);
+    u64 ret = sys_wait4((u64)pid, status*adr, 0, null);
 
     if (syscall_error(ret) == 1) {
-        return(-1);
+        return(0 - (i64)(0 - ret));
     }
 
-    info->pid = ret;
-    info->status = status;
+    info->pid = (i64)ret;
+    info->status = (i64)status;
 
     if ((status & 0x7f) == 0) {
-        info->exit_code = (status >> 8) & 0xff;
+        info->exit_code = (i64)((status >> 8) & 0xff);
     } else {
         info->exit_code = -1;
     }
 
-    return(ret);
+    return((i64)ret);
 }
 
 fn process_wait_all(ProcessInfo* info) -> i64 {
@@ -67,16 +67,15 @@ fn process_exit(i64 code) {
 }
 
 fn process_kill(i64 pid, u64 signum) -> i64 {
-    i64 ret = sys_kill(pid, signum);
+    u64 ret = sys_kill((u64)pid, signum);
     if (syscall_error(ret) == 1) {
-        return(-1);
+        return(0 - (i64)(0 - ret));
     }
     return(0);
 }
 
 fn process_get_pid() -> i64 {
-    i64 pid = sys_getpid();
-    return(pid);
+    return((i64)sys_getpid());
 }
 
 struct ProcessGroup {

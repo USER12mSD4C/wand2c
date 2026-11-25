@@ -1,5 +1,6 @@
 sc.true
 #import <syscall>
+#import <io>
 
 sect.math_const
     i64 PI = 3141592;

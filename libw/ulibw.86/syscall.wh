@@ -1,0 +1,94 @@
+sc.true
+
+#import <syscall_constants>
+#import <syscall_structs>
+
+// Linux-compatible syscall wrappers supported by UTMS7. Return raw u64; use syscall_error(ret). 
+
+extern fn syscall_error(u64 ret) -> u64;
+
+// I/O 
+extern fn sys_read(u64 fd, u8* buf, u64 size) -> u64;
+extern fn sys_write(u64 fd, u8* buf, u64 size) -> u64;
+extern fn sys_open(u8* path, u64 flags, u64 mode) -> u64;
+extern fn sys_close(u64 fd) -> u64;
+extern fn sys_lseek(u64 fd, u64 offset, u64 whence) -> u64;
+extern fn sys_ioctl(u64 fd, u64 request, u64 arg) -> u64;
+extern fn sys_poll(u8* fds, u64 nfds, i64 timeout) -> u64;
+extern fn sys_pipe2(u8* pipefd, u64 flags) -> u64;
+extern fn sys_dup(u64 oldfd) -> u64;
+extern fn sys_dup2(u64 oldfd, u64 newfd) -> u64;
+extern fn sys_dup3(u64 oldfd, u64 newfd, u64 flags) -> u64;
+extern fn sys_fcntl(u64 fd, u64 cmd, u64 arg) -> u64;
+extern fn sys_pread64(u64 fd, u8* buf, u64 count, u64 offset) -> u64;
+extern fn sys_pwrite64(u64 fd, u8* buf, u64 count, u64 offset) -> u64;
+extern fn sys_readv(u64 fd, u8* iov, u64 iovcnt) -> u64;
+extern fn sys_writev(u64 fd, u8* iov, u64 iovcnt) -> u64;
+
+// Filesystem 
+extern fn sys_stat(u8* path, u8* statbuf) -> u64;
+extern fn sys_fstat(u64 fd, u8* statbuf) -> u64;
+extern fn sys_openat(u64 dirfd, u8* path, u64 flags, u64 mode) -> u64;
+extern fn sys_newfstatat(u64 dirfd, u8* path, u8* statbuf, u64 flags) -> u64;
+extern fn sys_getdents64(u64 fd, u8* dirp, u64 count) -> u64;
+extern fn sys_mkdir(u8* path, u64 mode) -> u64;
+extern fn sys_rmdir(u8* path) -> u64;
+extern fn sys_unlink(u8* path) -> u64;
+extern fn sys_rename(u8* oldpath, u8* newpath) -> u64;
+extern fn sys_chdir(u8* path) -> u64;
+extern fn sys_getcwd(u8* buf, u64 size) -> u64;
+extern fn sys_chroot(u8* path) -> u64;
+extern fn sys_symlink(u8* target, u8* linkpath) -> u64;
+extern fn sys_readlink(u8* path, u8* buf, u64 size) -> u64;
+extern fn sys_access(u8* path, u64 mode) -> u64;
+extern fn sys_sync() -> u64;
+extern fn sys_fsync(u64 fd) -> u64;
+
+// Memory 
+extern fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64;
+extern fn sys_munmap(u64 addr, u64 length) -> u64;
+extern fn sys_mprotect(u64 addr, u64 len, u64 prot) -> u64;
+extern fn sys_brk(u64 addr) -> u64;
+
+// Process 
+extern fn sys_getpid() -> u64;
+extern fn sys_getppid() -> u64;
+extern fn sys_gettid() -> u64;
+extern fn sys_fork() -> u64;
+extern fn sys_execve(u8* path, u8* argv, u8* envp) -> u64;
+extern fn sys_wait4(u64 pid, u64* status, u64 options, u8* rusage) -> u64;
+extern fn sys_exit(u64 code);
+extern fn sys_exit_group(u64 code);
+extern fn sys_kill(u64 pid, u64 sig) -> u64;
+extern fn sys_sched_yield() -> u64;
+
+// Identity - UTMS7 returns 0 for uid/gid 
+extern fn sys_getuid() -> u64;
+extern fn sys_getgid() -> u64;
+extern fn sys_geteuid() -> u64;
+extern fn sys_getegid() -> u64;
+
+// Time/info - UTMS7 clock_gettime returns ticks, not timespec 
+extern fn sys_gettime_ticks() -> u64;
+extern fn sys_uname(u8* buf) -> u64;
+
+// UTMS7-specific syscalls 
+extern fn u_sys_disk_list(u8* disks, u64 max) -> u64;
+extern fn u_sys_part_mount(u8* dev, u8* point) -> u64;
+extern fn u_sys_part_mount_fs(u8* dev, u8* point, u8* fstype) -> u64;
+extern fn u_sys_part_umount() -> u64;
+extern fn u_sys_part_format(u8* dev, u8* fstype) -> u64;
+extern fn u_sys_disk_table(u8* dev, u64 gpt) -> u64;
+extern fn u_sys_part_create(u8* dev, u64 size_mb, u64 type) -> u64;
+extern fn u_sys_part_delete(u8* dev) -> u64;
+extern fn u_sys_ps(u8* processes, u64 max) -> u64;
+extern fn u_sys_clear() -> u64;
+extern fn u_sys_setcolor(u64 fg, u64 bg) -> u64;
+extern fn u_sys_meminfo(u64* total, u64* used, u64* free_mem) -> u64;
+extern fn u_sys_sleep(u64 ms) -> u64;
+extern fn u_sys_setpgid(u64 pid, u64 pgid) -> u64;
+extern fn u_sys_set_term_pgid(u64 pid) -> u64;
+
+// Convenience allocator backed by mmap/munmap (like llibw mloc/mfree) 
+extern fn mloc(u64 hint, u64 size) -> u8*;
+extern fn mfree_map(u8* ptr);

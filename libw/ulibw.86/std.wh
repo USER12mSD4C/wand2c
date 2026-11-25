@@ -1,0 +1,5 @@
+sc.true
+
+extern fn exit(u64 code);
+extern fn rand() -> u64;
+extern fn srand(u64 seed);

@@ -1,0 +1,14 @@
+sc.true
+
+extern fn print_char(u8 c);
+extern fn print_string(u8* s);
+extern fn print_number(u64 num);
+extern fn print_signed_number(i64 num);
+extern fn eprint(u8* s);
+extern fn eprint_number(u64 n);
+extern fn die(u64 code, u8* msg);
+extern fn read_char() -> u8;
+extern fn read_line(u8* buf, u64 max_size);
+extern fn write_all(u64 fd, u8* buf, u64 len) -> u64;
+extern fn read_full(u64 fd, u8* buf, u64 len) -> i64;
+extern fn strerror(u64 err) -> u8*;

@@ -1,0 +1,6 @@
+sc.true
+
+// UTMS7 time helpers. UTMS7 currently exposes tick counts, not Linux timespec clocks.
+
+extern fn time_ticks() -> u64;
+extern fn time_sleep_ms(u64 ms) -> u64;

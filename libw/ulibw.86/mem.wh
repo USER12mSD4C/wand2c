@@ -1,0 +1,8 @@
+sc.true
+
+extern fn mem_init(u64 initial_size);
+extern fn malloc(u64 size) -> u8*;
+extern fn calloc(u64 num, u64 size) -> u8*;
+extern fn mfree(u8* ptr);
+extern fn mrealloc(u8* ptr, u64 new_size) -> u8*;
+extern fn mfree_all();

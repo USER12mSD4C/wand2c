@@ -60,7 +60,7 @@ extern fn mloc(u64 hint, u64 size) -> u8*;
 extern fn mfree(u8* ptr);
 extern fn sys_mkdir(u8* path, u64 mode) -> u64;
 extern fn sys_rmdir(u8* path) -> u64;
-export fn syscall_error(u64 ret) -> u64;
+extern fn syscall_error(u64 ret) -> u64;
 extern fn sys_mmap(u64 addr, u64 length, u64 prot, u64 flags, u64 fd, u64 offset) -> u64;
 extern fn sys_munmap(u64 addr, u64 length) -> u64;
 extern fn sys_poll(u8* fds, u64 nfds, i64 timeout) -> u64;

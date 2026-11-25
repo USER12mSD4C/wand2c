@@ -1,0 +1,11 @@
+sc.true
+
+#import <syscall_structs>
+
+extern fn path_exists(u8* path) -> u64;
+extern fn path_is_dir(u8* path) -> u64;
+extern fn path_is_file(u8* path) -> u64;
+extern fn path_join(u8* dest, u8* a, u8* b);
+extern fn path_dirname(u8* path, u8* dest);
+extern fn path_basename(u8* path) -> u8*;
+extern fn path_stat(u8* path, stat* st) -> i64;

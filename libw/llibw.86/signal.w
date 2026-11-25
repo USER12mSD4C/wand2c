@@ -2,6 +2,7 @@ sc.true
 
 #import <syscall>
 #import <syscall_structs>
+#import <string>
 
 struct SignalHandler {
     u64 handler;
