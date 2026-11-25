@@ -3416,12 +3416,34 @@ static void compile_stmt(Gen* g, WStmt* s) {
             break;
         }
         case 6: { /* Return */
-            static const uint8_t reg_moves[3][3] = {
-                {0x48, 0x89, 0xC2}, {0x48, 0x89, 0xC1}, {0x49, 0x89, 0xC0}
-            };
-            for (size_t i = 0; i < s->return_count && i < 4; i++) {
-                compile_expr(g, s->returns[i].expr, 0, 1);
-                if (i > 0) buf_bytes(b, reg_moves[i - 1], 3);
+            size_t n = s->return_count < 4 ? s->return_count : 4;
+            if (n <= 1) {
+                /* Preserve the single-value path exactly. */
+                if (n == 1) compile_expr(g, s->returns[0].expr, 0, 1);
+            } else {
+                /* Multi-value returns use rax, rdx, rcx, r8. compile_expr
+                 * leaves each result in rax and may clobber rdx/rcx/r8 (for
+                 * example when evaluating a call with many arguments), so
+                 * compiling values in source order loses earlier ones:
+                 * return(7, 9) used to emit mov $7,rax; mov $9,rax;
+                 * mov rax,rdx, returning 9 in both slots.  Save each value
+                 * on the stack as it is computed, then pop them in reverse
+                 * order into the ABI registers.  The epilogue below resets
+                 * rsp, so the temporary pushes need no explicit cleanup. */
+                for (size_t i = 0; i < n; i++) {
+                    compile_expr(g, s->returns[i].expr, 0, 1);
+                    buf_u8(b, 0x50); /* push rax */
+                }
+                for (size_t k = n; k > 0; k--) {
+                    size_t i = k - 1;
+                    if (i == 3) buf_u8(b, 0x41); /* REX.B: pop r8 */
+                    switch (i) {
+                        case 0: buf_u8(b, 0x58); break; /* pop rax */
+                        case 1: buf_u8(b, 0x5A); break; /* pop rdx */
+                        case 2: buf_u8(b, 0x59); break; /* pop rcx */
+                        default: buf_u8(b, 0x58); break; /* pop r8 */
+                    }
+                }
             }
             buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x65); buf_u8(b, 0xF8);
             buf_u8(b, 0x5B);
