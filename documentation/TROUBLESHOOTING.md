@@ -145,9 +145,10 @@ wand_p46_register_path("worker.wexp", "/path/to/worker.wexp", &options);
 ```
 
 Without a registration (or with more than six arguments / four results) the
-loader returns 0. If the worker source *is* present, the body is inlined and
-the optimizer can fold reads of locals written only by the inlined code; use
-the dynamic path, or a section global, when the caller needs the result.
+loader returns 0. If the worker source is present, the body is inlined; its
+`return(expr)` writes to the caller variable named by `expr`. Block variables
+and cached constants are preserved across the `jmpto` boundary so the result
+remains visible.
 
 ### Syntax errors
 

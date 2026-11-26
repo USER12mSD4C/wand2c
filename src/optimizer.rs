@@ -358,6 +358,10 @@ fn collect_escaped_stmt(stmt: &Stmt, escaped: &mut HashSet<String>) {
         Stmt::Jmpto { args, .. } => {
             for arg in args {
                 collect_escaped_stmt(arg, escaped);
+                /* The inlined module body can write to locals declared in the
+                 * block, and the dynamic loader can write result variables.
+                 * Keep those definitions alive and unpropagated. */
+                collect_assigned_stmt(arg, escaped);
             }
         }
         Stmt::Expr(expr) => {
@@ -1653,6 +1657,10 @@ fn optimize_statements(
             Stmt::Jmpto { module_name, args } => {
                 let opt_args =
                     optimize_statements(args, consts, escaped, reads, output_ptrs, count, env);
+                /* The worker body is emitted after optimization (or executed
+                 * by the loader at runtime), so it can change any local the
+                 * caller has cached as a constant. */
+                consts.clear();
                 new_stmts.push(Stmt::Jmpto {
                     module_name,
                     args: opt_args,
