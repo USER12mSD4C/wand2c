@@ -3206,9 +3206,12 @@ static void emit_float_compare_bool(Gen* g, WExpr* e) {
     int need_not_pf = 0;
 
     compile_expr(g, e->a, 0, 1);
-    buf_u8(b, 0x50); /* push lhs bits */
+    size_t lhs_slot = g->stack_depth;
+    emit_mov_to_stack(b, 0, lhs_slot);
+    g->stack_depth += 8;
     compile_expr(g, e->b, 0, 1);
-    buf_u8(b, 0x59); /* pop rcx = lhs bits */
+    emit_mov_from_stack(b, 1, lhs_slot); /* rcx = lhs bits */
+    g->stack_depth -= 8;
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC1); /* movq xmm0, rcx */
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC8); /* movq xmm1, rax */
     buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x2E); buf_u8(b, 0xC1); /* ucomisd xmm0, xmm1 */
