@@ -235,6 +235,10 @@ fn halt() {
 }
 ```
 
+This is a small built-in encoder, not a full assembler; unsupported lines are
+ignored with a warning. See `documentation/SYNTAX.md` section 28 for the exact
+instruction list.
+
 ### Compile-Time Reflection
 
 Built-in functions inspect types at compile time:
@@ -292,8 +296,8 @@ The `mfree` function reads the header and calls `munmap`.
 The compiler supports direct hardware access on x86_64:
 
 * **Port I/O**: `inb`, `outb`, `inw`, `outw`, `inl`, `outl`.
-* **Inline Assembly**: `::nasm::{}` blocks for raw machine instructions.
-* **Atomics**: `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_inc`, `atomic_dec`, `atomic_swap`, `atomic_cas`.
+* **Inline Assembly**: `::nasm::{}` blocks for a supported subset of x86_64 instructions (`pause`, `rdtsc`, `hlt`, fences, `cli`/`sti`, narrow `mov`, and the fixed encodings). Unsupported lines produce a compiler warning. See `documentation/SYNTAX.md` section 28.
+* **Atomics**: `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_inc`, `atomic_dec`, `atomic_swap`, `atomic_cas`. Operations are sized from the variable's type (1/2/4/8 bytes), so a `u32` lock cannot clobber adjacent data.
 * **Barriers**: `memory_barrier`, `compiler_barrier`.
 * **Critical Sections**: `critical { }` blocks disable interrupts in `sc.false` code.
 * **IRQ Handlers**: `irq fn handler() { }` generates interrupt-safe function prologues and epilogues.

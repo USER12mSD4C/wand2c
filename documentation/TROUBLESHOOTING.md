@@ -112,6 +112,21 @@ u8* p = buffer*adr;
 
 `--entry` is valid only with `-fr` and `-fk`. Hosted programs and wexp modules use `main`.
 
+### Function `version N` has no effect
+
+Function versioning is not implemented. The parser accepts the suffix, but
+exported symbols use the plain function name and two functions differing only
+in version collide. Use distinct function names instead. Struct versions and
+`versionof(Type)` do work.
+
+### `warning: unsupported ::nasm:: line ignored`
+
+`::nasm::{}` is a small built-in encoder, not a full NASM assembler. It only
+knows the instructions listed in `SYNTAX.md` section 28. Unknown lines emit no
+bytes, so a program may build and then misbehave. Check compiler warnings and
+replace unsupported instructions with Wand builtins (`atomic_*`, `inb/outb`,
+`memory_barrier()`) or a supported `mov` form through a local variable.
+
 ### Syntax errors
 
 The compiler may report the line after the actual mistake. Check the previous line for:

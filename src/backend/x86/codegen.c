@@ -3536,6 +3536,7 @@ static void compile_nasm(Gen* g, WStr code) {
         if (!*t) {
             continue;
         }
+        size_t before = b->len;
         if (strcmp(t, "syscall") == 0) {
             buf_u8(b, 0x0F); buf_u8(b, 0x05);
         } else if (strcmp(t, "pause") == 0) {
@@ -3623,6 +3624,9 @@ static void compile_nasm(Gen* g, WStr code) {
                     buf_u8(b, (uint8_t)(0xC0 | (sreg << 3) | dreg));
                 }
             }
+        }
+        if (b->len == before) {
+            fprintf(stderr, "[wand2c] warning: unsupported ::nasm:: line ignored: '%s'\n", t);
         }
     }
 }
