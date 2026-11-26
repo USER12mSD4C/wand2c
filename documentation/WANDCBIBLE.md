@@ -2125,10 +2125,31 @@ fn main(u64 argc, u64 argv, u64 envp) -> u64 {
 result. This is the path used by `probes/wexp/jmpto_host.w`.
 
 When the worker's `.w` source is present, the compiler may inline its `main`
-body instead. In that mode the worker's `return(expr)` stores into the caller
-variable named by `expr`. Since the optimizer runs before the inlined body is
-emitted, prefer the dynamic path (or a section global) when the caller needs
-the computed result.
+body instead. The block variables act as the worker's parameters, and the
+worker's `return(expr)` stores into the caller variable named by `expr`:
+
+```
+// compute.w
+fn main(u64 input) -> u64 {
+    u64 output = input * 3;
+    return(output);
+}
+
+// caller.w
+#import <io>
+fn main() -> u64 {
+    u64 output = 0;
+    jmpto "compute.w" {
+        u64 input = 100;
+    }
+    print_number(output);  // 300
+    return(0);
+}
+```
+
+The optimizer keeps block variables alive and discards cached constants at a
+`jmpto` boundary, so inlined results are not folded away. The same rule applies
+to the dynamic loader's result variables.
 
 ### Chapter 34: Standard 4/6 Binary Interface
 
