@@ -2055,6 +2055,31 @@ exported `main` continuation. Export addresses are offsets from the module base.
 The `.wexp` format requires a `main` function.
 The `--entry` flag is not allowed for this format.
 
+#### Why use continuation objects?
+
+A continuation object is useful anywhere a host needs to call code that was
+built separately, without binding that code to a process or fixed address:
+
+- **Kernel and boot modules.** The OS chooses the mapping and supplies imports
+  through callbacks; no ELF loader or libc startup is needed.
+- **Plugins and updatable components.** The metadata records versions, types,
+  dependencies and signatures, so the host can check compatibility before
+  calling anything.
+- **Hosted testing.** The same `.wexp` bytes can be loaded by a desktop test
+  harness, which makes driver logic testable without booting the OS.
+- **Small attack surface.** There is no entry stub, no fixed address and no
+  way for the object to start executing on its own. Values cross the boundary
+  only as up to six arguments and up to four results.
+
+The reference loader API is in `include/wand_p46.h`; `make -C loader` builds it
+as a static or shared library. A host loads a module with
+`wand_p46_load(bytes, len, &options, &status)`, calls `main` with
+`wand_p46_call(module, args, argc, results, result_cap, &count)`, and releases
+it with `wand_p46_unload(module)`. Options supply callbacks for imports and
+dependencies. `wand_p46_get_symbol()` resolves any other exported function by
+name and minimum version. The loader copies the input buffer, applies the
+relocations, and resolves imports before returning a module handle.
+
 ### Chapter 33: jmpto - Dynamic Module Invocation
 
 The `jmpto` statement invokes another module at the language level.
@@ -2081,19 +2106,29 @@ Variables prepared by the block are passed as arguments, `return(var)` entries
 name result variables, and the loader loads the `.wexp` file, validates
 metadata, resolves imports, and calls the module's `main` continuation.
 
-Example with compile-time inlining:
+Dynamic example (no worker source needed). Register the module once with
+`wand_p46_register_path("worker.wexp", path, &options)`:
 
 ```
-fn main() -> u64 {
-    u64 result = 0;
-    jmpto "compute.w" {
-        u64 input = 100;
-        return(input);
+// worker.w, built with -fw: fn main(u64 value) -> u64 { return(value * 3); }
+
+fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+    jmpto "worker.wexp" {
+        u64 input_value = argc + 21;
+        return(input_value);
     }
-    print_number(result);
-    return(0);
+    return(input_value);
 }
 ```
+
+`input_value` is passed as the first argument and then receives the first
+result. This is the path used by `probes/wexp/jmpto_host.w`.
+
+When the worker's `.w` source is present, the compiler may inline its `main`
+body instead. In that mode the worker's `return(expr)` stores into the caller
+variable named by `expr`. Since the optimizer runs before the inlined body is
+emitted, prefer the dynamic path (or a section global) when the caller needs
+the computed result.
 
 ### Chapter 34: Standard 4/6 Binary Interface
 

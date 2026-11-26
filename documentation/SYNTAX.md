@@ -1132,7 +1132,10 @@ jmpto "worker.wexp" {
 }
 ```
 
-The block contains statements that prepare arguments.
+The block contains statements that prepare arguments. This is how a Wand host
+calls a separately built `.wexp` module at runtime: the module is registered
+with `wand_p46_register_path()` and the generated code calls
+`__wand_jmpto_loader` from the Standard 4/6 loader library.
 
 Rules:
 
