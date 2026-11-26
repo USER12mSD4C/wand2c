@@ -197,7 +197,7 @@ Use `_` to ignore a return value:
 [_, r] = divmod(17, 5);
 ```
 
-> Current limitation: see [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md#multiple-return-values-give-the-same-result).
+> Fixed: multi-value returns now assign each result to the correct target. See [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md#multiple-return-values-give-the-same-result) for the historical bug.
 
 ### Structures with Versioning
 
