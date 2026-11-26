@@ -949,6 +949,8 @@ typedef struct {
     size_t cont_n, cont_cap;
     size_t* brk;
     size_t brk_n, brk_cap;
+    /* Number of active match-scrutinee stack slots at loop entry. */
+    size_t match_depth;
 } LoopCtx;
 
 DEFINE_VEC(AddrPatchVec, AddrPatch)
@@ -1002,6 +1004,7 @@ struct Gen {
     CallPatchVec call_patches;
     LoopCtxVec loop_stack;
     size_t stack_depth;
+    size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
 
     WandOutputFormat format;
@@ -1093,11 +1096,18 @@ static void emit_mem_load(Buf* b, uint8_t reg, uint32_t offset, uint32_t size,
             buf_u8(b, modrm);
             break;
         case 4:
-            if (reg >= 8) {
-                buf_u8(b, 0x44);
+            if (is_signed) {
+                /* movsxd r64, r/m32 — a plain 32-bit mov would zero-extend. */
+                buf_u8(b, reg >= 8 ? 0x49 : 0x48);
+                buf_u8(b, 0x63);
+                buf_u8(b, modrm);
+            } else {
+                if (reg >= 8) {
+                    buf_u8(b, 0x44);
+                }
+                buf_u8(b, 0x8B);
+                buf_u8(b, modrm);
             }
-            buf_u8(b, 0x8B);
-            buf_u8(b, modrm);
             break;
         default:
             buf_u8(b, reg >= 8 ? 0x4C : 0x48);
@@ -2451,20 +2461,30 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 }
             } else {
                 uint32_t size = expr_size(g, e);
-                if (reg == 0) {
-                    switch (size) {
-                        case 1: buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0x03); break;
-                        case 2: buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, 0x03); break;
-                        case 4: buf_u8(b, 0x8B); buf_u8(b, 0x03); break;
-                        default: buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x03); break;
-                    }
-                } else {
-                    switch (size) {
-                        case 1: buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0x1B); break;
-                        case 2: buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, 0x1B); break;
-                        case 4: buf_u8(b, 0x8B); buf_u8(b, 0x1B); break;
-                        default: buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B); break;
-                    }
+                WType* scalar = peel_typedefs(t);
+                int is_signed = scalar && scalar->tag >= 4 && scalar->tag <= 7;
+                uint8_t modrm = reg == 0 ? 0x03 : 0x1B;
+                switch (size) {
+                    case 1:
+                        buf_u8(b, 0x48); buf_u8(b, 0x0F);
+                        buf_u8(b, is_signed ? 0xBE : 0xB6);
+                        buf_u8(b, modrm);
+                        break;
+                    case 2:
+                        buf_u8(b, 0x48); buf_u8(b, 0x0F);
+                        buf_u8(b, is_signed ? 0xBF : 0xB7);
+                        buf_u8(b, modrm);
+                        break;
+                    case 4:
+                        if (is_signed) {
+                            buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, modrm);
+                        } else {
+                            buf_u8(b, 0x8B); buf_u8(b, modrm);
+                        }
+                        break;
+                    default:
+                        buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, modrm);
+                        break;
                 }
             }
             break;
@@ -3143,10 +3163,6 @@ static int has_return_statement(WStmt** stmts, size_t count) {
                 has_return_statement(s->stmts2, s->stmt2_count)) {
                 return 1;
             }
-        } else if (s->tag == 3 || s->tag == 4) {
-            if (has_return_statement(s->stmts1, s->stmt1_count)) {
-                return 1;
-            }
         } else if (s->tag == 9) {
             /* A match only covers the function when every case and the
              * default arm return. */
@@ -3173,6 +3189,53 @@ static void emit_cmp_rax_imm(Buf* b, int64_t imm) {
     } else {
         buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xF8); buf_u32(b, (uint32_t)imm);
     }
+}
+
+static int is_float_comparison(Gen* g, WExpr* e) {
+    return e && e->tag == 8 && (is_float_expr(g, e->a) || is_float_expr(g, e->b));
+}
+
+/* f64 values travel as bit patterns in GPRs. Compare them numerically with
+ * ucomisd and materialize a 0/1 boolean in rax. Unordered (NaN) results are
+ * false for every relation except "!=", matching IEEE-754 semantics. */
+static void emit_float_compare_bool(Gen* g, WExpr* e) {
+    Buf* b = &g->code;
+    WStr op = e->str;
+    uint8_t cc;
+    int unordered_is_true = 0;
+    int need_not_pf = 0;
+
+    compile_expr(g, e->a, 0, 1);
+    buf_u8(b, 0x50); /* push lhs bits */
+    compile_expr(g, e->b, 0, 1);
+    buf_u8(b, 0x59); /* pop rcx = lhs bits */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC1); /* movq xmm0, rcx */
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC8); /* movq xmm1, rax */
+    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x2E); buf_u8(b, 0xC1); /* ucomisd xmm0, xmm1 */
+
+    if (wstr_eq_c(op, "OpEq") || wstr_eq_c(op, "OpEqEq") || wstr_eq_c(op, "==")) {
+        cc = 0x94; need_not_pf = 1; /* sete al */
+    } else if (wstr_eq_c(op, "OpNotEq") || wstr_eq_c(op, "OpNe") || wstr_eq_c(op, "!=")) {
+        cc = 0x95; unordered_is_true = 1; /* setne al */
+    } else if (wstr_eq_c(op, "OpLt") || wstr_eq_c(op, "Lt") || wstr_eq_c(op, "<")) {
+        cc = 0x92; need_not_pf = 1; /* setb al */
+    } else if (wstr_eq_c(op, "OpLtEq") || wstr_eq_c(op, "OpLe") || wstr_eq_c(op, "<=")) {
+        cc = 0x96; need_not_pf = 1; /* setbe al */
+    } else if (wstr_eq_c(op, "OpGt") || wstr_eq_c(op, "Gt") || wstr_eq_c(op, ">")) {
+        cc = 0x97; /* seta al: unordered clears CF */
+    } else {
+        cc = 0x93; /* setae al: unordered clears CF */
+    }
+
+    buf_u8(b, 0x0F); buf_u8(b, cc); buf_u8(b, 0xC0);
+    if (need_not_pf) {
+        buf_u8(b, 0x0F); buf_u8(b, 0x9B); buf_u8(b, 0xC1); /* setnp cl */
+        buf_u8(b, 0x20); buf_u8(b, 0xC8);                   /* and al, cl */
+    } else if (unordered_is_true) {
+        buf_u8(b, 0x0F); buf_u8(b, 0x9A); buf_u8(b, 0xC1); /* setp cl */
+        buf_u8(b, 0x08); buf_u8(b, 0xC8);                   /* or al, cl */
+    }
+    buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0); /* movzx eax, al */
 }
 
 /* Return 1 if e is a comparison; *setcc receives the setcc opcode. Shared by
@@ -3263,7 +3326,12 @@ static size_t compile_condition_jump(Gen* g, WExpr* cond) {
     Buf* b = &g->code;
     uint8_t setcc;
     uint8_t jump_op = 0x84; /* jz */
-    if (comparison_setcc(g, cond, &setcc)) {
+    if (is_float_comparison(g, cond)) {
+        /* Numeric f64 comparison needs ucomisd and NaN checks; materialize
+         * the boolean first, then branch on it like any other condition. */
+        compile_bool_expr(g, cond);
+        buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0); /* test rax, rax */
+    } else if (comparison_setcc(g, cond, &setcc)) {
         emit_cmp_operands(g, cond);
         /* setcc = 0x90 + cc; the inverse jcc is 0x80 + (cc ^ 1). */
         jump_op = (uint8_t)(0x80 + ((setcc - 0x90) ^ 1));
@@ -3324,6 +3392,11 @@ static void compile_bool_expr(Gen* g, WExpr* e) {
             buf_u32(b, 1);
             size_t end_pos = b->len;
             patch_address(g, end_patch, (int32_t)(end_pos - (end_patch + 4)));
+            return;
+        }
+
+        if (is_float_comparison(g, e)) {
+            emit_float_compare_bool(g, e);
             return;
         }
 
@@ -3575,8 +3648,19 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
         }
         case 7: { /* SectionAccess */
             WStr key = wstr_pair(target->str, target->str2);
+            uint64_t type_ptr;
+            WType* var_type = map_get_str(&g->section_types, key, &type_ptr)
+                                  ? AS_PTR(WType, type_ptr)
+                                  : NULL;
+            uint32_t size = var_type ? type_size(g, var_type) : 8;
+            if (size == 0) size = 8;
             emit_rip_relative_lea(g, 3, key);
-            buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x03);
+            switch (size) {
+                case 1: buf_u8(b, 0x88); buf_u8(b, 0x03); break;
+                case 2: buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+                case 4: buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+                default: buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+            }
             if (map_has(&g->section_volatile, key.ptr, key.len)) {
                 buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xF0);
             }
@@ -3983,6 +4067,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             size_t loop_start = b->len;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
+            ctx.match_depth = g->match_depth;
             LoopCtxVec_push(&g->loop_stack, ctx);
             size_t exit_patch = compile_condition_jump(g, s->e1);
             for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
@@ -4005,6 +4090,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
             size_t loop_start = b->len;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
+            ctx.match_depth = g->match_depth;
             LoopCtxVec_push(&g->loop_stack, ctx);
             size_t exit_patch = compile_condition_jump(g, s->e1);
             for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
@@ -4093,6 +4179,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 9: { /* Match */
             compile_expr(g, s->e1, 0, 1);
             buf_u8(b, 0x50); /* push rax - save scrutinee */
+            g->match_depth++;
             SizeVec je_patches = {0};
             for (size_t i = 0; i < s->case_count; i++) {
                 compile_expr(g, s->cases[i].expr, 0, 1);
@@ -4124,6 +4211,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 patch_address(g, end_jmps.v[i], (int32_t)(b->len - (end_jmps.v[i] + 4)));
             }
             buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xC4); buf_u8(b, 0x08); /* add rsp, 8 */
+            g->match_depth--;
             break;
         }
         case 10: /* Expr */
@@ -4132,6 +4220,12 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 11: { /* Continue */
             if (g->loop_stack.n) {
                 LoopCtx* ctx = &g->loop_stack.v[g->loop_stack.n - 1];
+                /* Jumping out of one or more `match` bodies skips their
+                 * `add rsp,8`; restore those slots here. */
+                if (g->match_depth > ctx->match_depth) {
+                    uint8_t slots = (uint8_t)((g->match_depth - ctx->match_depth) * 8u);
+                    buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xC4); buf_u8(b, slots);
+                }
                 buf_u8(b, 0xE9);
                 size_t p = b->len;
                 buf_u32(b, 0);
@@ -4142,6 +4236,10 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 12: { /* Break */
             if (g->loop_stack.n) {
                 LoopCtx* ctx = &g->loop_stack.v[g->loop_stack.n - 1];
+                if (g->match_depth > ctx->match_depth) {
+                    uint8_t slots = (uint8_t)((g->match_depth - ctx->match_depth) * 8u);
+                    buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xC4); buf_u8(b, slots);
+                }
                 buf_u8(b, 0xE9);
                 size_t p = b->len;
                 buf_u32(b, 0);

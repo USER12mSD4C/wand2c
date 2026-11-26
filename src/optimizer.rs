@@ -15,15 +15,32 @@ struct OptimizeEnv {
     signs: HashMap<String, ValueSign>,
     copy_sources: HashSet<String>,
     single_assignment: HashSet<String>,
+    /* Variables whose value must be re-read at every access. */
+    volatile: HashSet<String>,
+    /* Array/struct roots whose elements or fields may alias. */
+    array_roots: HashSet<String>,
+    union_roots: HashSet<String>,
 }
 
 impl OptimizeEnv {
-    fn from_function(func: &FuncDecl) -> Self {
+    fn from_function(func: &FuncDecl, structs: &HashMap<String, StructDecl>) -> Self {
         let mut signs = HashMap::new();
         let mut assigned: HashMap<String, usize> = HashMap::new();
+        let mut volatile = HashSet::new();
+        let mut array_roots = HashSet::new();
+        let mut union_roots = HashSet::new();
 
         for (ty, name, access) in &func.params {
             signs.insert(name.clone(), data_type_sign(ty));
+            if matches!(access, PtrAccess::Volatile | PtrAccess::Atomic) {
+                volatile.insert(name.clone());
+            }
+            if matches!(ty, DataType::Array(_, _)) {
+                array_roots.insert(name.clone());
+            }
+            if type_is_union(ty, structs) {
+                union_roots.insert(name.clone());
+            }
             let count = assigned.entry(name.clone()).or_insert(0);
             if matches!(
                 access,
@@ -39,6 +56,13 @@ impl OptimizeEnv {
         if let Some(ref body) = func.body {
             collect_signs(body, &mut signs);
             collect_assignment_counts(body, &mut assigned);
+            collect_decl_aliases(
+                body,
+                structs,
+                &mut volatile,
+                &mut array_roots,
+                &mut union_roots,
+            );
 
             let mut reads = HashMap::new();
             collect_reads(body, &mut reads);
@@ -70,6 +94,9 @@ impl OptimizeEnv {
             signs,
             copy_sources,
             single_assignment,
+            volatile,
+            array_roots,
+            union_roots,
         }
     }
 
@@ -89,6 +116,79 @@ fn data_type_sign(ty: &DataType) -> ValueSign {
         DataType::Pointer(_) | DataType::Array(_, _) => ValueSign::Unsigned,
         DataType::Typedef(_, inner) => data_type_sign(inner),
         _ => ValueSign::Unknown,
+    }
+}
+
+fn type_is_union(ty: &DataType, structs: &HashMap<String, StructDecl>) -> bool {
+    match ty {
+        DataType::Struct(name) => structs.get(name).map(|s| s.is_union).unwrap_or(false),
+        DataType::Typedef(_, inner) | DataType::Pointer(inner) | DataType::Array(inner, _) => {
+            type_is_union(inner, structs)
+        }
+        _ => false,
+    }
+}
+
+fn collect_decl_aliases(
+    body: &[Stmt],
+    structs: &HashMap<String, StructDecl>,
+    volatile: &mut HashSet<String>,
+    array_roots: &mut HashSet<String>,
+    union_roots: &mut HashSet<String>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::VarDefinition(decl) => {
+                if matches!(decl.modifier, PtrAccess::Volatile | PtrAccess::Atomic) {
+                    volatile.insert(decl.name.clone());
+                }
+                if matches!(decl.data_type, DataType::Array(_, _)) {
+                    array_roots.insert(decl.name.clone());
+                }
+                if type_is_union(&decl.data_type, structs) {
+                    union_roots.insert(decl.name.clone());
+                }
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_decl_aliases(then_branch, structs, volatile, array_roots, union_roots);
+                if let Some(branch) = else_branch {
+                    collect_decl_aliases(branch, structs, volatile, array_roots, union_roots);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Critical(body) => {
+                collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+            }
+            Stmt::For { init, post, body, .. } => {
+                for nested in [init, post] {
+                    if let Some(stmt) = nested {
+                        collect_decl_aliases(
+                            std::slice::from_ref(stmt.as_ref()),
+                            structs,
+                            volatile,
+                            array_roots,
+                            union_roots,
+                        );
+                    }
+                }
+                collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+            }
+            Stmt::Jmpto { args, .. } => {
+                collect_decl_aliases(args, structs, volatile, array_roots, union_roots);
+            }
+            Stmt::Match { cases, default, .. } => {
+                for (_, body) in cases {
+                    collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                }
+                if let Some(body) = default {
+                    collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -121,17 +221,22 @@ fn expr_sign(expr: &Expr, env: &OptimizeEnv) -> ValueSign {
     }
 }
 
-fn is_pure_expr(expr: &Expr) -> bool {
+/* A volatile/atomic variable is a fresh read on every access, so `v - v`
+ * and `v & v` may not be simplified and operands containing it may not be
+ * discarded. */
+fn is_pure_expr(expr: &Expr, env: &OptimizeEnv) -> bool {
     match expr {
+        Expr::Variable(name) => !env.volatile.contains(name),
         Expr::Number(_)
         | Expr::SignedNumber(_)
         | Expr::FloatLit(_)
         | Expr::StringLit(_)
-        | Expr::Variable(_)
         | Expr::AddrOf(_)
         | Expr::Null => true,
-        Expr::Binary { left, right, .. } => is_pure_expr(left) && is_pure_expr(right),
-        Expr::AddrOfExpr(inner) => is_pure_expr(inner),
+        Expr::Binary { left, right, .. } => {
+            is_pure_expr(left, env) && is_pure_expr(right, env)
+        }
+        Expr::AddrOfExpr(inner) => is_pure_expr(inner, env),
         _ => false,
     }
 }
@@ -252,15 +357,21 @@ pub struct Optimizer;
 
 impl Optimizer {
     pub fn optimize_program(program: &mut Program) -> usize {
+        let structs: HashMap<String, StructDecl> = program
+            .structs
+            .iter()
+            .map(|s| (s.name.clone(), s.clone()))
+            .collect();
         let mut total_optimized = 0;
         for func in &mut program.functions {
-            let env = OptimizeEnv::from_function(&*func);
+            let env = OptimizeEnv::from_function(&*func, &structs);
             if let Some(ref mut body) = func.body {
                 let mut iteration = 0;
                 loop {
                     let mut count = 0;
                     let mut escaped = HashSet::new();
                     collect_escaped(body, &mut escaped);
+                    collect_call_array_escaped(body, &env.array_roots, &mut escaped);
 
                     let mut reads = HashMap::new();
                     collect_reads(body, &mut reads);
@@ -357,6 +468,17 @@ fn collect_escaped_stmt(stmt: &Stmt, escaped: &mut HashSet<String>) {
         }
         Stmt::Jmpto { args, .. } => {
             for arg in args {
+                /* `return(var)` inside a jmpto block names the variable that
+                 * receives a continuation result. The backend requires the
+                 * marker to remain a plain variable, and the loader may write
+                 * that variable, so it must never be constant-propagated. */
+                if let Stmt::Return(values) = arg {
+                    for (_, expr) in values {
+                        if let Expr::Variable(name) = expr {
+                            escaped.insert(name.clone());
+                        }
+                    }
+                }
                 collect_escaped_stmt(arg, escaped);
                 /* The inlined module body can write to locals declared in the
                  * block, and the dynamic loader can write result variables.
@@ -447,6 +569,116 @@ fn collect_escaped_expr(expr: &Expr, escaped: &mut HashSet<String>) {
         }
         _ => {}
     }
+}
+
+/* An array may be passed to a pointer parameter without an explicit `*adr`,
+ * so the callee can write through it. Mark those roots escaped or cached
+ * element constants survive the call. */
+fn collect_call_array_escaped(
+    body: &[Stmt],
+    array_roots: &HashSet<String>,
+    escaped: &mut HashSet<String>,
+) {
+    fn walk_expr(expr: &Expr, array_roots: &HashSet<String>, escaped: &mut HashSet<String>) {
+        match expr {
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    if let Expr::Variable(name) = arg {
+                        if array_roots.contains(name) {
+                            escaped.insert(name.clone());
+                        }
+                    }
+                    walk_expr(arg, array_roots, escaped);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                walk_expr(left, array_roots, escaped);
+                walk_expr(right, array_roots, escaped);
+            }
+            Expr::Index { expr: base, index } => {
+                walk_expr(base, array_roots, escaped);
+                walk_expr(index, array_roots, escaped);
+            }
+            Expr::MemberAccess { expr: base, .. } | Expr::AddrOfExpr(base) => {
+                walk_expr(base, array_roots, escaped);
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(stmt: &Stmt, array_roots: &HashSet<String>, escaped: &mut HashSet<String>) {
+        match stmt {
+            Stmt::VarDefinition(decl) => {
+                if let Some(init) = &decl.initial_value {
+                    walk_expr(init, array_roots, escaped);
+                }
+            }
+            Stmt::Assignment { targets, value } => {
+                for target in targets {
+                    walk_expr(target, array_roots, escaped);
+                }
+                walk_expr(value, array_roots, escaped);
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                walk_expr(cond, array_roots, escaped);
+                walk_stmts(then_branch, array_roots, escaped);
+                if let Some(b) = else_branch {
+                    walk_stmts(b, array_roots, escaped);
+                }
+            }
+            Stmt::While { cond, body } => {
+                walk_expr(cond, array_roots, escaped);
+                walk_stmts(body, array_roots, escaped);
+            }
+            Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+            } => {
+                for nested in [init, post] {
+                    if let Some(stmt) = nested {
+                        walk_stmt(stmt, array_roots, escaped);
+                    }
+                }
+                walk_expr(cond, array_roots, escaped);
+                walk_stmts(body, array_roots, escaped);
+            }
+            Stmt::Return(values) => {
+                for (_, expr) in values {
+                    walk_expr(expr, array_roots, escaped);
+                }
+            }
+            Stmt::Jmpto { args, .. } | Stmt::Critical(args) => {
+                walk_stmts(args, array_roots, escaped);
+            }
+            Stmt::Expr(expr) => walk_expr(expr, array_roots, escaped),
+            Stmt::Match {
+                expr,
+                cases,
+                default,
+            } => {
+                walk_expr(expr, array_roots, escaped);
+                for (ce, body) in cases {
+                    walk_expr(ce, array_roots, escaped);
+                    walk_stmts(body, array_roots, escaped);
+                }
+                if let Some(body) = default {
+                    walk_stmts(body, array_roots, escaped);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmts(body: &[Stmt], array_roots: &HashSet<String>, escaped: &mut HashSet<String>) {
+        for stmt in body {
+            walk_stmt(stmt, array_roots, escaped);
+        }
+    }
+    walk_stmts(body, array_roots, escaped);
 }
 
 fn collect_addr_target_roots(expr: &Expr, escaped: &mut HashSet<String>) {
@@ -626,6 +858,21 @@ fn get_expr_path(expr: &Expr) -> Option<String> {
         Expr::AddrOfExpr(inner) => get_expr_path(inner),
         _ => None,
     }
+}
+
+fn expr_root_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Variable(name) => Some(name),
+        Expr::AddrOf(name) => Some(name.rsplit(':').next().unwrap_or(name)),
+        Expr::MemberAccess { expr: base, .. } | Expr::AddrOfExpr(base) => expr_root_name(base),
+        Expr::Index { expr: base, .. } => expr_root_name(base),
+        _ => None,
+    }
+}
+
+fn invalidate_root_elements(consts: &mut HashMap<String, Expr>, root: &str) {
+    let prefix = format!("{}[", root);
+    consts.retain(|k, _| !k.starts_with(&prefix));
 }
 
 fn is_constant_expr(expr: &Expr) -> bool {
@@ -873,20 +1120,10 @@ fn optimize_expr_recursive(
                 "OpAdd" => Some(val_a.wrapping_add(val_b)),
                 "OpSub" => Some(val_a.wrapping_sub(val_b)),
                 "OpMul" => Some(val_a.wrapping_mul(val_b)),
-                "OpDiv" => {
-                    if val_b != 0 {
-                        Some(val_a / val_b)
-                    } else {
-                        None
-                    }
-                }
-                "OpMod" => {
-                    if val_b != 0 {
-                        Some(val_a % val_b)
-                    } else {
-                        None
-                    }
-                }
+                /* checked_div/checked_mod also reject i64::MIN / -1, which
+                 * overflows in Rust (and traps on x86 idiv). */
+                "OpDiv" => val_a.checked_div(val_b),
+                "OpMod" => val_a.checked_rem(val_b),
                 "OpLt" | "Lt" | "<" => Some(if val_a < val_b { 1 } else { 0 }),
                 "OpLtEq" | "OpLe" | "<=" => Some(if val_a <= val_b { 1 } else { 0 }),
                 "OpGt" | "Gt" | ">" => Some(if val_a > val_b { 1 } else { 0 }),
@@ -911,20 +1148,10 @@ fn optimize_expr_recursive(
                 "OpAdd" => Some(val_a.wrapping_add(val_b)),
                 "OpSub" => Some(val_a.wrapping_sub(val_b)),
                 "OpMul" => Some(val_a.wrapping_mul(val_b)),
-                "OpDiv" => {
-                    if val_b != 0 {
-                        Some(val_a / val_b)
-                    } else {
-                        None
-                    }
-                }
-                "OpMod" => {
-                    if val_b != 0 {
-                        Some(val_a % val_b)
-                    } else {
-                        None
-                    }
-                }
+                /* checked_div/checked_mod also reject i64::MIN / -1, which
+                 * overflows in Rust (and traps on x86 idiv). */
+                "OpDiv" => val_a.checked_div(val_b),
+                "OpMod" => val_a.checked_rem(val_b),
                 "OpBitAnd" => Some(val_a & val_b),
                 "OpBitOr" => Some(val_a | val_b),
                 "OpBitXor" => Some(val_a ^ val_b),
@@ -966,7 +1193,7 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_pure_expr(left) && is_same_expr(left, right) {
+            if is_pure_expr(left, env) && is_same_expr(left, right) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -980,11 +1207,11 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_left_zero && is_pure_expr(right) {
+            if is_left_zero && is_pure_expr(right, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
-            if is_right_zero && is_pure_expr(left) {
+            if is_right_zero && is_pure_expr(left, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -1045,11 +1272,11 @@ fn optimize_expr_recursive(
             }
         }
         if op_str == "OpBitAnd" {
-            if is_left_zero && is_pure_expr(right) {
+            if is_left_zero && is_pure_expr(right, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
-            if is_right_zero && is_pure_expr(left) {
+            if is_right_zero && is_pure_expr(left, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -1059,7 +1286,7 @@ fn optimize_expr_recursive(
                     return count + 1;
                 }
             }
-            if is_pure_expr(left) && is_same_expr(left, right) {
+            if is_pure_expr(left, env) && is_same_expr(left, right) {
                 *expr = *left.clone();
                 return count + 1;
             }
@@ -1073,7 +1300,7 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_pure_expr(left) && is_same_expr(left, right) {
+            if is_pure_expr(left, env) && is_same_expr(left, right) {
                 *expr = *left.clone();
                 return count + 1;
             }
@@ -1087,7 +1314,7 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_pure_expr(left) && is_same_expr(left, right) {
+            if is_pure_expr(left, env) && is_same_expr(left, right) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -1107,7 +1334,15 @@ fn optimize_expr_recursive(
                 {
                     if inner_op == &op_str {
                         if let Expr::Number(inner) = &**inner_right {
-                            Some((inner_left.clone(), inner.wrapping_add(*outer)))
+                            /* x86 masks each shift count independently:
+                             * (x << 63) << 1 is zero, not x << 0. Only
+                             * fold when neither count wraps and their sum
+                             * stays below the machine width. */
+                            if *inner < 64 && *outer < 64 && inner + *outer < 64 {
+                                Some((inner_left.clone(), inner + *outer))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -1131,7 +1366,7 @@ fn optimize_expr_recursive(
             }
         }
         if op_str == "OpAnd" || op_str == "&&" {
-            if is_left_zero && is_pure_expr(right) {
+            if is_left_zero && is_pure_expr(right, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -1143,13 +1378,13 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_right_zero && is_pure_expr(left) {
+            if is_right_zero && is_pure_expr(left, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
         }
         if op_str == "OpOr" || op_str == "||" {
-            if is_left_one && is_pure_expr(right) {
+            if is_left_one && is_pure_expr(right, env) {
                 *expr = Expr::Number(1);
                 return count + 1;
             }
@@ -1161,13 +1396,13 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_right_one && is_pure_expr(left) {
+            if is_right_one && is_pure_expr(left, env) {
                 *expr = Expr::Number(1);
                 return count + 1;
             }
         }
 
-        if is_pure_expr(left) && is_same_expr(left, right) {
+        if is_pure_expr(left, env) && is_same_expr(left, right) {
             match op_str.as_str() {
                 "OpEq" | "OpEqEq" | "==" | "OpLtEq" | "OpLe" | "<=" | "OpGtEq" | "OpGe" | ">=" => {
                     *expr = Expr::Number(1);
@@ -1227,6 +1462,13 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<String>) {
                         path.as_str()
                     };
                     assigned.insert(root.to_string());
+                }
+                /* A write through a computed index can alias any element,
+                 * so treat the whole array as assigned. */
+                if let Expr::Index { expr: base, .. } = target {
+                    if let Some(root) = expr_root_name(base) {
+                        assigned.insert(root.to_string());
+                    }
                 }
                 collect_assigned_expr(target, assigned);
             }
@@ -1436,6 +1678,12 @@ fn optimize_statements(
                             && !target_path.contains(':')
                             && !output_ptrs.contains(&target_path)
                         {
+                            /* Union fields share storage: writing one field
+                             * invalidates every cached field of that union. */
+                            if env.union_roots.contains(root) && target_path.contains('.') {
+                                let prefix = format!("{}.", root);
+                                consts.retain(|k, _| !k.starts_with(&prefix));
+                            }
                             if is_constant_expr(&value) {
                                 consts.insert(target_path, value.clone());
                             } else {
@@ -1451,11 +1699,32 @@ fn optimize_statements(
                                 }
                             }
                         }
+                    } else if let Expr::Index { expr: base, .. } = target {
+                        /* Computed index: the write can hit any element. */
+                        if let Some(root) = expr_root_name(base) {
+                            if !escaped.contains(root) {
+                                invalidate_root_elements(consts, root);
+                                consts.remove(root);
+                            }
+                        }
                     }
                 } else {
                     for target in &targets {
                         if let Some(target_path) = get_expr_path(target) {
                             consts.remove(&target_path);
+                            let root = target_path
+                                .split(|c| c == '.' || c == '[')
+                                .next()
+                                .unwrap_or(&target_path);
+                            if env.union_roots.contains(root) {
+                                let prefix = format!("{}.", root);
+                                consts.retain(|k, _| !k.starts_with(&prefix));
+                            }
+                        } else if let Expr::Index { expr: base, .. } = target {
+                            if let Some(root) = expr_root_name(base) {
+                                invalidate_root_elements(consts, root);
+                                consts.remove(root);
+                            }
                         }
                     }
                 }
@@ -1558,8 +1827,20 @@ fn optimize_statements(
                     continue;
                 }
 
-                let opt_body =
-                    optimize_statements(body, consts, escaped, reads, output_ptrs, count, env);
+                /* The body may run zero times. Optimize it with a copy of the
+                 * entry constants and discard everything it learns, otherwise
+                 * a constant assigned only inside the loop would appear to
+                 * hold after it. */
+                let mut loop_consts = consts.clone();
+                let opt_body = optimize_statements(
+                    body,
+                    &mut loop_consts,
+                    escaped,
+                    reads,
+                    output_ptrs,
+                    count,
+                    env,
+                );
                 new_stmts.push(Stmt::While {
                     cond,
                     body: opt_body,
@@ -1611,11 +1892,16 @@ fn optimize_statements(
 
                 *count += optimize_expr_recursive(&mut cond, consts, escaped, env);
 
+                /* `post` runs after the body, while the source order below is
+                 * init/cond/post/body. Give each a private copy of the entry
+                 * constants so facts learned in one cannot leak into the
+                 * other or past the loop. */
+                let mut post_consts = consts.clone();
                 let opt_post = if let Some(p) = post {
                     let post_wrapper = vec![*p];
                     let mut opt_post_vec = optimize_statements(
                         post_wrapper,
-                        consts,
+                        &mut post_consts,
                         escaped,
                         reads,
                         output_ptrs,
@@ -1631,8 +1917,16 @@ fn optimize_statements(
                     None
                 };
 
-                let opt_body =
-                    optimize_statements(body, consts, escaped, reads, output_ptrs, count, env);
+                let mut body_consts = consts.clone();
+                let opt_body = optimize_statements(
+                    body,
+                    &mut body_consts,
+                    escaped,
+                    reads,
+                    output_ptrs,
+                    count,
+                    env,
+                );
 
                 if let Expr::Number(0) = cond {
                     *count += 1;
@@ -1655,8 +1949,25 @@ fn optimize_statements(
                 new_stmts.push(Stmt::Return(values));
             }
             Stmt::Jmpto { module_name, args } => {
-                let opt_args =
-                    optimize_statements(args, consts, escaped, reads, output_ptrs, count, env);
+                /* Result markers must keep their plain `Variable` form: the
+                 * backend only records result targets for those. Optimize the
+                 * argument statements, but pass markers through untouched. */
+                let mut opt_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    if matches!(arg, Stmt::Return(_)) {
+                        opt_args.push(arg);
+                    } else {
+                        opt_args.extend(optimize_statements(
+                            vec![arg],
+                            consts,
+                            escaped,
+                            reads,
+                            output_ptrs,
+                            count,
+                            env,
+                        ));
+                    }
+                }
                 /* The worker body is emitted after optimization (or executed
                  * by the loader at runtime), so it can change any local the
                  * caller has cached as a constant. */
@@ -1683,16 +1994,46 @@ fn optimize_statements(
                 *count += optimize_expr_recursive(&mut expr, consts, escaped, env);
 
                 let mut new_cases = Vec::new();
+                let mut branch_assigned = HashSet::new();
                 for (case_expr, body) in cases {
                     let mut ce = case_expr;
                     *count += optimize_expr_recursive(&mut ce, consts, escaped, env);
-                    let opt_body =
-                        optimize_statements(body, consts, escaped, reads, output_ptrs, count, env);
+                    collect_assigned(&body, &mut branch_assigned);
+                    let mut case_consts = consts.clone();
+                    let opt_body = optimize_statements(
+                        body,
+                        &mut case_consts,
+                        escaped,
+                        reads,
+                        output_ptrs,
+                        count,
+                        env,
+                    );
                     new_cases.push((ce, opt_body));
                 }
 
                 let new_default = default.map(|d| {
-                    optimize_statements(d, consts, escaped, reads, output_ptrs, count, env)
+                    collect_assigned(&d, &mut branch_assigned);
+                    let mut default_consts = consts.clone();
+                    optimize_statements(
+                        d,
+                        &mut default_consts,
+                        escaped,
+                        reads,
+                        output_ptrs,
+                        count,
+                        env,
+                    )
+                });
+
+                /* Only one case executes. Facts learned while optimizing one
+                 * case must not be visible in another or after the match. */
+                consts.retain(|k, _| {
+                    let root = k
+                        .split(|c| c == '.' || c == '[')
+                        .next()
+                        .unwrap_or(k);
+                    !branch_assigned.contains(root)
                 });
 
                 new_stmts.push(Stmt::Match {
@@ -1727,6 +2068,9 @@ mod tests {
             signs,
             copy_sources: HashSet::new(),
             single_assignment: HashSet::new(),
+            volatile: HashSet::new(),
+            array_roots: HashSet::new(),
+            union_roots: HashSet::new(),
         }
     }
 
@@ -1777,11 +2121,7 @@ mod tests {
 
     #[test]
     fn unknown_division_by_power_of_two_is_not_shifted() {
-        let env = OptimizeEnv {
-            signs: HashMap::new(),
-            copy_sources: HashSet::new(),
-            single_assignment: HashSet::new(),
-        };
+        let env = env_with_sign("unused", ValueSign::Unknown);
         let mut expr = bin(var("x"), "OpDiv", num(8));
         assert_eq!(fold(&mut expr, &env), 0);
         assert_eq!(op_of(&expr), "OpDiv");
@@ -1817,11 +2157,7 @@ mod tests {
 
     #[test]
     fn zero_multiply_does_not_drop_call_effects() {
-        let env = OptimizeEnv {
-            signs: HashMap::new(),
-            copy_sources: HashSet::new(),
-            single_assignment: HashSet::new(),
-        };
+        let env = env_with_sign("unused", ValueSign::Unknown);
         let mut expr = bin(
             num(0),
             "OpMul",
@@ -1836,11 +2172,7 @@ mod tests {
 
     #[test]
     fn zero_and_does_not_drop_call_effects() {
-        let env = OptimizeEnv {
-            signs: HashMap::new(),
-            copy_sources: HashSet::new(),
-            single_assignment: HashSet::new(),
-        };
+        let env = env_with_sign("unused", ValueSign::Unknown);
         let mut expr = bin(
             num(0),
             "OpAnd",
@@ -1892,14 +2224,61 @@ mod tests {
     }
 
     #[test]
-    fn shift_counts_wrap_before_codegen() {
+    fn shift_counts_do_not_wrap() {
         let env = env_with_sign("x", ValueSign::Unsigned);
         let mut expr = bin(bin(var("x"), "OpShl", num(u64::MAX)), "OpShl", num(1));
-        assert!(fold(&mut expr, &env) > 0);
+        /* x86 masks each shift count to 63 bits independently: (x << 63) << 1
+         * is not x << 0. The nested form must survive folding. */
+        assert_eq!(fold(&mut expr, &env), 0);
+        assert_eq!(op_of(&expr), "OpShl");
         match expr {
-            Expr::Binary { right, .. } => assert_eq!(*right, num(0)),
+            Expr::Binary { left, right, .. } => {
+                assert_eq!(*right, num(1));
+                assert_eq!(op_of(&left), "OpShl");
+            }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn nested_shifts_below_width_are_folded() {
+        let env = env_with_sign("x", ValueSign::Unsigned);
+        let mut expr = bin(bin(var("x"), "OpShl", num(3)), "OpShl", num(4));
+        assert!(fold(&mut expr, &env) > 0);
+        match expr {
+            Expr::Binary { right, .. } => assert_eq!(*right, num(7)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn signed_min_div_minus_one_is_not_folded() {
+        let env = env_with_sign("x", ValueSign::Signed);
+        let mut expr = bin(
+            Expr::SignedNumber(i64::MIN),
+            "OpDiv",
+            Expr::SignedNumber(-1),
+        );
+        assert_eq!(fold(&mut expr, &env), 0);
+        assert_eq!(op_of(&expr), "OpDiv");
+    }
+
+    #[test]
+    fn volatile_self_subtraction_is_not_folded() {
+        let mut env = env_with_sign("v", ValueSign::Unsigned);
+        env.volatile.insert("v".to_string());
+        let mut expr = bin(var("v"), "OpSub", var("v"));
+        assert_eq!(fold(&mut expr, &env), 0);
+        assert_eq!(op_of(&expr), "OpSub");
+    }
+
+    #[test]
+    fn volatile_operand_is_not_discarded() {
+        let mut env = env_with_sign("v", ValueSign::Unsigned);
+        env.volatile.insert("v".to_string());
+        let mut expr = bin(num(0), "OpMul", var("v"));
+        assert_eq!(fold(&mut expr, &env), 0);
+        assert_eq!(op_of(&expr), "OpMul");
     }
 
     #[test]

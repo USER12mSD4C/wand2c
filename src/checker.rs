@@ -39,6 +39,29 @@ impl TypeChecker {
     }
 
     pub fn calculate_struct_layout(&self, struct_name: &str) -> Result<(u32, Vec<u32>), String> {
+        let mut visiting = Vec::new();
+        self.calculate_struct_layout_inner(struct_name, &mut visiting)
+    }
+
+    fn calculate_struct_layout_inner(
+        &self,
+        struct_name: &str,
+        visiting: &mut Vec<String>,
+    ) -> Result<(u32, Vec<u32>), String> {
+        if visiting.iter().any(|n| n == struct_name) {
+            return Err(format!("recursive struct type '{}'", struct_name));
+        }
+        visiting.push(struct_name.to_string());
+        let result = self.calculate_struct_layout_body(struct_name, visiting);
+        visiting.pop();
+        result
+    }
+
+    fn calculate_struct_layout_body(
+        &self,
+        struct_name: &str,
+        visiting: &mut Vec<String>,
+    ) -> Result<(u32, Vec<u32>), String> {
         let s = self
             .structs
             .get(struct_name)
@@ -53,7 +76,7 @@ impl TypeChecker {
 
             for field in &s.fields {
                 offsets.push(0);
-                let size = self.get_type_size(&field.data_type)?;
+                let size = self.get_type_size_inner(&field.data_type, visiting)?;
                 if size > max_size {
                     max_size = size;
                 }
@@ -78,7 +101,7 @@ impl TypeChecker {
         let mut max_alignment = declared_alignment;
 
         for field in &s.fields {
-            let size = self.get_type_size(&field.data_type)?;
+            let size = self.get_type_size_inner(&field.data_type, visiting)?;
             let mut alignment = if s.is_packed { 1 } else { size };
             if alignment > 8 {
                 alignment = 8;
@@ -103,6 +126,15 @@ impl TypeChecker {
     }
 
     fn get_type_size(&self, dt: &DataType) -> Result<u32, String> {
+        let mut visiting = Vec::new();
+        self.get_type_size_inner(dt, &mut visiting)
+    }
+
+    fn get_type_size_inner(
+        &self,
+        dt: &DataType,
+        visiting: &mut Vec<String>,
+    ) -> Result<u32, String> {
         match dt {
             DataType::U8 | DataType::I8 => Ok(1),
             DataType::U16 | DataType::I16 => Ok(2),
@@ -112,15 +144,15 @@ impl TypeChecker {
             DataType::Void => Ok(0),
             DataType::Pointer(_) => Ok(8),
             DataType::Array(elem, count) => {
-                let size = self.get_type_size(elem)?;
+                let size = self.get_type_size_inner(elem, visiting)?;
                 Ok(size * (*count as u32))
             }
-            DataType::Typedef(_, underlying) => self.get_type_size(underlying),
+            DataType::Typedef(_, underlying) => self.get_type_size_inner(underlying, visiting),
             DataType::Struct(name) => {
                 if let Some(alias) = self.typedefs.get(name) {
-                    self.get_type_size(alias)
+                    self.get_type_size_inner(alias, visiting)
                 } else {
-                    let (size, _) = self.calculate_struct_layout(name)?;
+                    let (size, _) = self.calculate_struct_layout_inner(name, visiting)?;
                     Ok(size)
                 }
             }
@@ -128,9 +160,142 @@ impl TypeChecker {
     }
     pub fn verify_calls(&self, program: &Program) -> Result<(), String> {
         for func in &program.functions {
+            if func.is_irq && self.use_os {
+                return Err("irq requires sc.false".to_string());
+            }
             if let Some(body) = &func.body {
                 self.verify_stmts_calls(body)?;
             }
+        }
+        self.verify_arities(program)
+    }
+
+    /* Return/call arity is part of the ABI: the backend places exactly the
+     * values present in `return(...)`, so a missing value leaves a stale
+     * register. `jmpto` blocks are skipped because their `return(var)`
+     * entries name continuation results, not function returns. */
+    pub fn verify_arities(&self, program: &Program) -> Result<(), String> {
+        for func in &program.functions {
+            if let Some(body) = &func.body {
+                self.verify_arity_stmts(body, func)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_arity_stmts(&self, stmts: &[Stmt], func: &FuncDecl) -> Result<(), String> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::VarDefinition(decl) => {
+                    if let Some(init) = &decl.initial_value {
+                        self.verify_arity_expr(init)?;
+                    }
+                }
+                Stmt::Assignment { targets, value } => {
+                    for target in targets {
+                        self.verify_arity_expr(target)?;
+                    }
+                    self.verify_arity_expr(value)?;
+                }
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    self.verify_arity_expr(cond)?;
+                    self.verify_arity_stmts(then_branch, func)?;
+                    if let Some(else_b) = else_branch {
+                        self.verify_arity_stmts(else_b, func)?;
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    self.verify_arity_expr(cond)?;
+                    self.verify_arity_stmts(body, func)?;
+                }
+                Stmt::For {
+                    init,
+                    cond,
+                    post,
+                    body,
+                } => {
+                    if let Some(i) = init {
+                        self.verify_arity_stmts(std::slice::from_ref(i.as_ref()), func)?;
+                    }
+                    self.verify_arity_expr(cond)?;
+                    if let Some(p) = post {
+                        self.verify_arity_stmts(std::slice::from_ref(p), func)?;
+                    }
+                    self.verify_arity_stmts(body, func)?;
+                }
+                Stmt::Return(values) => {
+                    if !func.return_types.is_empty() && values.len() != func.return_types.len() {
+                        return Err(format!(
+                            "function '{}' declares {} return value(s) but returns {}",
+                            func.name,
+                            func.return_types.len(),
+                            values.len()
+                        ));
+                    }
+                }
+                Stmt::Critical(body) => self.verify_arity_stmts(body, func)?,
+                Stmt::Match {
+                    expr,
+                    cases,
+                    default,
+                } => {
+                    self.verify_arity_expr(expr)?;
+                    for (ce, body) in cases {
+                        self.verify_arity_expr(ce)?;
+                        self.verify_arity_stmts(body, func)?;
+                    }
+                    if let Some(d) = default {
+                        self.verify_arity_stmts(d, func)?;
+                    }
+                }
+                Stmt::Expr(expr) => self.verify_arity_expr(expr)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_arity_expr(&self, expr: &Expr) -> Result<(), String> {
+        match expr {
+            Expr::Call { name, args } => {
+                /* The standard-library formatters are declared with a fixed
+                 * set of argument slots but are called with a varying number
+                 * of arguments throughout the language's programs. */
+                let variadic = name == "printf" || name == "snprintf";
+                if let Some(callee) = self.functions.get(name) {
+                    if !variadic && args.len() != callee.params.len() {
+                        return Err(format!(
+                            "call to '{}' passes {} argument(s), expected {}",
+                            name,
+                            args.len(),
+                            callee.params.len()
+                        ));
+                    }
+                }
+                for arg in args {
+                    self.verify_arity_expr(arg)?;
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.verify_arity_expr(left)?;
+                self.verify_arity_expr(right)?;
+            }
+            Expr::Index { expr: base, index } => {
+                self.verify_arity_expr(base)?;
+                self.verify_arity_expr(index)?;
+            }
+            Expr::MemberAccess { expr: base, .. } => self.verify_arity_expr(base)?,
+            Expr::AddrOfExpr(inner) => self.verify_arity_expr(inner)?,
+            Expr::ArrayInit(items) => {
+                for item in items {
+                    self.verify_arity_expr(item)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -227,7 +392,6 @@ impl TypeChecker {
                     "syscall4",
                     "syscall5",
                     "syscall6",
-                    "bmloc",
                     "inb",
                     "outb",
                     "inw",
@@ -287,7 +451,7 @@ impl TypeChecker {
 
                 let hosted_only = [
                     "syscall0", "syscall1", "syscall2", "syscall3", "syscall4", "syscall5",
-                    "syscall6", "jmpto",
+                    "syscall6",
                 ];
 
                 if hosted_only.contains(&name.as_str()) && !self.use_os {
@@ -314,6 +478,11 @@ impl TypeChecker {
             }
             Expr::AddrOfExpr(inner) => {
                 self.verify_expr_calls(inner)?;
+            }
+            Expr::ArrayInit(items) => {
+                for item in items {
+                    self.verify_expr_calls(item)?;
+                }
             }
             _ => {}
         }
