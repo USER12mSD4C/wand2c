@@ -829,21 +829,11 @@ return(0);
 
 ### Function Versions
 
-A function can have a version.
-
-```wandc
-export fn open(u8* path, u64 flags) -> i64 version 2;
-```
-
-With body:
-
-```wandc
-export fn open(u8* path, u64 flags) -> i64 version 2 {
-    return(0);
-}
-```
-
-Default function version is 1.
+> Current limitation: the parser accepts the `version N` suffix but does not
+> implement it. The emitted symbol is the plain function name (`open`, not
+> `open@2`), and two definitions differing only in version collide. Do not use
+> function versions for ABI versioning yet. Struct/union/version reflection
+> (`versionof`) is implemented; function versioning is not.
 
 ---
 
@@ -863,12 +853,8 @@ Use `extern` to declare a function from another module.
 extern fn external_func(u64 a, u64 b) -> u64;
 ```
 
-Exported and extern functions can have versions.
-
-```wandc
-export fn open(u8* path, u64 flags) -> i64 version 2;
-extern fn close(u64 fd) -> i64 version 1;
-```
+> Function `version` suffixes are currently accepted but ignored; exported
+> symbols use only the function name. See [section 21](#21-functions).
 
 ---
 
@@ -982,6 +968,41 @@ Example:
 atomic_add(shared:counter*adr, 1);
 ```
 
+Implementation notes:
+
+- These builtins work on the pointed-to type: `atomic u8`, `atomic u16`,
+  `atomic u32` and `atomic u64` emit 1-, 2-, 4- and 8-byte operations. Narrow
+  operations never touch adjacent bytes.
+- `atomic_add`, `atomic_sub`, `atomic_swap` and `atomic_cas` return the **old**
+  value; `atomic_inc` and `atomic_dec` return the **new** value.
+- `atomic_load` is a plain load, `atomic_store` is a store followed by
+  `memory_barrier()`, and the read-modify-write builtins use locked
+  instructions (`xchg` or `lock xadd`/`lock cmpxchg`).
+
+A spinlock can therefore be written entirely in Wand:
+
+```wandc
+sect.shared
+atomic u32 lock_word = 0;
+EOS
+
+fn lock() -> u64 {
+    while (atomic_swap(shared:lock_word*adr, 1) != 0) {
+        while (atomic_load(shared:lock_word*adr) != 0) {
+            ::nasm::{
+                pause
+            }
+        }
+    }
+    return(0);
+}
+
+fn unlock() -> u64 {
+    atomic_store(shared:lock_word*adr, 0);
+    return(0);
+}
+```
+
 ---
 
 ## 26. Critical Sections
@@ -1042,13 +1063,33 @@ fn read_timestamp() -> u64 {
 }
 ```
 
-Rules:
+Supported instructions (this is a small built-in encoder, **not** a full NASM
+assembler):
 
-1. Inline assembly is unsafe.
-2. The compiler treats the block as an optimization barrier.
-3. The compiler must store referenced local variables in memory before the block.
-4. The compiler must assume that all registers can change.
-5. The programmer is responsible for correctness and side effects.
+| Instruction | Notes |
+|---|---|
+| `pause`, `hlt`, `nop`, `rdtsc` | No operands. |
+| `mfence`, `lfence`, `sfence` | No operands. |
+| `cli`, `sti`, `cld` | No operands. |
+| `syscall`, `ret`, `push rbp`, `pop rbp` | Fixed encodings. |
+| `rep movsb`, `rep stosb` | Fixed encodings. |
+| `mov reg, reg` | `rax/rbx/rcx/rdx/rsi/rdi` and 8/16/32-bit aliases (`al`, `ax`, `eax`, …). |
+| `mov [local], reg`, `mov reg, [local]` | Stack slot of a local variable; width follows the register name. |
+| `mov reg, imm` | Signed decimal immediate, truncated to the register width. |
+
+Rules and limitations:
+
+1. Inline assembly is unsafe and the programmer is responsible for side effects.
+2. The block statement itself is kept by the optimizer. Locals named as
+   `[name]` inside the block are kept in memory and are not constant-propagated.
+3. The compiler does **not** save or restore registers around the block.
+   Do not clobber registers that hold live values; prefer passing values
+   through local variables.
+4. Unknown lines are not assembled. The compiler prints
+   `warning: unsupported ::nasm:: line ignored` and emits no bytes for them,
+   so check compiler output when using unfamiliar instructions.
+5. This is not an optimization or CPU memory barrier by itself. Use explicit
+   `memory_barrier()` if ordering is required.
 
 ---
 

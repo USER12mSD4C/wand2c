@@ -561,6 +561,11 @@ fn kmain() {
 }
 ```
 
+The `mov [low], eax` / `mov [high], edx` lines write the 32-bit halves into
+local stack slots; the optimizer keeps these locals because the asm block
+references them by name. Unsupported asm lines are ignored with a compiler
+warning, so check the build output.
+
 ---
 
 ## Critical Sections (Bare Metal)

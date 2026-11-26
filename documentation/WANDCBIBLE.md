@@ -945,6 +945,10 @@ fn increment() {
 | `memory_barrier()` | Full memory fence |
 | `compiler_barrier()` | Prevent compiler reordering |
 
+Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
+`add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
+new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
+
 ## Part 3: Memory and Safety
 
 ### Chapter 15: Stack vs Heap
@@ -1810,23 +1814,38 @@ fn get_ticks() -> u64 {
 }
 ```
 
-Supported instructions:
+Supported instructions (small built-in encoder, not a full NASM assembler):
 
-| Instruction | Encoding |
-|-------------|----------|
+| Instruction | Encoding / notes |
+|-------------|------------------|
+| `pause` | 0xF3 0x90 |
 | `hlt` | 0xF4 |
 | `cli` | 0xFA |
 | `sti` | 0xFB |
 | `nop` | 0x90 |
+| `cld` | 0xFC |
+| `mfence` | 0x0F 0xAE 0xF0 |
+| `lfence` | 0x0F 0xAE 0xE8 |
+| `sfence` | 0x0F 0xAE 0xF8 |
 | `ret` | 0xC3 |
 | `syscall` | 0x0F 0x05 |
 | `rdtsc` | 0x0F 0x31 |
 | `push rbp` | 0x55 |
 | `pop rbp` | 0x5D |
-| `mov reg, reg` | Register to register move |
-| `mov [var], reg` | Store register to local variable |
-| `mov reg, [var]` | Load local variable to register |
-| `mov reg, imm` | Immediate to register |
+| `rep movsb` | 0xF3 0xA4 |
+| `rep stosb` | 0xF3 0xAA |
+| `mov reg, reg` | Width follows the register name (`rax`/`eax`/`ax`/`al`, …). |
+| `mov [var], reg` | Store register into a local's stack slot. |
+| `mov reg, [var]` | Load a local's stack slot into a register. |
+| `mov reg, imm` | Signed decimal immediate, truncated to register width. |
+
+Registers accepted by `mov`: `rax/rcx/rdx/rbx/rsi/rdi` and their 32-bit
+(`eax/…`), 16-bit (`ax/…`) and low-byte 8-bit (`al/…`) aliases.
+
+Unknown lines emit no bytes and produce a compiler warning
+(`warning: unsupported ::nasm:: line ignored`). The compiler does not save or
+restore registers around a block; use local variables to exchange values and
+do not assume the block is a CPU memory fence.
 
 ### Chapter 28: Critical Sections and IRQ Handlers
 
@@ -2501,6 +2520,10 @@ wand2c kernel.w -o kernel.img -fk --entry kmain
 | `memory_barrier()` | Full memory fence |
 | `compiler_barrier()` | Prevent compiler reordering |
 
+Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
+`add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
+new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
+
 ### Chapter 41: Writing a TUI Text Editor
 
 This project builds a minimal text editor using the `tui` and `keyboard` modules.
@@ -3133,6 +3156,10 @@ To force dynamic loading at runtime, compile the host without the worker source 
 | `atomic_cas(ptr, exp, des)` | Compare-and-swap |
 | `memory_barrier()` | Full memory fence |
 | `compiler_barrier()` | Prevent compiler reordering |
+
+Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
+`add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
+new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
 
 ## Appendix E: Standard Library Module Index
 
