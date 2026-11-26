@@ -110,7 +110,7 @@ impl MemorySafetyAnalyzer {
 
     fn is_allocation_call(&self, expr: &Expr) -> bool {
         if let Expr::Call { name, .. } = expr {
-            name == "mloc" || name == "bmloc"
+            name == "mloc"
         } else {
             false
         }
