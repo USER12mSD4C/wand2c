@@ -832,7 +832,7 @@ return(0);
 > Current limitation: the parser accepts the `version N` suffix but does not
 > implement it. The emitted symbol is the plain function name (`open`, not
 > `open@2`), and two definitions differing only in version collide. Do not use
-> function versions for ABI versioning yet. Struct/union/version reflection
+> function versions for ABI versioning yet. Struct/union version reflection
 > (`versionof`) is implemented; function versioning is not.
 
 ---
