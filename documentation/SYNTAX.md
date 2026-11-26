@@ -168,7 +168,9 @@ u8* p = null;
 | `f64` | 8 bytes |
 | `void` | no value |
 
-Signed types use two's complement representation.
+Signed types use two's complement representation. When a narrow signed value
+(`i8`, `i16`, `i32`) is promoted into a 64-bit expression, it is sign-extended;
+the unsigned types zero-extend.
 
 ---
 
