@@ -1,5 +1,5 @@
 mod abi;
-use abi::generate_elf64_binary;
+use abi::{generate_elf64_binary, generate_wexp_image};
 mod ast;
 mod checker;
 mod codegen;
@@ -619,21 +619,43 @@ fn main() {
         }
     }
 
-    let executable_image =
-        if output_format == OutputFormat::Program || output_format == OutputFormat::Wexp {
-            generate_elf64_binary(&generator.code, &program, &generator)
-        } else {
-            generator.code
-        };
+    let executable_image = match output_format {
+        OutputFormat::Program => generate_elf64_binary(&generator.code, &program, &generator),
+        OutputFormat::Wexp => {
+            let module_name = std::path::Path::new(&final_output)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "main_module".to_string());
+            generate_wexp_image(
+                &generator.code,
+                &program,
+                &generator,
+                if module_name.is_empty() {
+                    "main_module"
+                } else {
+                    &module_name
+                },
+            )
+        }
+        _ => generator.code,
+    };
 
     if verbose {
-        println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
-        println!("      .text          (0x400078) -> Executive payload");
-        println!("      .p46_header    (ABI Magic + Metadata)");
-        println!("      .p46_types     (TLV structures declarations)");
-        println!("      .p46_exports   (Exported symbols & signatures)");
-        println!("      .p46_deps      (Standard 4/6 dependencies)");
-        println!("      .p46_strtab    (Symbol names String Table)");
+        if output_format == OutputFormat::Wexp {
+            println!("    \x1b[37;1mPacking Standard 4/6 continuation object:\x1b[0m");
+            println!("      P46 header     (flat Raw Binary, no load address)");
+            println!("      P46 sections   (types, exports, reflect, imports, deps)");
+            println!("      vendor 100     (relocatable module image)");
+            println!("      vendor 101     (module-relative relocations)");
+        } else if output_format == OutputFormat::Program {
+            println!("    \x1b[37;1mLinking ELF SHT Sections:\x1b[0m");
+            println!("      .text          (0x400078) -> Executive payload");
+            println!("      .p46_header    (ABI Magic + Metadata)");
+            println!("      .p46_types     (TLV structures declarations)");
+            println!("      .p46_exports   (Exported symbols & signatures)");
+            println!("      .p46_deps      (Standard 4/6 dependencies)");
+            println!("      .p46_strtab    (Symbol names String Table)");
+        }
     }
 
     if let Err(e) = fs::write(&final_output, &executable_image) {

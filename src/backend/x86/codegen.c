@@ -473,6 +473,7 @@ typedef struct {
 
 typedef struct {
     WStr name;
+    uint32_t version;
     WParam* params;
     size_t param_count;
     WType** returns;
@@ -889,6 +890,7 @@ static WProgram rd_program(Reader* r) {
     for (uint32_t i = 0; i < n; i++) {
         WFunc* f = &p.funcs[i];
         f->name = rd_str(r);
+        f->version = rd_u32(r);
         uint32_t params = rd_u32(r);
         f->param_count = params;
         f->params = (WParam*)arena_alloc(g_arena, (size_t)(params ? params : 1) * sizeof(WParam));
@@ -2191,6 +2193,50 @@ static int atomic_operand_signed(Gen* g, WExpr* e) {
     return t && (t->tag == 4 || t->tag == 5 || t->tag == 6);
 }
 
+/* Raw address loads/stores. These are compiler builtins, not new syntax:
+ * existing Wand call expressions keep working while the back end emits the
+ * exact-width x86 access directly. `volatile_*` variants add mfence ordering
+ * for MMIO registers; all variants are unaligned-safe on x86. */
+static int raw_mem_builtin(WStr name, uint32_t* width, int* is_store,
+                           int* is_volatile) {
+    const char* prefix = NULL;
+    int store = 0;
+    int vol = 0;
+
+    if (wstr_starts_with(name, "volatile_load_")) {
+        prefix = "volatile_load_";
+        vol = 1;
+    } else if (wstr_starts_with(name, "volatile_store_")) {
+        prefix = "volatile_store_";
+        store = 1;
+        vol = 1;
+    } else if (wstr_starts_with(name, "mem_load_")) {
+        prefix = "mem_load_";
+    } else if (wstr_starts_with(name, "mem_store_")) {
+        prefix = "mem_store_";
+        store = 1;
+    } else {
+        return 0;
+    }
+
+    size_t prefix_len = strlen(prefix);
+    WStr suffix = wstr_sub(name, prefix_len, name.len - prefix_len);
+    if (wstr_eq_c(suffix, "u8")) {
+        *width = 1;
+    } else if (wstr_eq_c(suffix, "u16")) {
+        *width = 2;
+    } else if (wstr_eq_c(suffix, "u32")) {
+        *width = 4;
+    } else if (wstr_eq_c(suffix, "u64")) {
+        *width = 8;
+    } else {
+        return 0;
+    }
+    *is_store = store;
+    *is_volatile = vol;
+    return 1;
+}
+
 /* Operand-size prefix for atomic read-modify-write instructions. */
 static void emit_atomic_prefix(Buf* b, uint32_t size) {
     if (size == 8) {
@@ -2327,7 +2373,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                         section.str2 = wstr_sub(key, colon + 1, key.len - colon - 1);
                         compile_expr(g, &section, reg, deref_ptr);
                     } else if (map_get_str(&g->function_offsets, e->str, &off)) {
-                        if (g->format == WAND_OUTPUT_OBJECT) {
+                        if (g->format == WAND_OUTPUT_OBJECT ||
+                            g->format == WAND_OUTPUT_WEXP) {
                             WStr fnkey = wstr_prefix("fn:", e->str);
                             emit_rip_relative_lea(g, reg, fnkey);
                         } else {
@@ -2356,7 +2403,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                         section.str2 = wstr_sub(key, colon + 1, key.len - colon - 1);
                         compile_address(g, &section, reg);
                     } else if (map_get_str(&g->function_offsets, e->str, &off)) {
-                        if (g->format == WAND_OUTPUT_OBJECT) {
+                        if (g->format == WAND_OUTPUT_OBJECT ||
+                            g->format == WAND_OUTPUT_WEXP) {
                             WStr fnkey = wstr_prefix("fn:", e->str);
                             emit_rip_relative_lea(g, reg, fnkey);
                         } else {
@@ -2625,7 +2673,22 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 } else {
                     emit_mov_imm64(b, 7, 0);
                 }
+                /* rdi = module name, rsi = args (none), rdx = 0,
+                 * rcx = one result slot, r8 = 1. Keep rsp 16-byte aligned. */
+                static const uint8_t alloc_slots[] = {0x48, 0x83, 0xEC, 0x10};
+                static const uint8_t mov_rsi_rsp[] = {0x48, 0x89, 0xE6};
+                static const uint8_t xor_edx[] = {0x48, 0x31, 0xD2};
+                static const uint8_t lea_rcx_slot[] = {0x48, 0x8D, 0x48, 0x08};
+                static const uint8_t load_rax_slot[] = {0x48, 0x8B, 0x44, 0x24, 0x08};
+                static const uint8_t free_slots[] = {0x48, 0x83, 0xC4, 0x10};
+                buf_bytes(b, alloc_slots, sizeof(alloc_slots));
+                buf_bytes(b, mov_rsi_rsp, sizeof(mov_rsi_rsp));
+                buf_bytes(b, xor_edx, sizeof(xor_edx));
+                buf_bytes(b, lea_rcx_slot, sizeof(lea_rcx_slot));
+                emit_mov_imm64(b, 8, 1);
                 emit_call_patch(g, wstr_lit("__wand_jmpto_loader"));
+                buf_bytes(b, load_rax_slot, sizeof(load_rax_slot));
+                buf_bytes(b, free_slots, sizeof(free_slots));
                 move_rax_to_reg(b, reg);
                 return;
             }
@@ -2639,6 +2702,58 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 buf_u8(b, 0x48); buf_u8(b, 0x31); buf_u8(b, 0xC0);
                 move_rax_to_reg(b, reg);
                 return;
+            }
+            {
+                uint32_t width = 0;
+                int is_store = 0;
+                int is_volatile = 0;
+                if (raw_mem_builtin(name, &width, &is_store, &is_volatile)) {
+                    static const uint8_t mfence[] = {0x0F, 0xAE, 0xF0};
+                    if (is_volatile) buf_bytes(b, mfence, sizeof(mfence));
+                    if (!is_store) {
+                        if (!argc) {
+                            emit_mov_imm64(b, reg, 0);
+                            return;
+                        }
+                        compile_expr(g, e->args[0], 0, 0);
+                        if (width == 1) {
+                            buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0x00);
+                        } else if (width == 2) {
+                            buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, 0x00);
+                        } else if (width == 4) {
+                            buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                        } else {
+                            buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                        }
+                        if (is_volatile) buf_bytes(b, mfence, sizeof(mfence));
+                        move_rax_to_reg(b, reg);
+                        return;
+                    }
+                    if (argc < 2) {
+                        emit_mov_imm64(b, reg, 0);
+                        return;
+                    }
+                    static const uint8_t alloc_slots[] = {0x48, 0x83, 0xEC, 0x10};
+                    static const uint8_t free_slots[] = {0x48, 0x83, 0xC4, 0x10};
+                    buf_bytes(b, alloc_slots, sizeof(alloc_slots));
+                    compile_expr(g, e->args[0], 0, 0);
+                    emit_mov_to_stack(b, 0, 0);
+                    compile_expr(g, e->args[1], 0, 1);
+                    emit_mov_from_stack(b, 1, 0);
+                    if (width == 1) {
+                        buf_u8(b, 0x88); buf_u8(b, 0x01);
+                    } else if (width == 2) {
+                        buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, 0x01);
+                    } else if (width == 4) {
+                        buf_u8(b, 0x89); buf_u8(b, 0x01);
+                    } else {
+                        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x01);
+                    }
+                    if (is_volatile) buf_bytes(b, mfence, sizeof(mfence));
+                    buf_bytes(b, free_slots, sizeof(free_slots));
+                    emit_mov_imm64(b, reg, 0);
+                    return;
+                }
             }
             if (wstr_eq_c(name, "atomic_load")) {
                 if (!argc) {
@@ -2851,8 +2966,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     WType* pt = peel_typedefs(callee->params[i].type);
                     uint8_t access = callee->params[i].access;
                     f = pt && pt->tag == 8;
-                    /* A modifier (*i/*o/*io) makes a pointer parameter even
-                     * when its declared type is a plain scalar. */
+                    /* An access modifier (in, out, in-out) makes a pointer
+                     * parameter even when its declared type is a scalar. */
                     p = (access == 0 || access == 1 || access == 2) ||
                         (pt && (pt->tag == 10 || pt->tag == 12));
                 }
@@ -3243,9 +3358,9 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 elem_size = type_size(g, base_type->inner);
             }
             /* The base of an index is an address, not a value: compile it as
-             * an lvalue so pointer parameters (*i/*o/*io) and local pointer
-             * variables stay pointers. compile_expr(..., deref_ptr=1) used to
-             * load the first element here, turning a[j] into a[0][j]. */
+             * an lvalue so pointer parameters and local pointer variables stay
+             * pointers. compile_expr(..., deref_ptr=1) used to load the first
+             * element here, turning a[j] into a[0][j]. */
             compile_address(g, e->a, 3);
             buf_u8(b, 0x53);
             compile_expr(g, e->b, 0, 1);
@@ -3631,6 +3746,117 @@ static void compile_nasm(Gen* g, WStr code) {
     }
 }
 
+static void wstr_vec_push_unique(WStrVec* v, WStr name) {
+    if (!name.ptr || !name.len) return;
+    for (size_t i = 0; i < v->n; i++) {
+        if (wstr_eq(v->v[i], name)) return;
+    }
+    WStrVec_push(v, name);
+}
+
+/* Dynamic `jmpto`. There is no new syntax: variables prepared by the block
+ * become the continuation's arguments, and `return(var)` entries in the block
+ * name variables that receive the continuation's results. With no return
+ * entries the first result is still available in rax, as before. */
+static void compile_dynamic_jmpto(Gen* g, WStmt* s, int variable_module) {
+    Buf* b = &g->code;
+    WStrVec arg_names = {0};
+    WStrVec result_targets = {0};
+
+    for (size_t i = 0; i < s->stmt1_count; i++) {
+        WStmt* arg = s->stmts1[i];
+        if (!arg) continue;
+        if (arg->tag == 6) {
+            for (size_t j = 0; j < arg->return_count; j++) {
+                WExpr* expr = arg->returns[j].expr;
+                if (expr && expr->tag == 3) {
+                    wstr_vec_push_unique(&result_targets, expr->str);
+                }
+            }
+            continue;
+        }
+        if (arg->tag == 0 && arg->type) {
+            uint64_t type_ptr;
+            uint32_t size = 8;
+            if (map_get_str(&g->local_types, arg->name, &type_ptr)) {
+                size = type_size(g, AS_PTR(WType, type_ptr));
+            }
+            if (size && size <= 8) wstr_vec_push_unique(&arg_names, arg->name);
+        } else if (arg->tag == 1) {
+            for (size_t j = 0; j < arg->expr_count; j++) {
+                if (arg->exprs[j] && arg->exprs[j]->tag == 3) {
+                    wstr_vec_push_unique(&arg_names, arg->exprs[j]->str);
+                }
+            }
+        }
+        compile_stmt(g, arg);
+    }
+
+    size_t arg_count = arg_names.n < 6 ? arg_names.n : 6;
+    size_t result_count = result_targets.n < 4 ? result_targets.n : 4;
+    size_t slot_count = arg_count + result_count;
+    if (slot_count == 0) slot_count = 2;
+    slot_count = (slot_count + 1) & ~(size_t)1; /* keep rsp 16-byte aligned */
+    size_t slot_bytes = slot_count * 8u;
+
+    buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xEC);
+    buf_u32(b, (uint32_t)slot_bytes);
+
+    for (size_t i = 0; i < arg_count; i++) {
+        WExpr var = {0};
+        var.tag = 3;
+        var.str = arg_names.v[i];
+        compile_expr(g, &var, 0, 1);
+        emit_mov_to_stack(b, 0, i * 8u);
+    }
+
+    if (variable_module) {
+        WExpr var = {0};
+        var.tag = 3;
+        var.str = s->name;
+        compile_expr(g, &var, 7, 0);
+    } else {
+        WStr key = wstr_prefix("str:", s->name);
+        emit_rip_relative_lea(g, 7, key);
+    }
+    static const uint8_t mov_rsi_rsp[] = {0x48, 0x89, 0xE6};
+    static const uint8_t mov_rcx_rsp[] = {0x48, 0x89, 0xE1};
+    buf_bytes(b, mov_rsi_rsp, sizeof(mov_rsi_rsp));
+    emit_mov_imm64(b, 2, (uint64_t)arg_count);
+    if (arg_count) {
+        static const uint8_t lea_rcx_stack[] = {0x48, 0x8D, 0x8C, 0x24};
+        buf_bytes(b, lea_rcx_stack, sizeof(lea_rcx_stack));
+        buf_u32(b, (uint32_t)(arg_count * 8u));
+    } else {
+        buf_bytes(b, mov_rcx_rsp, sizeof(mov_rcx_rsp));
+    }
+    emit_mov_imm64(b, 8, (uint64_t)result_count);
+    emit_call_patch(g, wstr_lit("__wand_jmpto_loader"));
+
+    for (size_t i = 0; i < result_count; i++) {
+        emit_mov_from_stack(b, 0, (arg_count + i) * 8u);
+        WType* type = NULL;
+        uint64_t type_ptr;
+        uint32_t size = 8;
+        if (map_get_str(&g->local_types, result_targets.v[i], &type_ptr)) {
+            type = AS_PTR(WType, type_ptr);
+            size = type_size(g, type);
+            if (size == 0) size = 8;
+        }
+        uint64_t off;
+        if (map_get_str(&g->locals, result_targets.v[i], &off)) {
+            emit_mem_store(b, 0, (uint32_t)off, size);
+        } else {
+            WExpr target = {0};
+            target.tag = 3;
+            target.str = result_targets.v[i];
+            store_assignment_target_from_rax(g, &target);
+        }
+    }
+    buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xC4);
+    buf_u32(b, (uint32_t)slot_bytes);
+}
+
 static void compile_stmt(Gen* g, WStmt* s) {
     Buf* b = &g->code;
     if (!s) {
@@ -3759,57 +3985,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
         }
         case 5: { /* Jmpto */
             uint64_t module_off;
-            if (map_get_str(&g->locals, s->name, &module_off)) {
-                WStrVec result_targets = {0};
-                for (size_t i = 0; i < s->stmt1_count; i++) {
-                    WStmt* arg = s->stmts1[i];
-                    if (!arg) continue;
-                    if (arg->tag == 6) {
-                        for (size_t j = 0; j < arg->return_count; j++) {
-                            if (arg->returns[j].expr && arg->returns[j].expr->tag == 3) {
-                                WStrVec_push(&result_targets, arg->returns[j].expr->str);
-                            }
-                        }
-                        continue;
-                    }
-                    compile_stmt(g, arg);
-                }
-                WExpr var = {0};
-                var.tag = 3;
-                var.str = s->name;
-                compile_expr(g, &var, 7, 0);
-                emit_call_patch(g, wstr_lit("__wand_jmpto_loader"));
-                for (size_t i = 0; i < result_targets.n; i++) {
-                    WType* type = NULL;
-                    uint64_t type_ptr;
-                    uint32_t size = 8;
-                    if (map_get_str(&g->local_types, result_targets.v[i], &type_ptr)) {
-                        type = AS_PTR(WType, type_ptr);
-                        size = type_size(g, type);
-                        if (size == 0) size = 8;
-                    }
-                    uint64_t off;
-                    if (map_get_str(&g->locals, result_targets.v[i], &off)) {
-                        emit_mem_store(b, 0, (uint32_t)off, size);
-                    } else {
-                        WExpr target = {0};
-                        target.tag = 3;
-                        target.str = result_targets.v[i];
-                        store_assignment_target_from_rax(g, &target);
-                    }
-                }
+            if (!s->flag && map_get_str(&g->locals, s->name, &module_off)) {
+                compile_dynamic_jmpto(g, s, 1);
                 break;
             }
-
             if (s->flag) {
                 compile_inline_jmpto(g, s);
                 break;
             }
-
-            for (size_t i = 0; i < s->stmt1_count; i++) compile_stmt(g, s->stmts1[i]);
-            WStr key = wstr_prefix("str:", s->name);
-            emit_rip_relative_lea(g, 7, key);
-            emit_call_patch(g, wstr_lit("__wand_jmpto_loader"));
+            compile_dynamic_jmpto(g, s, 0);
             break;
         }
         case 6: { /* Return */
@@ -4322,10 +4506,8 @@ static void emit_prologue(Gen* g, WandOutputFormat format, size_t* entry_patch) 
             buf_u8(b, 0xFA); buf_u8(b, 0xF4); buf_u8(b, 0xEB); buf_u8(b, 0xFD);
             break;
         case WAND_OUTPUT_WEXP:
-            buf_u8(b, 0xE8);
-            *entry_patch = b->len;
-            buf_u32(b, 0);
-            buf_u8(b, 0xC3);
+            /* A .wexp module is a continuation object, not a process image.
+             * There is no _start stub: the loader calls `main` directly. */
             break;
     }
 }
@@ -4369,7 +4551,14 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
         map_get_str(&g->global_offsets, p.key, &local_off);
         uint64_t target = (uint64_t)global_start + local_off;
         if (p.is_rip) {
+            /* RIP-relative displacements are invariant under relocation. */
             patch_rel32(b, p.pos, target);
+        } else if (format == WAND_OUTPUT_WEXP) {
+            /* Leave the module-relative offset in place. The P46 loader adds
+             * the module base when it applies the relocation entry. */
+            for (int k = 0; k < 8; k++) {
+                b->data[p.pos + k] = (uint8_t)(target >> (k * 8));
+            }
         } else {
             uint64_t abs = LOAD_BASE + target;
             for (int k = 0; k < 8; k++) {
@@ -4502,6 +4691,22 @@ WandCompileResult wand_x86_compile_program(
         }
     }
 
+    if (g->address_patches.n) {
+        result.addr_patches = (WandAddrPatch*)calloc(g->address_patches.n, sizeof(WandAddrPatch));
+        if (!result.addr_patches) {
+            wand_compile_result_free(&result);
+            arena_free(&arena);
+            g_arena = NULL;
+            return make_error_result(2);
+        }
+        for (size_t i = 0; i < g->address_patches.n; i++) {
+            result.addr_patches[i].position = g->address_patches.v[i].pos;
+            result.addr_patches[i].key = dup_wstr(g->address_patches.v[i].key);
+            result.addr_patches[i].is_rip = g->address_patches.v[i].is_rip;
+            result.addr_patch_count++;
+        }
+    }
+
     arena_free(&arena);
     g_arena = NULL;
     return result;
@@ -4520,6 +4725,10 @@ void wand_compile_result_free(WandCompileResult* result) {
         free(result->call_patches[i].target);
     }
     free(result->call_patches);
+    for (size_t i = 0; i < result->addr_patch_count; i++) {
+        free(result->addr_patches[i].key);
+    }
+    free(result->addr_patches);
     memset(result, 0, sizeof(*result));
 }
 /*

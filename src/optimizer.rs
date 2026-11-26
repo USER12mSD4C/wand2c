@@ -1873,6 +1873,7 @@ mod tests {
     fn test_func(body: Vec<Stmt>) -> FuncDecl {
         FuncDecl {
             name: "main".to_string(),
+            version: 1,
             params: vec![(DataType::U64, "x".to_string(), PtrAccess::Input)],
             return_types: vec![DataType::U64],
             body: Some(body),

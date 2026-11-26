@@ -4,3 +4,6 @@ notes
 testing
 w2wexp/wtw
 other
+loader/*.o
+loader/*.a
+loader/*.so

@@ -890,6 +890,25 @@ For raw binaries (bare metal), the layout is:
 
 The header's section descriptors (one per mandatory section: types, exports, imports, deps, reflect, plus any vendor sections) point to offsets within the file. `p46_strtab` is located directly via the header's `strtab_offset`/`strtab_size` fields, not through a descriptor.
 
+### Wand continuation objects (informative)
+
+Wand's `-fw` output uses this Raw Binary embedding as a continuation object.
+It is not an executable image: it has no process entry stub and no fixed load
+address. A loader maps the image at a chosen base, applies the relocations in
+vendor section 101, and calls the exported `main` function. Every address stored
+in the mandatory sections is relative to that module base.
+
+| Vendor type | Name | Layout / meaning |
+|-------------|------|------------------|
+| 100 | `P46_SECTION_WEXP_IMAGE` | Raw module image; byte 0 is function offset 0 |
+| 101 | `P46_SECTION_WEXP_RELOCS` | Array of 24-byte entries: `offset:u64`, `type:u32`, `name_off:u32`, `addend:i64` |
+
+Relocation offsets are relative to the start of section 100. `type 1`
+(`WEXP_RELOC_64`) writes `S + A` as 64 bits; `type 4` (`WEXP_RELOC_PC32`) writes
+`S + A - P` as 32 bits. `name_off` indexes `p46_strtab`; `@offset:N` denotes an
+address inside the module image. Loaders that do not implement continuations
+ignore both vendor sections as required by section 3.6.
+
 ---
 
 ## Appendix B: Example Binary Layout (ELF)

@@ -1302,6 +1302,15 @@ impl Parser {
         };
         self.step();
 
+        let mut version = 1;
+        if self.current_token == Token::Version {
+            self.step();
+            if let Token::Number(v) = self.current_token {
+                version = v as u32;
+                self.step();
+            }
+        }
+
         if self.current_token != Token::LParen {
             return Err(self.err("Expected '(' after function name"));
         }
@@ -1332,6 +1341,15 @@ impl Parser {
         }
         self.step();
 
+        /* Also accept the pre-arrow spelling `fn f(...) version 2 -> u64`. */
+        if self.current_token == Token::Version {
+            self.step();
+            if let Token::Number(v) = self.current_token {
+                version = v as u32;
+                self.step();
+            }
+        }
+
         let mut return_types = Vec::new();
         if self.current_token == Token::Arrow {
             self.step();
@@ -1349,10 +1367,22 @@ impl Parser {
             }
         }
 
+        /* Standard 4/6 writes the function version after the return type:
+         * `fn open(...) -> i32 version 2;`. Accept it there as well as after
+         * the name so older accepted-but-ignored spellings keep working. */
+        if self.current_token == Token::Version {
+            self.step();
+            if let Token::Number(v) = self.current_token {
+                version = v as u32;
+                self.step();
+            }
+        }
+
         if self.current_token == Token::Semicolon {
             self.step();
             return Ok(FuncDecl {
                 name,
+                version,
                 params,
                 return_types,
                 body: None,
@@ -1368,6 +1398,7 @@ impl Parser {
 
         Ok(FuncDecl {
             name,
+            version,
             params,
             return_types,
             body: None,

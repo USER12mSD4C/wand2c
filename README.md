@@ -319,11 +319,23 @@ The compiler adds custom sections to the ELF file:
 
 ## Dynamic Modules (.wexp)
 
-The `-fw` flag produces a dynamic execution module. The module contains a `main` entry point and Standard 4/6 metadata. The runtime loads `.wexp` modules through the Standard 4/6 loader API.
+The `-fw` flag produces a continuation object: a flat Standard 4/6 Raw Binary
+image, not an ELF executable. It has no `_start` stub, no fixed load address and
+no process entry point. A loader maps the module image at any convenient
+address, applies its relocations, resolves imports and then calls `main` as a
+continuation. Export addresses are offsets from that module base.
 
-A `.wexp` entry stub calls `main` and then **returns to its caller**, so running
-the generated ELF directly from a shell ends with a segfault after the program
-finishes. On Linux use `-fp` for a stand-alone executable; use `-fw` only when
-a loader will call the module.
+Two vendor sections carry the executable part:
 
-The `jmpto` statement invokes dynamic modules at the language level. If the source file is available, the compiler inlines the target. If not, it generates a call to `__wand_jmpto_loader`.
+| Type | Name | Content |
+|------|------|---------|
+| 100 | `P46_SECTION_WEXP_IMAGE` | Relocatable module image (code and globals) |
+| 101 | `P46_SECTION_WEXP_RELOCS` | 24-byte relocation entries applied after mapping |
+
+The loader API is declared in `include/wand_p46.h`. Build the standalone loader
+library with `make -C loader`; it provides `wand_p46_load`,
+`wand_p46_get_symbol`, `wand_p46_call`, a module registry for `jmpto`, and the
+`__wand_jmpto_loader` entry point. On Linux use `-fp` for a stand-alone
+executable; `.wexp` files are only for loaders.
+
+The `jmpto` statement invokes dynamic modules at the language level. If the source file is available, the compiler inlines the target. If not, it generates a call to `__wand_jmpto_loader` with the module name, an argument array, and a result array.
