@@ -380,6 +380,33 @@ fn collect_escaped_stmt(stmt: &Stmt, escaped: &mut HashSet<String>) {
         Stmt::Critical(body) => {
             collect_escaped(body, escaped);
         }
+        Stmt::Nasm(code) => {
+            // Locals named as `[name]` inside an asm block are read/written by
+            // the backend, not by AST expressions. Keep their definitions and
+            // prevent constant propagation into them.
+            let bytes = code.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'[' {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end] != b']' {
+                        end += 1;
+                    }
+                    let name = code[start..end].trim();
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    {
+                        let root = name.rsplit(':').next().unwrap_or(name);
+                        escaped.insert(root.to_string());
+                    }
+                    i = end;
+                }
+                i += 1;
+            }
+        }
         _ => {}
     }
 }

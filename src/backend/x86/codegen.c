@@ -1431,6 +1431,17 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
             }
             return NULL;
         }
+        case 4: { /* AddrOf (named local or section variable) */
+            uint64_t v;
+            if (map_get_str(&g->local_types, e->str, &v)) {
+                return type_pointer_to(AS_PTR(WType, v));
+            }
+            WStr key = find_global_key(g, e->str);
+            if (key.ptr && map_get_str(&g->section_types, key, &v)) {
+                return type_pointer_to(AS_PTR(WType, v));
+            }
+            return NULL;
+        }
         case 5: { /* AddrOfExpr */
             WType* inner = resolve_expr_type(g, e->a);
             return inner ? type_pointer_to(inner) : NULL;
@@ -2156,6 +2167,54 @@ static void emit_call_patch(Gen* g, WStr target) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Atomic operand sizing                                               */
+/* ------------------------------------------------------------------ */
+
+/* Atomic builtins take a pointer. Resolve its pointee so a u8/u16/u32
+ * operation never touches adjacent memory (the old code always emitted
+ * 64-bit instructions). Unknown types fall back to 8 bytes. */
+static WType* atomic_pointee_type(Gen* g, WExpr* e) {
+    WType* t = peel_typedefs(resolve_expr_type(g, e));
+    if (t && t->tag == 10) {
+        t = peel_typedefs(t->inner);
+    }
+    return t;
+}
+
+static uint32_t atomic_operand_size(Gen* g, WExpr* e) {
+    uint32_t size = type_size(g, atomic_pointee_type(g, e));
+    return (size == 1 || size == 2 || size == 4) ? size : 8;
+}
+
+static int atomic_operand_signed(Gen* g, WExpr* e) {
+    WType* t = atomic_pointee_type(g, e);
+    return t && (t->tag == 4 || t->tag == 5 || t->tag == 6);
+}
+
+/* Operand-size prefix for atomic read-modify-write instructions. */
+static void emit_atomic_prefix(Buf* b, uint32_t size) {
+    if (size == 8) {
+        buf_u8(b, 0x48);
+    } else if (size == 2) {
+        buf_u8(b, 0x66);
+    }
+}
+
+/* Canonicalize rax after a narrow atomic operation. movzx/movsx also clear
+ * stale high bits left behind by the 64-bit register scratch path. */
+static void emit_atomic_rax_extend(Buf* b, uint32_t size, int is_signed) {
+    if (size == 1) {
+        buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6); buf_u8(b, 0xC0);
+    } else if (size == 2) {
+        buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7); buf_u8(b, 0xC0);
+    } else if (size == 4 && is_signed) {
+        buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0xC0);
+    } else if (size == 4) {
+        buf_u8(b, 0x89); buf_u8(b, 0xC0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* compile_expr                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -2586,8 +2645,20 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     emit_mov_imm64(b, reg, 0);
                     return;
                 }
+                uint32_t size = atomic_operand_size(g, e->args[0]);
+                int is_signed = atomic_operand_signed(g, e->args[0]);
                 compile_expr(g, e->args[0], 0, 1);
-                buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                if (size == 1) {
+                    buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6); buf_u8(b, 0x00);
+                } else if (size == 2) {
+                    buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7); buf_u8(b, 0x00);
+                } else if (size == 4 && is_signed) {
+                    buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0x00);
+                } else if (size == 4) {
+                    buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                }
                 move_rax_to_reg(b, reg);
                 return;
             }
@@ -2596,11 +2667,20 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     emit_mov_imm64(b, reg, 0);
                     return;
                 }
+                uint32_t size = atomic_operand_size(g, e->args[0]);
                 compile_expr(g, e->args[0], 0, 1);
                 buf_u8(b, 0x50);
                 compile_expr(g, e->args[1], 0, 1);
                 buf_u8(b, 0x5B);
-                buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x03);
+                if (size == 1) {
+                    buf_u8(b, 0x88); buf_u8(b, 0x03);
+                } else if (size == 2) {
+                    buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, 0x03);
+                } else if (size == 4) {
+                    buf_u8(b, 0x89); buf_u8(b, 0x03);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x03);
+                }
                 buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xF0);
                 move_rax_to_reg(b, reg);
                 return;
@@ -2611,18 +2691,36 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     emit_mov_imm64(b, reg, 0);
                     return;
                 }
+                uint32_t size = atomic_operand_size(g, e->args[0]);
+                int is_signed = atomic_operand_signed(g, e->args[0]);
                 compile_expr(g, e->args[0], 0, 1);
                 buf_u8(b, 0x50);
                 compile_expr(g, e->args[1], 0, 1);
                 if (wstr_eq_c(name, "atomic_sub")) {
-                    buf_u8(b, 0x48); buf_u8(b, 0xF7); buf_u8(b, 0xD8);
+                    if (size == 1) {
+                        buf_u8(b, 0xF6); buf_u8(b, 0xD8);
+                    } else if (size == 2) {
+                        buf_u8(b, 0x66); buf_u8(b, 0xF7); buf_u8(b, 0xD8);
+                    } else if (size == 4) {
+                        buf_u8(b, 0xF7); buf_u8(b, 0xD8);
+                    } else {
+                        buf_u8(b, 0x48); buf_u8(b, 0xF7); buf_u8(b, 0xD8);
+                    }
                 }
                 buf_u8(b, 0x5B);
                 if (wstr_eq_c(name, "atomic_swap")) {
-                    buf_u8(b, 0x48); buf_u8(b, 0x87); buf_u8(b, 0x03);
+                    if (size == 1) {
+                        buf_u8(b, 0x86); buf_u8(b, 0x03);
+                    } else {
+                        emit_atomic_prefix(b, size);
+                        buf_u8(b, 0x87); buf_u8(b, 0x03);
+                    }
                 } else {
-                    buf_u8(b, 0xF0); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xC1); buf_u8(b, 0x03);
+                    buf_u8(b, 0xF0);
+                    emit_atomic_prefix(b, size);
+                    buf_u8(b, 0x0F); buf_u8(b, 0xC1); buf_u8(b, 0x03);
                 }
+                emit_atomic_rax_extend(b, size, is_signed);
                 move_rax_to_reg(b, reg);
                 return;
             }
@@ -2631,14 +2729,27 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     emit_mov_imm64(b, reg, 0);
                     return;
                 }
+                uint32_t size = atomic_operand_size(g, e->args[0]);
+                int is_signed = atomic_operand_signed(g, e->args[0]);
+                int inc = wstr_eq_c(name, "atomic_inc");
                 compile_expr(g, e->args[0], 0, 1);
                 buf_u8(b, 0x50);
-                emit_mov_imm64(b, 0, wstr_eq_c(name, "atomic_inc") ? 1u : 0xFFFFFFFFu);
+                emit_mov_imm64(b, 0, inc ? 1u : 0xFFFFFFFFu);
                 buf_u8(b, 0x5B);
-                buf_u8(b, 0xF0); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xC1); buf_u8(b, 0x03);
-                buf_u8(b, 0x48);
-                buf_u8(b, wstr_eq_c(name, "atomic_inc") ? 0xFF : 0xF8);
-                buf_u8(b, wstr_eq_c(name, "atomic_inc") ? 0xC0 : 0xC8);
+                buf_u8(b, 0xF0);
+                emit_atomic_prefix(b, size);
+                buf_u8(b, 0x0F); buf_u8(b, 0xC1); buf_u8(b, 0x03);
+                emit_atomic_rax_extend(b, size, is_signed);
+                if (size == 1) {
+                    buf_u8(b, 0xFE); buf_u8(b, inc ? 0xC0 : 0xC8);
+                } else if (size == 2) {
+                    buf_u8(b, 0x66); buf_u8(b, 0xFF); buf_u8(b, inc ? 0xC0 : 0xC8);
+                } else if (size == 4) {
+                    buf_u8(b, 0xFF); buf_u8(b, inc ? 0xC0 : 0xC8);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0xFF); buf_u8(b, inc ? 0xC0 : 0xC8);
+                }
+                emit_atomic_rax_extend(b, size, is_signed);
                 move_rax_to_reg(b, reg);
                 return;
             }
@@ -2647,15 +2758,28 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     emit_mov_imm64(b, reg, 0);
                     return;
                 }
+                uint32_t size = atomic_operand_size(g, e->args[0]);
+                int is_signed = atomic_operand_signed(g, e->args[0]);
                 compile_expr(g, e->args[0], 0, 1);
                 buf_u8(b, 0x50);
                 compile_expr(g, e->args[1], 0, 1);
                 buf_u8(b, 0x50);
                 compile_expr(g, e->args[2], 0, 1);
-                buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC1);
+                if (size == 1) {
+                    buf_u8(b, 0x88); buf_u8(b, 0xC1);
+                } else if (size == 2) {
+                    buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, 0xC1);
+                } else if (size == 4) {
+                    buf_u8(b, 0x89); buf_u8(b, 0xC1);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC1);
+                }
                 buf_u8(b, 0x58);
                 buf_u8(b, 0x5B);
-                buf_u8(b, 0xF0); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB1); buf_u8(b, 0x0B);
+                buf_u8(b, 0xF0);
+                emit_atomic_prefix(b, size);
+                buf_u8(b, 0x0F); buf_u8(b, 0xB1); buf_u8(b, 0x0B);
+                emit_atomic_rax_extend(b, size, is_signed);
                 move_rax_to_reg(b, reg);
                 return;
             }
@@ -3370,13 +3494,30 @@ static char* trim_line(char* s) {
     return s;
 }
 
-static int nasm_reg(WStr s, uint8_t* reg) {
-    if (wstr_eq_c(s, "rax")) { *reg = 0; return 1; }
-    if (wstr_eq_c(s, "rcx")) { *reg = 1; return 1; }
-    if (wstr_eq_c(s, "rdx")) { *reg = 2; return 1; }
-    if (wstr_eq_c(s, "rbx")) { *reg = 3; return 1; }
-    if (wstr_eq_c(s, "rsi")) { *reg = 6; return 1; }
-    if (wstr_eq_c(s, "rdi")) { *reg = 7; return 1; }
+static int nasm_reg_size(WStr s, uint8_t* reg, uint32_t* size) {
+    if (wstr_eq_c(s, "rax")) { *reg = 0; *size = 8; return 1; }
+    if (wstr_eq_c(s, "rcx")) { *reg = 1; *size = 8; return 1; }
+    if (wstr_eq_c(s, "rdx")) { *reg = 2; *size = 8; return 1; }
+    if (wstr_eq_c(s, "rbx")) { *reg = 3; *size = 8; return 1; }
+    if (wstr_eq_c(s, "rsi")) { *reg = 6; *size = 8; return 1; }
+    if (wstr_eq_c(s, "rdi")) { *reg = 7; *size = 8; return 1; }
+    /* Documented rdtsc example uses eax/edx; accept all narrow aliases. */
+    if (wstr_eq_c(s, "eax")) { *reg = 0; *size = 4; return 1; }
+    if (wstr_eq_c(s, "ecx")) { *reg = 1; *size = 4; return 1; }
+    if (wstr_eq_c(s, "edx")) { *reg = 2; *size = 4; return 1; }
+    if (wstr_eq_c(s, "ebx")) { *reg = 3; *size = 4; return 1; }
+    if (wstr_eq_c(s, "esi")) { *reg = 6; *size = 4; return 1; }
+    if (wstr_eq_c(s, "edi")) { *reg = 7; *size = 4; return 1; }
+    if (wstr_eq_c(s, "ax")) { *reg = 0; *size = 2; return 1; }
+    if (wstr_eq_c(s, "cx")) { *reg = 1; *size = 2; return 1; }
+    if (wstr_eq_c(s, "dx")) { *reg = 2; *size = 2; return 1; }
+    if (wstr_eq_c(s, "bx")) { *reg = 3; *size = 2; return 1; }
+    if (wstr_eq_c(s, "si")) { *reg = 6; *size = 2; return 1; }
+    if (wstr_eq_c(s, "di")) { *reg = 7; *size = 2; return 1; }
+    if (wstr_eq_c(s, "al")) { *reg = 0; *size = 1; return 1; }
+    if (wstr_eq_c(s, "cl")) { *reg = 1; *size = 1; return 1; }
+    if (wstr_eq_c(s, "dl")) { *reg = 2; *size = 1; return 1; }
+    if (wstr_eq_c(s, "bl")) { *reg = 3; *size = 1; return 1; }
     return 0;
 }
 
@@ -3397,6 +3538,25 @@ static void compile_nasm(Gen* g, WStr code) {
         }
         if (strcmp(t, "syscall") == 0) {
             buf_u8(b, 0x0F); buf_u8(b, 0x05);
+        } else if (strcmp(t, "pause") == 0) {
+            /* Spin-loop hint; keeps the zram lock free of GCC builtins. */
+            buf_u8(b, 0xF3); buf_u8(b, 0x90);
+        } else if (strcmp(t, "rdtsc") == 0) {
+            buf_u8(b, 0x0F); buf_u8(b, 0x31);
+        } else if (strcmp(t, "hlt") == 0) {
+            buf_u8(b, 0xF4);
+        } else if (strcmp(t, "nop") == 0) {
+            buf_u8(b, 0x90);
+        } else if (strcmp(t, "mfence") == 0) {
+            buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xF0);
+        } else if (strcmp(t, "lfence") == 0) {
+            buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xE8);
+        } else if (strcmp(t, "sfence") == 0) {
+            buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xF8);
+        } else if (strcmp(t, "cli") == 0) {
+            buf_u8(b, 0xFA);
+        } else if (strcmp(t, "sti") == 0) {
+            buf_u8(b, 0xFB);
         } else if (strcmp(t, "rep movsb") == 0) {
             buf_u8(b, 0xF3); buf_u8(b, 0xA4);
         } else if (strcmp(t, "rep stosb") == 0) {
@@ -3418,27 +3578,48 @@ static void compile_nasm(Gen* g, WStr code) {
             char* dst = trim_line(t + 4);
             char* src = trim_line(comma + 1);
             uint8_t dreg, sreg;
+            uint32_t dsize = 8, ssize = 8;
             if (dst[0] == '[' && dst[strlen(dst) - 1] == ']') {
                 dst[strlen(dst) - 1] = '\0';
                 WStr name = wstr_lit(dst + 1);
                 uint64_t off;
-                if (nasm_reg(wstr_lit(src), &sreg) && map_get_str(&g->locals, name, &off)) {
-                    emit_mem_store(b, sreg, (uint32_t)off, 8);
+                if (nasm_reg_size(wstr_lit(src), &sreg, &ssize) &&
+                    map_get_str(&g->locals, name, &off)) {
+                    emit_mem_store(b, sreg, (uint32_t)off, ssize);
                 }
-            } else if (nasm_reg(wstr_lit(dst), &dreg)) {
+            } else if (nasm_reg_size(wstr_lit(dst), &dreg, &dsize)) {
                 if (src[0] == '[' && src[strlen(src) - 1] == ']') {
                     src[strlen(src) - 1] = '\0';
                     WStr name = wstr_lit(src + 1);
                     uint64_t off;
                     if (map_get_str(&g->locals, name, &off)) {
-                        emit_mem_load(b, dreg, (uint32_t)off, 8);
+                        emit_mem_load(b, dreg, (uint32_t)off, dsize);
                     }
                 } else if (strspn(src, "0123456789-") == strlen(src) && *src) {
                     long value = strtol(src, NULL, 10);
-                    buf_u8(b, 0x48); buf_u8(b, 0xC7); buf_u8(b, (uint8_t)(0xC0 | dreg));
-                    buf_u32(b, (uint32_t)(int32_t)value);
-                } else if (nasm_reg(wstr_lit(src), &sreg)) {
-                    buf_u8(b, 0x48); buf_u8(b, 0x89);
+                    if (dsize == 8) {
+                        buf_u8(b, 0x48); buf_u8(b, 0xC7); buf_u8(b, (uint8_t)(0xC0 | dreg));
+                        buf_u32(b, (uint32_t)(int32_t)value);
+                    } else if (dsize == 4) {
+                        buf_u8(b, (uint8_t)(0xB8 | dreg));
+                        buf_u32(b, (uint32_t)(int32_t)value);
+                    } else if (dsize == 2) {
+                        buf_u8(b, 0x66); buf_u8(b, (uint8_t)(0xB8 | dreg));
+                        buf_u16(b, (uint16_t)value);
+                    } else {
+                        buf_u8(b, (uint8_t)(0xB0 | dreg));
+                        buf_u8(b, (uint8_t)value);
+                    }
+                } else if (nasm_reg_size(wstr_lit(src), &sreg, &ssize)) {
+                    if (dsize == 1) {
+                        buf_u8(b, 0x88);
+                    } else if (dsize == 2) {
+                        buf_u8(b, 0x66); buf_u8(b, 0x89);
+                    } else if (dsize == 4) {
+                        buf_u8(b, 0x89);
+                    } else {
+                        buf_u8(b, 0x48); buf_u8(b, 0x89);
+                    }
                     buf_u8(b, (uint8_t)(0xC0 | (sreg << 3) | dreg));
                 }
             }
