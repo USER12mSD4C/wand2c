@@ -953,14 +953,19 @@ Raw memory built-in functions (MMIO and packed data):
 
 | Function | Operation |
 |----------|-----------|
-| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address, zero-extended |
+| `mem_load_i8/i16/i32/i64(addr)` | Read 1/2/4/8 bytes at a `u64` address, sign-extended |
 | `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
-| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `mem_store_i8/i16/i32/i64(addr, val)` | Write the low 1/2/4/8 bytes of `val` (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after, zero-extended |
+| `volatile_load_i8/i16/i32/i64(addr)` | Read with a full fence before and after, sign-extended |
 | `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+| `volatile_store_i8/i16/i32/i64(addr, val)` | Write with a full fence before and after (returns 0) |
 
 These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
-without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
-width, and the `volatile_*` forms add `mfence` ordering.
+without any C shim. `u*` loads zero-extend and `i*` loads sign-extend to 64
+bits; stores truncate to the named width; the `volatile_*` forms add `mfence`
+ordering. Narrow signed `atomic_load`s also sign-extend to 64 bits.
 
 ## Part 3: Memory and Safety
 
@@ -2604,14 +2609,19 @@ Raw memory built-in functions (MMIO and packed data):
 
 | Function | Operation |
 |----------|-----------|
-| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address, zero-extended |
+| `mem_load_i8/i16/i32/i64(addr)` | Read 1/2/4/8 bytes at a `u64` address, sign-extended |
 | `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
-| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `mem_store_i8/i16/i32/i64(addr, val)` | Write the low 1/2/4/8 bytes of `val` (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after, zero-extended |
+| `volatile_load_i8/i16/i32/i64(addr)` | Read with a full fence before and after, sign-extended |
 | `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+| `volatile_store_i8/i16/i32/i64(addr, val)` | Write with a full fence before and after (returns 0) |
 
 These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
-without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
-width, and the `volatile_*` forms add `mfence` ordering.
+without any C shim. `u*` loads zero-extend and `i*` loads sign-extend to 64
+bits; stores truncate to the named width; the `volatile_*` forms add `mfence`
+ordering. Narrow signed `atomic_load`s also sign-extend to 64 bits.
 
 ### Chapter 41: Writing a TUI Text Editor
 
@@ -3254,14 +3264,19 @@ Raw memory built-in functions (MMIO and packed data):
 
 | Function | Operation |
 |----------|-----------|
-| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address, zero-extended |
+| `mem_load_i8/i16/i32/i64(addr)` | Read 1/2/4/8 bytes at a `u64` address, sign-extended |
 | `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
-| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `mem_store_i8/i16/i32/i64(addr, val)` | Write the low 1/2/4/8 bytes of `val` (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after, zero-extended |
+| `volatile_load_i8/i16/i32/i64(addr)` | Read with a full fence before and after, sign-extended |
 | `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+| `volatile_store_i8/i16/i32/i64(addr, val)` | Write with a full fence before and after (returns 0) |
 
 These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
-without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
-width, and the `volatile_*` forms add `mfence` ordering.
+without any C shim. `u*` loads zero-extend and `i*` loads sign-extend to 64
+bits; stores truncate to the named width; the `volatile_*` forms add `mfence`
+ordering. Narrow signed `atomic_load`s also sign-extend to 64 bits.
 
 ## Appendix E: Standard Library Module Index
 

@@ -1012,10 +1012,14 @@ dereference syntax is involved.
 
 | Function | Operation |
 |---|---|
-| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at `addr` |
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at `addr`, zero-extended to 64 bits |
+| `mem_load_i8/i16/i32/i64(addr)` | Read 1/2/4/8 bytes at `addr`, sign-extended to 64 bits |
 | `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes at `addr` (returns 0) |
-| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `mem_store_i8/i16/i32/i64(addr, val)` | Write the low 1/2/4/8 bytes of `val` (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after, zero-extended |
+| `volatile_load_i8/i16/i32/i64(addr)` | Read with a full fence before and after, sign-extended |
 | `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+| `volatile_store_i8/i16/i32/i64(addr, val)` | Write with a full fence before and after (returns 0) |
 
 ```wandc
 u32 status = volatile_load_u32(0x1000);
