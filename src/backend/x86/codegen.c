@@ -2198,7 +2198,7 @@ static int atomic_operand_signed(Gen* g, WExpr* e) {
  * exact-width x86 access directly. `volatile_*` variants add mfence ordering
  * for MMIO registers; all variants are unaligned-safe on x86. */
 static int raw_mem_builtin(WStr name, uint32_t* width, int* is_store,
-                           int* is_volatile) {
+                           int* is_volatile, int* is_signed) {
     const char* prefix = NULL;
     int store = 0;
     int vol = 0;
@@ -2229,11 +2229,20 @@ static int raw_mem_builtin(WStr name, uint32_t* width, int* is_store,
         *width = 4;
     } else if (wstr_eq_c(suffix, "u64")) {
         *width = 8;
+    } else if (wstr_eq_c(suffix, "i8")) {
+        *width = 1;
+    } else if (wstr_eq_c(suffix, "i16")) {
+        *width = 2;
+    } else if (wstr_eq_c(suffix, "i32")) {
+        *width = 4;
+    } else if (wstr_eq_c(suffix, "i64")) {
+        *width = 8;
     } else {
         return 0;
     }
     *is_store = store;
     *is_volatile = vol;
+    *is_signed = suffix.ptr && suffix.len && suffix.ptr[0] == 'i';
     return 1;
 }
 
@@ -2250,8 +2259,10 @@ static void emit_atomic_prefix(Buf* b, uint32_t size) {
  * stale high bits left behind by the 64-bit register scratch path. */
 static void emit_atomic_rax_extend(Buf* b, uint32_t size, int is_signed) {
     if (size == 1) {
+        if (is_signed) buf_u8(b, 0x48);
         buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6); buf_u8(b, 0xC0);
     } else if (size == 2) {
+        if (is_signed) buf_u8(b, 0x48);
         buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7); buf_u8(b, 0xC0);
     } else if (size == 4 && is_signed) {
         buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0xC0);
@@ -2707,7 +2718,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 uint32_t width = 0;
                 int is_store = 0;
                 int is_volatile = 0;
-                if (raw_mem_builtin(name, &width, &is_store, &is_volatile)) {
+                int is_signed = 0;
+                if (raw_mem_builtin(name, &width, &is_store, &is_volatile,
+                                    &is_signed)) {
                     static const uint8_t mfence[] = {0x0F, 0xAE, 0xF0};
                     if (is_volatile) buf_bytes(b, mfence, sizeof(mfence));
                     if (!is_store) {
@@ -2717,9 +2730,13 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                         }
                         compile_expr(g, e->args[0], 0, 0);
                         if (width == 1) {
-                            buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0x00);
+                            if (is_signed) buf_u8(b, 0x48);
+                            buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6); buf_u8(b, 0x00);
                         } else if (width == 2) {
-                            buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, 0x00);
+                            if (is_signed) buf_u8(b, 0x48);
+                            buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7); buf_u8(b, 0x00);
+                        } else if (width == 4 && is_signed) {
+                            buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0x00);
                         } else if (width == 4) {
                             buf_u8(b, 0x8B); buf_u8(b, 0x00);
                         } else {
@@ -2764,8 +2781,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 int is_signed = atomic_operand_signed(g, e->args[0]);
                 compile_expr(g, e->args[0], 0, 1);
                 if (size == 1) {
+                    if (is_signed) buf_u8(b, 0x48);
                     buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6); buf_u8(b, 0x00);
                 } else if (size == 2) {
+                    if (is_signed) buf_u8(b, 0x48);
                     buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7); buf_u8(b, 0x00);
                 } else if (size == 4 && is_signed) {
                     buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0x00);
