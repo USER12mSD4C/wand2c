@@ -949,6 +949,19 @@ Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
 `add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
 new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
 
+Raw memory built-in functions (MMIO and packed data):
+
+| Function | Operation |
+|----------|-----------|
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+
+These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
+without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
+width, and the `volatile_*` forms add `mfence` ordering.
+
 ## Part 3: Memory and Safety
 
 ### Chapter 15: Stack vs Heap
@@ -2022,18 +2035,22 @@ Compile with `-fw`:
 wand2c module.w -o module.wexp -fw
 ```
 
-A `.wexp` file uses the ELF container with Standard 4/6 metadata sections:
+A `.wexp` file is a flat Standard 4/6 Raw Binary image. It is not an ELF file,
+has no `_start` stub and cannot be executed by a shell. A loader maps the image
+at a chosen base address, applies relocations, resolves imports and calls the
+exported `main` continuation. Export addresses are offsets from the module base.
 
 | Section | Content |
 |---------|---------|
-| `.text` | Executable code |
-| `.p46_header` | ABI magic and metadata |
-| `.p46_types` | TLV type descriptors |
-| `.p46_exports` | Exported symbols |
-| `.p46_imports` | Imported symbols |
-| `.p46_deps` | Module dependencies |
-| `.p46_reflect` | Qualified-name lookup index |
-| `.p46_strtab` | String table |
+| P46 header | ABI magic, metadata and section descriptors |
+| P46_SECTION_TYPES | TLV type descriptors |
+| P46_SECTION_EXPORTS | Exported symbols and signatures |
+| P46_SECTION_IMPORTS | Imported symbols |
+| P46_SECTION_DEPENDENCIES | Module dependencies |
+| P46_SECTION_REFLECT | Qualified-name lookup index |
+| P46 strtab | String table (located by the header) |
+| vendor 100 (`WEXP_IMAGE`) | Relocatable code and global data |
+| vendor 101 (`WEXP_RELOCS`) | Relocations applied at load time |
 
 The `.wexp` format requires a `main` function.
 The `--entry` flag is not allowed for this format.
@@ -2058,9 +2075,11 @@ If the source file is found, the compiler:
 4. Inlines the body of the target `main`.
 5. Converts `return(expr)` into a store to the caller variable.
 
-If the source file is not found, the compiler generates a call to `__wand_jmpto_loader`.
-The runtime provides this function.
-It loads the `.wexp` file, validates metadata, resolves imports, and calls the entry point.
+If the source file is not found, the compiler generates a call to
+`__wand_jmpto_loader`. The Standard 4/6 loader library provides this function.
+Variables prepared by the block are passed as arguments, `return(var)` entries
+name result variables, and the loader loads the `.wexp` file, validates
+metadata, resolves imports, and calls the module's `main` continuation.
 
 Example with compile-time inlining:
 
@@ -2092,11 +2111,12 @@ Pointer size is 8 bytes.
 
 The loader performs these steps when loading a `.wexp` module:
 
-1. Validate the header magic and version.
-2. Resolve dependencies from `.p46_deps`.
-3. Resolve imports from `.p46_imports`.
-4. Map the `.text` section into memory.
-5. Transfer control to the entry point.
+1. Validate the header magic, version and section bounds.
+2. Resolve dependencies from the dependencies section.
+3. Parse imports and exports and check the string table.
+4. Map vendor section 100 at a loader-chosen base address.
+5. Apply vendor section 101 relocations, resolving imports and internal symbols.
+6. Look up `main` and call it as a continuation with the supplied arguments.
 
 ---
 
@@ -2523,6 +2543,19 @@ wand2c kernel.w -o kernel.img -fk --entry kmain
 Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
 `add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
 new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
+
+Raw memory built-in functions (MMIO and packed data):
+
+| Function | Operation |
+|----------|-----------|
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+
+These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
+without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
+width, and the `volatile_*` forms add `mfence` ordering.
 
 ### Chapter 41: Writing a TUI Text Editor
 
@@ -3076,7 +3109,7 @@ result from module: 42
 
 If the compiler finds `worker.w` or `worker.wexp` source at compile time, it inlines the module body directly into the host.
 If the source is not found, the compiler emits a call to `__wand_jmpto_loader`.
-The runtime loads the `.wexp` file, validates the Standard 4/6 metadata, resolves imports, and calls the module entry point.
+The runtime loads the `.wexp` file, validates the Standard 4/6 metadata, resolves imports, and calls the module's `main` continuation.
 
 To force dynamic loading at runtime, compile the host without the worker source present, then place `worker.wexp` next to the host binary.
 
@@ -3160,6 +3193,19 @@ To force dynamic loading at runtime, compile the host without the worker source 
 Operations use the width of the pointed-to type (`u8`/`u16`/`u32`/`u64`).
 `add`, `sub`, `swap` and `cas` return the old value; `inc` and `dec` return the
 new value. A pure-Wand spinlock example is in `SYNTAX.md`, section 25.
+
+Raw memory built-in functions (MMIO and packed data):
+
+| Function | Operation |
+|----------|-----------|
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at a `u64` address |
+| `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+
+These calls keep the driver call names (`mem_load_u32`, `mmio_store_u32`, ...)
+without any C shim. Loads zero-extend to 64 bits, stores truncate to the named
+width, and the `volatile_*` forms add `mfence` ordering.
 
 ## Appendix E: Standard Library Module Index
 

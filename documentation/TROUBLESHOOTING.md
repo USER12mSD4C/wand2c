@@ -114,10 +114,10 @@ u8* p = buffer*adr;
 
 ### Function `version N` has no effect
 
-Function versioning is not implemented. The parser accepts the suffix, but
-exported symbols use the plain function name and two functions differing only
-in version collide. Use distinct function names instead. Struct versions and
-`versionof(Type)` do work.
+Function versions are recorded in the exports and type records of `-fw`
+continuation objects, and `version N` is accepted before or after the return
+type. They do not change the exported symbol name: `fn add version 3` and
+`fn add version 4` still collide. Use distinct names for different exports.
 
 ### `warning: unsupported ::nasm:: line ignored`
 
@@ -126,6 +126,14 @@ knows the instructions listed in `SYNTAX.md` section 28. Unknown lines emit no
 bytes, so a program may build and then misbehave. Check compiler warnings and
 replace unsupported instructions with Wand builtins (`atomic_*`, `inb/outb`,
 `memory_barrier()`) or a supported `mov` form through a local variable.
+
+### `Unexpected primary expression` on `*(u32*)addr`
+
+Wand has no raw pointer dereference expression. Use the raw-memory builtins
+instead: `mem_load_u32(addr)`, `mem_store_u32(addr, val)`, and the
+`volatile_load_*` / `volatile_store_*` forms for MMIO registers. They take a
+`u64` address and emit exact-width x86 accesses without a C shim. See
+`SYNTAX.md`, section 25.
 
 ### Syntax errors
 
@@ -139,12 +147,12 @@ The compiler may report the line after the actual mistake. Check the previous li
 
 ## Runtime failures
 
-### A `.wexp` binary segfaults when run directly on Linux
+### A `.wexp` binary will not run directly on Linux
 
-`-fw` builds a loadable module, not a stand-alone program. Its entry stub calls
-`main` and returns to the caller; when the Linux kernel starts the ELF directly
-there is no caller to return to. Use `-fp` for hosted executables, or load the
-`.wexp` module through a Standard 4/6 loader.
+`-fw` builds a continuation object, not a stand-alone program. It is a flat P46
+Raw Binary image with no ELF header and no process entry stub, so a shell or the
+Linux kernel cannot execute it. Use `-fp` for hosted executables, or load the
+`.wexp` module through a Standard 4/6 loader (`include/wand_p46.h`).
 
 ### Number printing crashes
 

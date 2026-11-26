@@ -853,8 +853,9 @@ Use `extern` to declare a function from another module.
 extern fn external_func(u64 a, u64 b) -> u64;
 ```
 
-> Function `version` suffixes are currently accepted but ignored; exported
-> symbols use only the function name. See [section 21](#21-functions).
+> Function `version` suffixes are recorded in the exports and type records of
+> continuation objects. The compiler accepts `version N` before or after the
+> return type. See [section 21](#21-functions).
 
 ---
 
@@ -1003,6 +1004,34 @@ fn unlock() -> u64 {
 }
 ```
 
+#### Raw address loads and stores (MMIO)
+
+Low-level drivers can read and write a device register or packed structure at
+an arbitrary address without a C shim. These are built-in calls: no new cast or
+dereference syntax is involved.
+
+| Function | Operation |
+|---|---|
+| `mem_load_u8/u16/u32/u64(addr)` | Read 1/2/4/8 bytes at `addr` |
+| `mem_store_u8/u16/u32/u64(addr, val)` | Write 1/2/4/8 bytes at `addr` (returns 0) |
+| `volatile_load_u8/u16/u32/u64(addr)` | Read with a full fence before and after |
+| `volatile_store_u8/u16/u32/u64(addr, val)` | Write with a full fence before and after (returns 0) |
+
+```wandc
+u32 status = volatile_load_u32(0x1000);
+mem_store_u32(0x1004, status);
+```
+
+Rules:
+
+1. Loads zero-extend to 64 bits; stores truncate `val` to the named width.
+2. Accesses are unaligned-safe on x86; alignment is still the caller's
+   responsibility on other targets.
+3. Calls are never removed by the optimizer. The `volatile_*` forms add
+   `mfence` before and after the access.
+4. Device memory must be mapped non-cacheable by the OS. These builtins
+   control instruction width and ordering, not page caching.
+
 ---
 
 ## 26. Critical Sections
@@ -1108,10 +1137,15 @@ The block contains statements that prepare arguments.
 Rules:
 
 1. The module name is a string literal or module identifier.
-2. The block must not contain `return`.
-3. Results must be returned through output pointers.
-4. If the module source is available, the compiler may inline it.
-5. If the module source is not available, the compiler emits a dynamic load call.
+2. Variables prepared by the block are passed as continuation arguments (at
+   most six values, in their order of definition/assignment).
+3. A `return(var)` entry in the block names a variable that receives the
+   corresponding continuation result (at most four values). Without such an
+   entry the first result remains in `rax`.
+4. If the module source is available, the compiler may inline it. In that case
+   `main`'s `return(expr)` stores into the caller variable named by `expr`.
+5. If the module source is not available, the compiler emits a call to
+   `__wand_jmpto_loader`, supplied by the Standard 4/6 loader library.
 
 ---
 

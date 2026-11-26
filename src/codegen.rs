@@ -42,6 +42,13 @@ struct CCallPatch {
 }
 
 #[repr(C)]
+struct CAddrPatch {
+    position: u64,
+    key: *mut c_char,
+    is_rip: u8,
+}
+
+#[repr(C)]
 struct CCompileResult {
     data: *mut c_uchar,
     size: usize,
@@ -49,6 +56,8 @@ struct CCompileResult {
     function_count: usize,
     call_patches: *mut CCallPatch,
     call_patch_count: usize,
+    addr_patches: *mut CAddrPatch,
+    addr_patch_count: usize,
     error: u32,
 }
 
@@ -69,6 +78,7 @@ pub struct CodegenOutput {
     pub code: Vec<u8>,
     pub function_offsets: HashMap<String, usize>,
     pub call_patches: Vec<(usize, String)>,
+    pub addr_patches: Vec<(usize, String, bool)>,
 }
 
 pub fn compile_program(
@@ -127,12 +137,26 @@ pub fn compile_program(
         }
     }
 
+    let mut addr_patches = Vec::with_capacity(result.addr_patch_count);
+    if !result.addr_patches.is_null() {
+        let patches =
+            unsafe { std::slice::from_raw_parts(result.addr_patches, result.addr_patch_count) };
+        for patch in patches {
+            addr_patches.push((
+                patch.position as usize,
+                unsafe { cstr_owned(patch.key) },
+                patch.is_rip != 0,
+            ));
+        }
+    }
+
     unsafe { wand_compile_result_free(&mut result) };
 
     Ok(CodegenOutput {
         code,
         function_offsets,
         call_patches,
+        addr_patches,
     })
 }
 
@@ -531,6 +555,7 @@ impl Wire {
 
     fn function(&mut self, func: &FuncDecl) {
         self.str(&func.name);
+        self.u32(func.version);
         self.u32(func.params.len() as u32);
         for (dt, name, access) in &func.params {
             self.datatype(dt);

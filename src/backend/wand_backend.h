@@ -28,6 +28,14 @@ typedef struct {
     char* target;
 } WandCallPatch;
 
+/* Data-address fixups. For Wexp these are emitted as P46 relocations rather
+ * than being bound to the compiler's fixed load address. */
+typedef struct {
+    uint64_t position;
+    char* key;
+    uint8_t is_rip;
+} WandAddrPatch;
+
 typedef struct {
     uint8_t* data;
     size_t size;
@@ -35,6 +43,8 @@ typedef struct {
     size_t function_count;
     WandCallPatch* call_patches;
     size_t call_patch_count;
+    WandAddrPatch* addr_patches;
+    size_t addr_patch_count;
     uint32_t error; /* 0 = ok, 1 = malformed input, 2 = out of memory, 3 = depth limit */
 } WandCompileResult;
 

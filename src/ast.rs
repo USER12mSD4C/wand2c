@@ -171,6 +171,7 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct FuncDecl {
     pub name: String,
+    pub version: u32,
     pub params: Vec<(DataType, String, PtrAccess)>,
     pub return_types: Vec<DataType>,
     pub body: Option<Vec<Stmt>>,
