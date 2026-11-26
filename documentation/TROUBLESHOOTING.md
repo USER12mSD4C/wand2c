@@ -139,6 +139,13 @@ The compiler may report the line after the actual mistake. Check the previous li
 
 ## Runtime failures
 
+### A `.wexp` binary segfaults when run directly on Linux
+
+`-fw` builds a loadable module, not a stand-alone program. Its entry stub calls
+`main` and returns to the caller; when the Linux kernel starts the ELF directly
+there is no caller to return to. Use `-fp` for hosted executables, or load the
+`.wexp` module through a Standard 4/6 loader.
+
 ### Number printing crashes
 
 Some installed copies of `libw/io.w` declare buffers as:

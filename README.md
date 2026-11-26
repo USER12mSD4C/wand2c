@@ -321,4 +321,9 @@ The compiler adds custom sections to the ELF file:
 
 The `-fw` flag produces a dynamic execution module. The module contains a `main` entry point and Standard 4/6 metadata. The runtime loads `.wexp` modules through the Standard 4/6 loader API.
 
+A `.wexp` entry stub calls `main` and then **returns to its caller**, so running
+the generated ELF directly from a shell ends with a segfault after the program
+finishes. On Linux use `-fp` for a stand-alone executable; use `-fw` only when
+a loader will call the module.
+
 The `jmpto` statement invokes dynamic modules at the language level. If the source file is available, the compiler inlines the target. If not, it generates a call to `__wand_jmpto_loader`.
