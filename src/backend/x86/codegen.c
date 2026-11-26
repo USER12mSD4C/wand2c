@@ -1073,7 +1073,8 @@ static void emit_mem_op(Buf* b, uint8_t opcode, uint8_t reg, uint32_t offset) {
     }
 }
 
-static void emit_mem_load(Buf* b, uint8_t reg, uint32_t offset, uint32_t size) {
+static void emit_mem_load(Buf* b, uint8_t reg, uint32_t offset, uint32_t size,
+                          int is_signed) {
     uint8_t low = reg & 7;
     int32_t neg = -(int32_t)offset;
     uint8_t modrm = (uint8_t)(neg >= -128 && neg <= 127 ? 0x45 | (low << 3) : 0x85 | (low << 3));
@@ -1082,13 +1083,13 @@ static void emit_mem_load(Buf* b, uint8_t reg, uint32_t offset, uint32_t size) {
         case 1:
             buf_u8(b, reg >= 8 ? 0x4C : 0x48);
             buf_u8(b, 0x0F);
-            buf_u8(b, 0xB6);
+            buf_u8(b, is_signed ? 0xBE : 0xB6);
             buf_u8(b, modrm);
             break;
         case 2:
             buf_u8(b, reg >= 8 ? 0x4C : 0x48);
             buf_u8(b, 0x0F);
-            buf_u8(b, 0xB7);
+            buf_u8(b, is_signed ? 0xBF : 0xB7);
             buf_u8(b, modrm);
             break;
         case 4:
@@ -2318,11 +2319,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                      * the pointer only in value context. In address context
                      * (deref_ptr=0) they must remain the pointer itself, so
                      * they can be passed on to another function or indexed. */
-                    emit_mem_load(b, reg, (uint32_t)off, 8);
+                    emit_mem_load(b, reg, (uint32_t)off, 8, 0);
                     uint32_t elem_size =
                         (var_type && (var_type->tag == 10 || var_type->tag == 12))
                             ? type_size(g, var_type->inner)
                             : var_size;
+                    int elem_signed = var_type &&
+                        ((var_type->tag == 10 || var_type->tag == 12) &&
+                         var_type->inner &&
+                         (var_type->inner->tag == 4 || var_type->inner->tag == 5 ||
+                          var_type->inner->tag == 6));
                     uint8_t low = reg & 7;
                     int use_sib = low == 4 || low == 5;
                     uint8_t modrm = use_sib ? (uint8_t)((low == 5 ? 0x40 : 0) | (low << 3) | 0x04)
@@ -2332,19 +2338,24 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     switch (elem_size) {
                         case 1:
                             buf_u8(b, reg >= 8 ? 0x4D : 0x48);
-                            buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, modrm);
+                            buf_u8(b, 0x0F); buf_u8(b, elem_signed ? 0xBE : 0xB6); buf_u8(b, modrm);
                             if (use_sib) buf_u8(b, sib);
                             if (disp) buf_u8(b, 0);
                             break;
                         case 2:
                             buf_u8(b, reg >= 8 ? 0x4D : 0x48);
-                            buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, modrm);
+                            buf_u8(b, 0x0F); buf_u8(b, elem_signed ? 0xBF : 0xB7); buf_u8(b, modrm);
                             if (use_sib) buf_u8(b, sib);
                             if (disp) buf_u8(b, 0);
                             break;
                         case 4:
-                            if (reg >= 8) buf_u8(b, 0x45);
-                            buf_u8(b, 0x8B); buf_u8(b, modrm);
+                            if (elem_signed) {
+                                buf_u8(b, reg >= 8 ? 0x49 : 0x48);
+                                buf_u8(b, 0x63); buf_u8(b, modrm);
+                            } else {
+                                if (reg >= 8) buf_u8(b, 0x45);
+                                buf_u8(b, 0x8B); buf_u8(b, modrm);
+                            }
                             if (use_sib) buf_u8(b, sib);
                             if (disp) buf_u8(b, 0);
                             break;
@@ -2359,7 +2370,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     /* Array parameters hold a pointer in the stack slot. */
                     uint32_t load_size =
                         (var_type && var_type->tag == 12) ? 8 : var_size;
-                    emit_mem_load(b, reg, (uint32_t)off, load_size);
+                    int local_signed = var_type && (var_type->tag == 4 ||
+                                                    var_type->tag == 5 ||
+                                                    var_type->tag == 6);
+                    emit_mem_load(b, reg, (uint32_t)off, load_size,
+                                  local_signed);
                 }
             } else {
                 uint64_t expr_ptr;
@@ -2604,11 +2619,18 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     return;
                 }
             }
-            if (!float_op && simple_left(g, e->a) && has_binary_imm(op)) {
-                /* Compile the RHS into rbx first; the simple LHS cannot
-                 * clobber it, so no push/pop is needed. */
-                compile_expr(g, e->b, 3, 0);
-                compile_expr(g, e->a, 0, 0);
+            if (!float_op && has_binary_imm(op) &&
+                (simple_left(g, e->a) || simple_left(g, e->b))) {
+                /* A simple operand never clobbers rbx, so it can be compiled
+                 * straight into rbx while the other side stays in rax. This
+                 * removes the push/mov/pop round trip in both directions. */
+                if (simple_left(g, e->a)) {
+                    compile_expr(g, e->b, 3, 0);
+                    compile_expr(g, e->a, 0, 0);
+                } else {
+                    compile_expr(g, e->a, 0, 0);
+                    compile_expr(g, e->b, 3, 0);
+                }
                 emit_binary_rbx(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3500,7 +3522,7 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
             uint64_t off;
             if (map_get_str(&g->locals, target->str, &off)) {
                 if (access == 1 || access == 2) {
-                    emit_mem_load(b, 3, (uint32_t)off, 8);
+                    emit_mem_load(b, 3, (uint32_t)off, 8, 0);
                     uint32_t elem_size = 8;
                     uint64_t type_ptr;
                     if (map_get_str(&g->local_types, target->str, &type_ptr)) {
@@ -3728,7 +3750,7 @@ static void compile_nasm(Gen* g, WStr code) {
                     WStr name = wstr_lit(src + 1);
                     uint64_t off;
                     if (map_get_str(&g->locals, name, &off)) {
-                        emit_mem_load(b, dreg, (uint32_t)off, dsize);
+                        emit_mem_load(b, dreg, (uint32_t)off, dsize, 0);
                     }
                 } else if (strspn(src, "0123456789-") == strlen(src) && *src) {
                     long value = strtol(src, NULL, 10);
