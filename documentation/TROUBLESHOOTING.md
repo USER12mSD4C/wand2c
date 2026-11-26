@@ -175,9 +175,15 @@ u8 small = big; // compiles; small is 44
 
 Use an explicit cast at every narrowing boundary. Explicit casts state the intended truncation and remain correct if checker behavior changes.
 
-### Multiple return values give the same result
+### Multiple return values give the same result (historical)
 
-Tuple destructuring currently assigns the last returned value to every target in this build.
+Fixed in the current compiler. Older builds assigned the last returned value
+to every target because each returned expression clobbered `rax` before the
+destructuring targets were populated. The regression probes
+`probes/tuple_return.w` and `probes/tuple_return_multi.w` in the experiment
+directory now produce `7 9` and `11 22 33` / `7 10 13`.
+
+The old failure looked like this:
 
 ```wand
 fn pair() -> (u64, u64) {
@@ -189,7 +195,8 @@ u64 b;
 [a, b] = pair(); // a = 9, b = 9
 ```
 
-Use output pointers:
+Older builds needed output pointers as a workaround; this is no longer
+required:
 
 ```wand
 fn pair(u64* a*o, u64* b*o) {
