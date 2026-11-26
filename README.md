@@ -338,4 +338,64 @@ library with `make -C loader`; it provides `wand_p46_load`,
 `__wand_jmpto_loader` entry point. On Linux use `-fp` for a stand-alone
 executable; `.wexp` files are only for loaders.
 
-The `jmpto` statement invokes dynamic modules at the language level. If the source file is available, the compiler inlines the target. If not, it generates a call to `__wand_jmpto_loader` with the module name, an argument array, and a result array.
+### Why continuations are useful
+
+- **No process ABI to inherit.** The module has no ELF entry stub and no fixed
+  addresses, so the same bytes can be loaded into a kernel, a boot image, a
+  sandboxed process or a hosted test harness.
+- **Small, explicit ABI.** `main` takes up to six `u64` values and returns up to
+  four (`rax`, `rdx`, `rcx`, `r8`). There is no `argc`/`argv`/`envp` convention,
+  no libc startup and no compiler-chosen load address.
+- **Metadata travels with the code.** Types, signatures, function versions,
+  imports, dependencies and a reflection index let a loader validate and link
+  a module before calling it.
+- **One door in and out.** Values enter as arguments and leave as results; a
+  module cannot run code on its own. This fits drivers, plugins and updatable
+  kernel components, and keeps the host's C ABI surface small.
+
+### Loading a module from C
+
+```c
+#include "wand_p46.h"
+
+static void* resolve(const char* module, const char* symbol,
+                     uint32_t version, void* ctx) {
+    /* Return the host address of `symbol`, or NULL if unavailable. */
+    return NULL;
+}
+
+/* bytes/len are the contents of module.wexp. The loader copies them. */
+WandP46Status status = WAND_P46_OK;
+WandP46Options options = {resolve, NULL, NULL};
+WandP46Module* m = wand_p46_load(bytes, len, &options, &status);
+if (!m) { /* wand_p46_status_string(status) explains the failure */ }
+
+uint64_t args[1] = {4};
+uint64_t results[4] = {0};
+size_t count = 0;
+status = wand_p46_call(m, args, 1, results, 4, &count);
+wand_p46_unload(m);
+```
+
+`wand_p46_get_symbol(module, "name", version, &fn)` resolves any exported
+function, not just `main`. The reference loader maps the image read/write/exec
+while applying relocations; an OS loader can map read/write first and switch to
+read/execute afterwards for W^X.
+
+### Calling a module from Wand (`jmpto`)
+
+```wandc
+jmpto "worker.wexp" {
+    u64 input_value = argc + 21;
+    return(input_value);
+}
+return(input_value);
+```
+
+Variables prepared in the block become arguments (at most six, in order);
+`return(var)` names a caller variable that receives a result (at most four).
+If the worker's `.w` source is present at compile time the call is inlined;
+otherwise the generated code calls `__wand_jmpto_loader`. For the dynamic path,
+register the module once with
+`wand_p46_register_path("worker.wexp", "/path/to/worker.wexp", &options)`;
+up to 32 modules can be registered. A failed lookup returns 0.

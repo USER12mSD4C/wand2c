@@ -135,6 +135,20 @@ instead: `mem_load_u32(addr)`, `mem_store_u32(addr, val)`, and the
 `u64` address and emit exact-width x86 accesses without a C shim. See
 `SYNTAX.md`, section 25.
 
+### `jmpto` returns 0 or leaves its result variable unchanged
+
+If the worker source is not next to the host at compile time, `jmpto` uses the
+dynamic loader. Register the module before calling it:
+
+```c
+wand_p46_register_path("worker.wexp", "/path/to/worker.wexp", &options);
+```
+
+Without a registration (or with more than six arguments / four results) the
+loader returns 0. If the worker source *is* present, the body is inlined and
+the optimizer can fold reads of locals written only by the inlined code; use
+the dynamic path, or a section global, when the caller needs the result.
+
 ### Syntax errors
 
 The compiler may report the line after the actual mistake. Check the previous line for:
