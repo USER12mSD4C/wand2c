@@ -124,7 +124,7 @@ Every Standard 4/6 binary must contain:
 
 ```
 struct p46_header {
-    u8  magic[4];            // fixed byte sequence: 0x50 '4' '6' 0x00 ("P46\\0")
+    u8  magic[4];            // fixed byte sequence: 0x50 '4' '6' 0x00 ("P46\0")
     u8  format_major;        // e.g. 1
     u8  format_minor;        // e.g. 6
     u8  format_patch;        // e.g. 0
@@ -139,6 +139,18 @@ struct p46_header {
     // followed by section descriptors
 }
 ```
+
+**On-disk size is 36 bytes, with no implicit C padding.** The field offsets
+are `magic@0`, `format_major@4`, `format_minor@5`, `format_patch@6`,
+`endianness@7`, `pointer_size@8`, `address_size@9`, `reserved@10..11`,
+`module_version@12`, `section_count@16`, `strtab_offset@20`, `strtab_size@28`.
+A hosted C struct with natural alignment is 40 bytes because `strtab_offset`
+needs 8-byte alignment; reading it with `fread(&hdr, sizeof(hdr), 1, f)` is
+therefore **not conformant** — it silently consumes four bytes of the first
+section descriptor. Read fields explicitly from bytes (see Appendix C) or use
+a packed struct. The same rule applies to every structure in this document:
+the wire format is dense, and any host-language padding is a bug in the
+reader, not part of the format.
 
 **Magic:** `magic` is a raw 4-byte sequence, **not** an integer. It must be compared byte-for-byte (e.g. `memcmp`), never loaded as a `u32` and compared against a constant - a `u32` load is endianness-dependent, but `endianness` itself hasn't been validated yet at the point the magic is checked. Byte-wise comparison sidesteps this chicken-and-egg problem entirely.
 
@@ -166,6 +178,12 @@ struct p46_section {
 }
 ```
 
+Each descriptor occupies exactly **20 bytes** on disk (`offset@0`, `size@8`,
+`type@16`); there is no trailing padding. A natural C struct is typically 24
+bytes and must not be used for I/O. The descriptor array begins immediately
+after the 36-byte header, so the first payload section starts at byte
+`36 + 20 * section_count`.
+
 **Section Types:**
 
 | Type | Meaning |
@@ -186,9 +204,9 @@ The string table (`.p46_strtab`) is a contiguous block of null-terminated UTF-8 
 
 ```
 // Example string table layout:
-// offset 0: "Foo\\0"
-// offset 4: "bar\\0"
-// offset 8: "libc.ko\\0"
+// offset 0: "Foo\0"
+// offset 4: "bar\0"
+// offset 8: "libc.ko\0"
 ```
 
 Loaders do not validate UTF-8 correctness; string table entries are byte sequences with null terminators. Consumers must handle invalid UTF-8 sequences gracefully.
@@ -201,6 +219,11 @@ Only `.p46_types` (`P46_SECTION_TYPES`) uses this repeated-record format. It con
 [type: u16][length: u32][value: byte[length]]
 ...
 ```
+
+Every multi-byte field in a record uses the byte order declared by
+`endianness` (little-endian when `endianness = 1`) and is packed with **no
+alignment padding**. In particular, a `u8` field is immediately followed by
+the next field at the next byte offset, never aligned up to a `u32` boundary.
 
 `.p46_exports`, `.p46_imports`, `.p46_deps` and `.p46_reflect` are **not** TLV-record sequences - each is a single flat structure (a count followed by a fixed-shape array), defined in full in sections 5.1-5.3 and 7.5 respectively. They don't need TLV type/length framing at the record level: the section descriptor already gives the exact `offset`/`size` of the whole structure, and every element within it has a statically known shape. Wrapping them in an outer TLV record on top of that would be redundant.
 
@@ -368,9 +391,17 @@ Pointers are explicitly typed with `pointer<T>` syntax. The size is determined b
 ### 4.4. Structures
 Layout rules (architecture-independent):
 - Fields are laid out in order of declaration
-- Each field is aligned to an offset multiple of its size (up to 8 bytes)
-- For fields with size > 8 bytes, alignment is 8 bytes
-- Total structure size is rounded up to the maximum field alignment
+- The alignment of a primitive is `min(size, 8)`; a pointer has alignment
+  `min(pointer_size, 8)` from the header
+- An array has the alignment of its **element type**, not of the whole array
+  (`u8[256]` has alignment 1, not 8)
+- A struct or union has alignment equal to the maximum alignment of its
+  fields, capped at 8 bytes
+- Each field starts at the next offset that is a multiple of its own alignment
+- Total structure size is rounded up to the structure's alignment
+
+These rules are a property of the type, not of the target machine; a field's
+byte size alone is not enough to compute its alignment for aggregates.
 
 ```
 struct Example version 1 {
@@ -424,6 +455,26 @@ exports: [
 ] * export_count
 ```
 
+With `A = header.address_size`, each entry starts at the following offsets
+relative to the entry (the section starts with the 4-byte count):
+
+| Field | Offset |
+|---|---|
+| `name_offset` | 0 |
+| `module_name_offset` | 4 |
+| `version` | 8 |
+| `kind` | 12 |
+| `address` | 13 .. 13+A-1 |
+| `type_id` | 13+A |
+| `param_count` | 17+A |
+| `return_type` | 21+A |
+| `param_types[0..]` | 25+A |
+
+`param_count` and `return_type` are **present in every entry** (zero for
+variables and types); only the `param_types` array length varies. There is no
+padding: for the common `address_size = 8` case the fixed part of an entry is
+33 bytes plus `4 * param_count`.
+
 ```
 #define P46_EXPORT_KIND_FUNCTION 1
 #define P46_EXPORT_KIND_VARIABLE 2
@@ -445,6 +496,10 @@ imports: [
 ] * import_count
 ```
 
+Each entry is exactly 16 bytes (`name_offset@0`, `module_name_offset@4`,
+`required_version@8`, `required_type_version@12`). Even with zero imports the
+section contains the 4-byte count; an empty section is **not** zero bytes.
+
 ### 5.3. Dependencies Section Format
 Section descriptor `type` field = `P46_SECTION_DEPENDENCIES` (5). Content (flat structure, not TLV):
 ```
@@ -457,6 +512,9 @@ dependencies: [
     required_build: u32
 ] * dep_count
 ```
+
+Each entry is exactly 20 bytes (fields at offsets 0, 4, 8, 12, 16); the count
+is always present, including when there are no dependencies.
 
 ### 5.4. Import Type Versioning
 When importing a type, the module specifies the version it expects. The loader must verify compatibility:
@@ -657,6 +715,11 @@ entries: [
 ] * entry_count
 ```
 
+Each entry is exactly 13 bytes (`qualified_name_offset@0`, `target_kind@4`,
+`target_index@5`, `version@9`); there is no padding between `target_kind` and
+`target_index`. An empty index is still a 4-byte section containing only
+`entry_count = 0`.
+
 A loader that omits this index entirely (`entry_count = 0`) must still conform - callers fall back to a linear scan of `.p46_types`/`.p46_exports` - but the section itself remains mandatory per section 3.2 so its presence and shape don't need to be probed for.
 
 ---
@@ -678,11 +741,17 @@ The `pointer_size` field in the header (a byte count, not a flag - see section 3
 Standard 4/6 uses **little-endian** for all metadata by default, and this governs every multi-byte field in every section (header, types, exports, imports, deps, reflect) - not just the header. The `endianness` field indicates the byte order the file was actually written in. A loader MAY convert on load if its native order differs, or MAY simply refuse to load modules whose declared `endianness` doesn't match its own - both are conformant. What's not conformant is ignoring the field and assuming native order. (An OS that only ever runs on one architecture it controls end-to-end is not obligated to implement a byte-swapping path it will never exercise.)
 
 ### 8.4. Alignment Rules (Architecture-Independent)
-1. Fields are laid out in order of declaration
-2. Each field is aligned to an offset multiple of its size (up to 8 bytes)
-3. For fields with size > 8 bytes, alignment is 8 bytes
-4. Total structure size is rounded up to the maximum alignment of its fields
-5. These rules are identical across all architectures, ensuring binary compatibility
+The complete rules are in section 4.4; they are repeated here because they
+apply to every architecture, including hosted targets such as Linux/x86_64:
+
+1. Primitive alignment is `min(size, 8)`; pointer alignment comes from
+   `pointer_size`, capped at 8
+2. An array has the alignment of its element type, never its total size
+3. A struct/union has the maximum alignment of its fields, capped at 8
+4. Fields are laid out in declaration order, each at the next multiple of its
+   own alignment; the total size is rounded up to the structure alignment
+5. These rules do not depend on the host compiler's padding rules; metadata
+   records in `.p46_types` are encoded using them, not with natural C layout
 
 ---
 
@@ -730,8 +799,14 @@ A conforming loader **must** perform the following validation before accepting a
 - `endianness` must match loader native order or loader must convert (`P46_ERR_ENDIANNESS_MISMATCH`)
 
 **Section validation:**
+- `section_count` must be at least 5 and the descriptor array
+  (`36 + 20 * section_count` bytes) must fit in the buffer (`P46_ERR_TRUNCATED`)
+- Each of the five mandatory section types (1-5) must appear exactly once;
+  vendor sections (type >= 100) may appear any number of times
 - Every section descriptor's `offset + size` must not exceed the input buffer size (`P46_ERR_TRUNCATED_SECTION`)
 - No two sections may overlap in the `[offset, offset + size)` range (`P46_ERR_OVERLAPPING_SECTIONS`)
+- No section, and neither the string table nor the header block, may overlap
+  another of these regions (`P46_ERR_OVERLAPPING_SECTIONS`)
 - The string table (`strtab_offset + strtab_size`) must fit within the buffer (`P46_ERR_TRUNCATED`)
 
 **String table validation:**
@@ -743,8 +818,12 @@ When parsing `.p46_types` (the only TLV-record section), the loader **must**:
 
 1. Read `type` (2 bytes) and `length` (4 bytes)
 2. Verify that `current_position + 6 + length <= section_end` before reading any value bytes (`P46_ERR_CORRUPT_TYPES`)
-3. If `type` is unrecognized (vendor range 100-65535), skip `6 + length` bytes and continue
-4. If `type` is invalid (0 or > 65535), reject (`P46_ERR_CORRUPT_TYPES`)
+3. If `type` is unrecognized (reserved core range 10-99 or vendor range
+   100-65535), skip `6 + length` bytes and continue. Any later record that
+   refers to a skipped type ID simply remains unresolved and fails import;
+   that is not a parse error.
+4. If `type` is 0, reject (`P46_ERR_CORRUPT_TYPES`). `type` is stored in two
+   bytes, so a value above 65535 cannot be encoded and is not a case to check.
 5. Never trust `length` without bounds checking
 
 This prevents malformed TLV records from causing out-of-bounds reads.
@@ -752,9 +831,14 @@ This prevents malformed TLV records from causing out-of-bounds reads.
 ### 10.3. Export Address Safety
 When reading export entries, the loader **must**:
 
-1. Read exactly `header.address_size` bytes for each `address` field
-2. Zero-extend to `u64` internally
-3. Verify that `address` is within the module's loaded image bounds (loader-defined check)
+1. Read each export entry in the field order and byte offsets of section 5.1,
+   starting by skipping the 4-byte `export_count` at the section start; the
+   address is **not** the first field after the count
+2. Read exactly `header.address_size` bytes for the `address` field and
+   zero-extend it to `u64` internally
+3. Verify that a non-zero `address` is within the module's loaded image bounds
+   (loader-defined check). Exports of kind TYPE have `address = 0` by
+   definition and are exempt from this check.
 
 ### 10.4. Reflection Index Safety
 When using `.p46_reflect`:
@@ -812,7 +896,7 @@ The header's section descriptors (one per mandatory section: types, exports, imp
 
 ```
 Section .p46_header:
-   magic:            50 34 36 00  ("P46\\0")
+   magic:            50 34 36 00  ("P46\0")
    format_major:      1
    format_minor:      6
    format_patch:      0
@@ -846,14 +930,26 @@ Section .p46_reflect:  (flat structure, section 7.5)
    entries: [ (qualified-name index entry for "libc.ko:open" -> export #0) ]
 
 Section .p46_strtab:
-   "Foo\\0x\\0y\\0MyBuffer\\0libc.ko\\0open\\0"
+   "Foo\0x\0y\0MyBuffer\0libc.ko\0open\0"
 ```
 
 ---
 
 ## Appendix C: Parser Example (C)
 
-This example demonstrates how to read the header and locate sections. It's written against hosted C (`stdio.h`, `malloc`) purely because that's a portable way to show byte layout on paper - it is not part of the standard's contract. A kernel-level loader (no filesystem yet, no heap yet, reading a module out of a boot-time memory blob) replaces `fread`/`fseek` with whatever primitives it already has (raw pointer arithmetic into a mapped image, block-device reads, etc.) and `malloc` with its own allocator or none at all (see section 6.2). Only the byte layout below is normative.
+This example demonstrates how to read the header, locate sections and parse
+export entries. It is written against hosted C purely because that's a
+portable way to show byte layout on paper - it is not part of the standard's
+contract. It parses a module already present in memory, matching the
+`module_load_from_memory` primitive (section 6.1); a hosted program can read a
+file into that buffer first. A kernel-level loader replaces the buffer with
+whatever address space it already has (mapped image, flash, boot blob) and
+`calloc` with its own allocator or none at all (see section 6.2). This example
+assumes the Raw Binary embedding from Appendix A, where the magic is at byte 0;
+for an ELF or PE/COFF module, locate the `.p46_header` section first and read
+each section by its descriptor offset (section 3.1). Fields are decoded byte
+by byte: `fread`-ing a natural C struct would introduce padding and is not
+conformant (sections 3.3 and 8.4). Only the byte layout below is normative.
 
 ```c
 #include <stdio.h>
@@ -861,112 +957,123 @@ This example demonstrates how to read the header and locate sections. It's writt
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    uint8_t  magic[4];
-    uint8_t  format_major;
-    uint8_t  format_minor;
-    uint8_t  format_patch;
-    uint8_t  endianness;
-    uint8_t  pointer_size;
-    uint8_t  address_size;
-    uint8_t  reserved[2];
-    uint32_t module_version;
-    uint32_t section_count;
-    uint64_t strtab_offset;
-    uint64_t strtab_size;
-} p46_header;
+/* The wire format is dense: no host-struct padding anywhere (sections 3.3,
+ * 3.5, 5.1-5.3, 7.5). Decode bytes explicitly instead of fread'ing structs. */
+#define P46_HEADER_SIZE       36u
+#define P46_SECTION_DESC_SIZE 20u
+#define P46_MIN_SECTIONS      5u
+#define P46_SECTION_EXPORTS   2u
 
 typedef struct {
     uint64_t offset;
     uint64_t size;
     uint32_t type;
-} p46_section;
+} p46_section_view;
 
 static const uint8_t P46_MAGIC[4] = { 0x50, '4', '6', 0x00 };
 
-static uint64_t read_address(const uint8_t* data, uint8_t address_size) {
-    switch (address_size) {
-        case 1: return data[0];
-        case 2: return (uint64_t)data[0] | ((uint64_t)data[1] << 8);
-        case 4: return (uint64_t)data[0] | ((uint64_t)data[1] << 8) |
-                        ((uint64_t)data[2] << 16) | ((uint64_t)data[3] << 24);
-        case 8: return (uint64_t)data[0] | ((uint64_t)data[1] << 8) |
-                        ((uint64_t)data[2] << 16) | ((uint64_t)data[3] << 24) |
-                        ((uint64_t)data[4] << 32) | ((uint64_t)data[5] << 40) |
-                        ((uint64_t)data[6] << 48) | ((uint64_t)data[7] << 56);
-        default: return 0;
-    }
+static uint32_t rd_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-int parse_p46(FILE* f) {
-    p46_header hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1) return -1;
+static uint64_t rd_u64(const uint8_t* p) {
+    return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
+}
 
-    // Byte-wise compare: correct regardless of host or file endianness,
-    // and doesn't depend on having read hdr.endianness first.
-    if (memcmp(hdr.magic, P46_MAGIC, 4) != 0) {
-        fprintf(stderr, "Invalid magic: %02x %02x %02x %02x\\n",
-                hdr.magic[0], hdr.magic[1], hdr.magic[2], hdr.magic[3]);
+static uint64_t rd_address(const uint8_t* p, uint8_t width) {
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < width; i++) {
+        value |= (uint64_t)p[i] << (8 * i);
+    }
+    return value;
+}
+
+/* module_load_from_memory is the primitive (section 6.1); a hosted caller can
+ * fread the whole file into this buffer before calling this function. */
+int parse_p46(const uint8_t* data, size_t size) {
+    if (!data || size < P46_HEADER_SIZE) return -1;
+
+    /* Byte-wise compare: correct before endianness has been decoded. */
+    if (memcmp(data, P46_MAGIC, 4) != 0) {
+        fprintf(stderr, "Invalid magic: %02x %02x %02x %02x\n",
+                data[0], data[1], data[2], data[3]);
         return -1;
     }
+    uint8_t fmt_major = data[4], fmt_minor = data[5], fmt_patch = data[6];
+    uint8_t endianness = data[7], ptr_size = data[8], addr_size = data[9];
+    if (endianness != 1) return -1; /* this example handles little-endian only */
+    if (ptr_size != 1 && ptr_size != 2 && ptr_size != 4 && ptr_size != 8) return -1;
+    if (addr_size != 1 && addr_size != 2 && addr_size != 4 && addr_size != 8) return -1;
 
-    printf("Standard 4/6 v%u.%u.%u\\n",
-           hdr.format_major, hdr.format_minor, hdr.format_patch);
-    printf("Module version: %u.%u.%u.%u\\n",
-           (hdr.module_version >> 24) & 0xFF,
-           (hdr.module_version >> 16) & 0xFF,
-           (hdr.module_version >> 8) & 0xFF,
-           hdr.module_version & 0xFF);
-    printf("Pointer size: %u bytes (%u-bit)\\n", hdr.pointer_size, hdr.pointer_size * 8);
-    printf("Address size: %u bytes\\n", hdr.address_size);
+    uint32_t module_version = rd_u32(data + 12);
+    uint32_t section_count = rd_u32(data + 16);
+    uint64_t strtab_offset = rd_u64(data + 20);
+    uint64_t strtab_size = rd_u64(data + 28);
+    if (section_count < P46_MIN_SECTIONS) return -1;
+    if ((uint64_t)size < P46_HEADER_SIZE + (uint64_t)P46_SECTION_DESC_SIZE * section_count) return -1;
+    if (strtab_offset > (uint64_t)size || strtab_size > (uint64_t)size - strtab_offset) return -1;
 
-    // Read section descriptors (section_count >= 5, see section 3.2/3.3)
-    p46_section* sections = malloc(hdr.section_count * sizeof(p46_section));
-    if (fread(sections, sizeof(p46_section), hdr.section_count, f) != hdr.section_count) {
-        free(sections);
-        return -1;
-    }
+    printf("Standard 4/6 v%u.%u.%u\n", fmt_major, fmt_minor, fmt_patch);
+    printf("Module version: %u.%u.%u.%u\n",
+           (module_version >> 24) & 0xFF, (module_version >> 16) & 0xFF,
+           (module_version >> 8) & 0xFF, module_version & 0xFF);
+    printf("Pointer size: %u bytes; address size: %u bytes\n", ptr_size, addr_size);
 
-    // Locate sections
-    for (uint32_t i = 0; i < hdr.section_count; i++) {
-        const char* type_name = "";
-        switch (sections[i].type) {
-            case 1: type_name = "types"; break;
-            case 2: type_name = "exports"; break;
-            case 3: type_name = "reflect"; break;
-            case 4: type_name = "imports"; break;
-            case 5: type_name = "dependencies"; break;
-            default: type_name = "vendor/unknown"; break;
+    p46_section_view* sections = calloc(section_count, sizeof(*sections));
+    if (!sections) return -1;
+    for (uint32_t i = 0; i < section_count; i++) {
+        const uint8_t* d = data + P46_HEADER_SIZE + (size_t)i * P46_SECTION_DESC_SIZE;
+        sections[i].offset = rd_u64(d);
+        sections[i].size = rd_u64(d + 8);
+        sections[i].type = rd_u32(d + 16);
+        if (sections[i].offset > (uint64_t)size ||
+            sections[i].size > (uint64_t)size - sections[i].offset) {
+            free(sections);
+            return -1;
         }
-        printf("Section %u: type=%s offset=0x%llx size=%llu\\n",
-               i, type_name, (unsigned long long)sections[i].offset,
+        printf("Section %u: type=%u offset=0x%llx size=%llu\n", i,
+               sections[i].type, (unsigned long long)sections[i].offset,
                (unsigned long long)sections[i].size);
     }
+    /* A production loader also checks all regions for overlap (section 10.1). */
 
-    // Read string table (located via header fields, not a section descriptor)
-    fseek(f, (long)hdr.strtab_offset, SEEK_SET);
-    char* strtab = malloc((size_t)hdr.strtab_size);
-    fread(strtab, 1, (size_t)hdr.strtab_size, f);
+    const uint8_t* strtab = data + (size_t)strtab_offset;
+    for (uint32_t i = 0; i < section_count; i++) {
+        if (sections[i].type != P46_SECTION_EXPORTS) continue;
+        const uint8_t* e = data + (size_t)sections[i].offset;
+        if (sections[i].size < 4) { free(sections); return -1; }
+        uint32_t export_count = rd_u32(e);
+        printf("Found exports section: %u exports\n", export_count);
 
-    // Example: read exports - a flat structure (section 5.1), not TLV records.
-    // .p46_types is the only section that needs a TLV-record loop (section 3.5).
-    for (uint32_t i = 0; i < hdr.section_count; i++) {
-        if (sections[i].type == 2) { // exports
-            fseek(f, (long)sections[i].offset, SEEK_SET);
-            uint32_t export_count;
-            fread(&export_count, sizeof(export_count), 1, f);
-            printf("Found exports section: %u exports\\n", export_count);
-            
-            // Example: read first export address with variable width
-            uint8_t addr_buf[8] = {0};
-            fread(addr_buf, 1, hdr.address_size, f);
-            uint64_t addr = read_address(addr_buf, hdr.address_size);
-            printf("First export address: 0x%llx\\n", (unsigned long long)addr);
-            break;
+        /* Entries are flat and dense (section 5.1), not TLV records. */
+        uint64_t pos = 4;
+        for (uint32_t j = 0; j < export_count; j++) {
+            if (sections[i].size - pos < 25u + addr_size) { free(sections); return -1; }
+            uint32_t name_offset     = rd_u32(e + (size_t)pos); pos += 4;
+            uint32_t module_offset   = rd_u32(e + (size_t)pos); pos += 4;
+            uint32_t version         = rd_u32(e + (size_t)pos); pos += 4;
+            uint8_t  kind            = e[(size_t)pos++];
+            uint64_t address         = rd_address(e + (size_t)pos, addr_size); pos += addr_size;
+            uint32_t type_id         = rd_u32(e + (size_t)pos); pos += 4;
+            uint32_t param_count     = rd_u32(e + (size_t)pos); pos += 4;
+            uint32_t return_type     = rd_u32(e + (size_t)pos); pos += 4;
+            if (sections[i].size - pos < (uint64_t)param_count * 4) { free(sections); return -1; }
+            pos += (uint64_t)param_count * 4; /* param_types[] */
+
+            if (name_offset >= strtab_size || module_offset >= strtab_size) {
+                free(sections);
+                return -1;
+            }
+            printf("export %u: %s from %s version=%u kind=%u "
+                   "address=0x%llx type=%u return=%u params=%u\n",
+                   j, (const char*)(strtab + name_offset),
+                   (const char*)(strtab + module_offset), version, kind,
+                   (unsigned long long)address, type_id, return_type, param_count);
         }
+        break;
     }
 
-    free(strtab);
     free(sections);
     return 0;
 }
@@ -993,16 +1100,16 @@ void print_struct(void* ptr, reflect_type* t) {
             case REFLECT_KIND_PRIMITIVE:
                 switch (f->type->id) {
                     case 3: // u32
-                        printf("%u\\n", *(uint32_t*)((char*)ptr + f->offset));
+                        printf("%u\n", *(uint32_t*)((char*)ptr + f->offset));
                         break;
                     case 4: // u64
-                        printf("%llu\\n", *(uint64_t*)((char*)ptr + f->offset));
+                        printf("%llu\n", *(uint64_t*)((char*)ptr + f->offset));
                         break;
                     // ...
                 }
                 break;
             case REFLECT_KIND_ARRAY:
-                printf("array[%u]\\n", f->type->array_count);
+                printf("array[%u]\n", f->type->array_count);
                 break;
         }
     }
