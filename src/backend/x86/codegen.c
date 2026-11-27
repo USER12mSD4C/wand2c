@@ -953,9 +953,15 @@ typedef struct {
     size_t match_depth;
 } LoopCtx;
 
+typedef struct {
+    WStr name;
+    uint8_t reg;
+} RegLocal;
+
 DEFINE_VEC(AddrPatchVec, AddrPatch)
 DEFINE_VEC(CallPatchVec, CallPatch)
 DEFINE_VEC(LoopCtxVec, LoopCtx)
+DEFINE_VEC(RegLocalVec, RegLocal)
 DEFINE_VEC(LayoutVec, Layout)
 DEFINE_VEC(VolatileSetVec, VolatileSet)
 
@@ -1008,6 +1014,7 @@ struct Gen {
     uint32_t last_rax_store_off; /* local stack offset stored to */
     size_t last_rax_store_gen; /* patch_generation at store time */
     LoopCtxVec loop_stack;
+    RegLocalVec reg_locals; /* canonical loop induction variables kept in regs */
     size_t stack_depth;
     size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
@@ -1028,6 +1035,65 @@ static int simple_left(Gen* g, WExpr* e);
 static int is_float_expr(Gen* g, WExpr* e);
 static int rax_only_expr(Gen* g, WExpr* e);
 static int expr_has_call(Gen* g, WExpr* e);
+static int is_local_self_addsub(Gen* g, WExpr* target, WExpr* e,
+                                uint8_t* op, int64_t* imm);
+
+/* Look up a local currently kept in a register. Newest binding wins. */
+static int reg_local_lookup(Gen* g, WStr name, uint8_t* reg) {
+    for (size_t i = g->reg_locals.n; i > 0; i--) {
+        RegLocal* r = &g->reg_locals.v[i - 1];
+        if (wstr_eq(r->name, name)) {
+            if (reg) *reg = r->reg;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* mov src -> dst for 64-bit GPRs. */
+static void emit_mov_reg_to_reg(Buf* b, uint8_t src, uint8_t dst) {
+    if (src == dst) return;
+    buf_u8(b, (uint8_t)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0)));
+    buf_u8(b, 0x89);
+    buf_u8(b, (uint8_t)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+}
+
+/* mov reg -> disp(%rbp) for 64-bit GPRs. */
+static void emit_mov_reg_to_local(Buf* b, uint8_t reg, uint32_t off) {
+    int32_t neg = -(int32_t)off;
+    buf_u8(b, (uint8_t)(0x48 | (reg >= 8 ? 4 : 0)));
+    buf_u8(b, 0x89);
+    if (neg >= -128 && neg <= 127) {
+        buf_u8(b, (uint8_t)(0x45 | ((reg & 7) << 3)));
+        buf_u8(b, (uint8_t)neg);
+    } else {
+        buf_u8(b, (uint8_t)(0x85 | ((reg & 7) << 3)));
+        buf_u32(b, (uint32_t)neg);
+    }
+}
+
+/* inc/dec/add/sub on a 64-bit register. op: 0=inc, 1=dec, 2=add imm,
+ * 3=sub imm. imm is a positive magnitude. */
+static void emit_addsub_reg(Buf* b, uint8_t reg, uint8_t op, int64_t imm) {
+    uint8_t rex = (uint8_t)(0x48 | (reg >= 8 ? 1 : 0));
+    uint8_t low = reg & 7;
+    if (op == 0 || op == 1) {
+        buf_u8(b, rex);
+        buf_u8(b, 0xFF);
+        buf_u8(b, (uint8_t)((op == 0 ? 0xC0 : 0xC8) | low));
+        return;
+    }
+    uint8_t group = op == 2 ? 0 : 5;
+    if (imm <= 127) {
+        buf_u8(b, rex); buf_u8(b, 0x83);
+        buf_u8(b, (uint8_t)(0xC0 | (group << 3) | low));
+        buf_u8(b, (uint8_t)imm);
+    } else {
+        buf_u8(b, rex); buf_u8(b, 0x81);
+        buf_u8(b, (uint8_t)(0xC0 | (group << 3) | low));
+        buf_u32(b, (uint32_t)imm);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Emitters                                                            */
@@ -2467,6 +2533,12 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                                       ? AS_PTR(WType, type_ptr)
                                       : NULL;
                 uint32_t var_size = type_size(g, var_type);
+                uint8_t bound_reg = 0;
+                if (reg_local_lookup(g, e->str, &bound_reg) && access == 3 &&
+                    var_size == 8) {
+                    emit_mov_reg_to_reg(b, bound_reg, reg);
+                    break;
+                }
                 /* Peephole: if an rax store to this exact slot was the last
                  * emitted instruction and no patch was recorded since, the
                  * load back into rax is redundant. Replace it with NOPs of
@@ -2888,14 +2960,19 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 }
             }
             if (!float_op && has_binary_imm(op) && e->b && e->b->tag == 3) {
-                /* RHS is a plain stack slot: apply the op directly to memory,
-                 * avoiding rbx entirely. Handles i*128 + p style index math
-                 * without a push/pop in compile_address. */
+                /* RHS is a plain 64-bit local: apply the op directly to its
+                 * memory slot, or to its bound register when the loop keeps
+                 * it in one. Both avoid rbx, which compile_address may have
+                 * already loaded with the array base. Handles i*128 + p
+                 * style index math without a push/pop round trip. */
                 uint64_t access = 3;
                 map_get_str(&g->local_access, e->b->str, &access);
                 uint64_t off = 0;
+                uint8_t bound_reg = 0;
+                int is_bound = access == 3 && expr_size(g, e->b) == 8 &&
+                    reg_local_lookup(g, e->b->str, &bound_reg);
                 if (access == 3 && rax_only_expr(g, e->a) &&
-                    map_get_str(&g->locals, e->b->str, &off)) {
+                    (is_bound || map_get_str(&g->locals, e->b->str, &off))) {
                     uint8_t opcode = 0;
                     if (wstr_eq_c(op, "OpAdd")) opcode = 0x03;
                     else if (wstr_eq_c(op, "OpSub")) opcode = 0x2B;
@@ -2905,12 +2982,19 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     else if (wstr_eq_c(op, "OpMul")) opcode = 0xAF;
                     if (opcode) {
                         compile_expr(g, e->a, 0, 0);
-                        buf_u8(b, 0x48);
-                        if (opcode == 0xAF) buf_u8(b, 0x0F);
-                        buf_u8(b, opcode);
-                        buf_u8(b, off <= 127 ? 0x45 : 0x85);
-                        if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
-                        else buf_u32(b, (uint32_t)(-(int32_t)off));
+                        if (is_bound) {
+                            buf_u8(b, (uint8_t)(0x48 | (bound_reg >= 8 ? 1 : 0)));
+                            if (opcode == 0xAF) buf_u8(b, 0x0F);
+                            buf_u8(b, opcode);
+                            buf_u8(b, (uint8_t)(0xC0 | (bound_reg & 7)));
+                        } else {
+                            buf_u8(b, 0x48);
+                            if (opcode == 0xAF) buf_u8(b, 0x0F);
+                            buf_u8(b, opcode);
+                            buf_u8(b, off <= 127 ? 0x45 : 0x85);
+                            if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+                            else buf_u32(b, (uint32_t)(-(int32_t)off));
+                        }
                         if (reg != 0) move_rax_to_reg(b, reg);
                         return;
                     }
@@ -3695,6 +3779,153 @@ static int expr_has_call(Gen* g, WExpr* e) {
     return expr_has_call(g, e->a) || expr_has_call(g, e->b);
 }
 
+/* Deeper call scan that also walks call arguments. r11 is caller-saved, so
+ * any call in a loop body would destroy a register-bound induction variable. */
+static int expr_has_call_deep(WExpr* e) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 9) {
+        return 1;
+    }
+    if (expr_has_call_deep(e->a) || expr_has_call_deep(e->b)) {
+        return 1;
+    }
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_has_call_deep(e->args[i])) return 1;
+    }
+    return 0;
+}
+
+/* True when e reads or writes the named local, or takes its address. */
+static int expr_mentions_name(WExpr* e, WStr name, int addr_only) {
+    if (!e) {
+        return 0;
+    }
+    if ((e->tag == 3 || e->tag == 4) && wstr_eq(e->str, name)) {
+        if (!addr_only || e->tag == 4) {
+            return 1;
+        }
+    }
+    return expr_mentions_name(e->a, name, addr_only) ||
+           expr_mentions_name(e->b, name, addr_only);
+}
+
+/* A loop body cannot keep its induction variable in r11 if it might call,
+ * return, redefine the variable, take its address, or start a jmpto. */
+static int stmt_forbidden_reg_loop(Gen* g, WStmt* s, WStr name) {
+    if (!s) {
+        return 0;
+    }
+    if (s->tag == 5 || s->tag == 8) { /* jmpto or return */
+        return 1;
+    }
+    if (s->tag == 0 && wstr_eq(s->name, name)) {
+        return 1;
+    }
+    if (s->tag == 1 && s->expr_count > 0 &&
+        expr_mentions_name(s->exprs[0], name, 0)) {
+        return 1;
+    }
+    WExpr* exprs[2] = {s->e1, s->e2};
+    for (size_t i = 0; i < 2; i++) {
+        if (expr_has_call_deep(exprs[i]) ||
+            expr_mentions_name(exprs[i], name, 1)) {
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < s->expr_count; i++) {
+        if (expr_has_call_deep(s->exprs[i]) ||
+            expr_mentions_name(s->exprs[i], name, 1)) {
+            return 1;
+        }
+    }
+    if (stmt_forbidden_reg_loop(g, s->s1, name) ||
+        stmt_forbidden_reg_loop(g, s->s2, name)) {
+        return 1;
+    }
+    for (size_t i = 0; i < s->stmt1_count; i++) {
+        if (stmt_forbidden_reg_loop(g, s->stmts1[i], name)) return 1;
+    }
+    for (size_t i = 0; i < s->stmt2_count; i++) {
+        if (stmt_forbidden_reg_loop(g, s->stmts2[i], name)) return 1;
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        if (expr_has_call_deep(s->cases[i].expr) ||
+            expr_mentions_name(s->cases[i].expr, name, 1)) {
+            return 1;
+        }
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            if (stmt_forbidden_reg_loop(g, s->cases[i].body[j], name)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Recognise a canonical for loop: i = constant literal, i < bound, i = i + 1.
+ * The bound may be any expression that does not mention i and has no call. */
+static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
+                            uint64_t* init) {
+    if (!s || !s->s1 || !s->e1 || !s->s2 || g->reg_locals.n != 0) {
+        return 0;
+    }
+    WExpr* init_expr = NULL;
+    WStr var = {0};
+    if (s->s1->tag == 0) {
+        var = s->s1->name;
+        init_expr = s->s1->e1;
+    } else if (s->s1->tag == 1 && s->s1->expr_count == 1 &&
+               s->s1->exprs[0] && s->s1->exprs[0]->tag == 3) {
+        var = s->s1->exprs[0]->str;
+        init_expr = s->s1->e1;
+    } else {
+        return 0;
+    }
+    if (!var.ptr || !init_expr || init_expr->tag != 0) {
+        return 0;
+    }
+    uint64_t off = 0, access = 3, type_ptr = 0, is_param = 0;
+    if (!map_get_str(&g->locals, var, &off)) {
+        return 0;
+    }
+    map_get_str(&g->local_access, var, &access);
+    map_get_str(&g->local_is_param, var, &is_param);
+    WType* t = map_get_str(&g->local_types, var, &type_ptr)
+                   ? AS_PTR(WType, type_ptr) : NULL;
+    if (access != 3 || is_param || !t || t->tag == 8 || t->tag == 10 ||
+        t->tag == 12 || type_size(g, t) != 8) {
+        return 0;
+    }
+    if (s->e1->tag != 8 ||
+        (!wstr_eq_c(s->e1->str, "OpLt") &&
+         !wstr_eq_c(s->e1->str, "OpLtEq"))) {
+        return 0;
+    }
+    if (!s->e1->a || s->e1->a->tag != 3 ||
+        !wstr_eq(s->e1->a->str, var) || !s->e1->b ||
+        s->e1->b->tag != 0 ||
+        expr_mentions_name(s->e1->b, var, 0) || expr_has_call(g, s->e1)) {
+        return 0;
+    }
+    if (!s->s2 || s->s2->tag != 1) {
+        return 0;
+    }
+    uint8_t op = 0;
+    int64_t imm = 0;
+    if (!is_local_self_addsub(g, s->s2->exprs[0], s->s2->e1, &op, &imm) ||
+        op != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < s->stmt1_count; i++) {
+        if (stmt_forbidden_reg_loop(g, s->stmts1[i], var)) return 0;
+    }
+    *reg = 11;
+    *name = var;
+    *init = init_expr->num;
+    return 1;
+}
+
+
 static int simple_left(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -4050,6 +4281,12 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
             map_get_str(&g->local_access, target->str, &access);
             uint64_t off;
             if (map_get_str(&g->locals, target->str, &off)) {
+                uint8_t bound_reg = 0;
+                if (reg_local_lookup(g, target->str, &bound_reg) && access == 3 &&
+                    expr_size(g, target) == 8) {
+                    emit_mov_reg_to_reg(b, 0, bound_reg);
+                    break;
+                }
                 if (access == 1 || access == 2) {
                     emit_mem_load(b, 3, (uint32_t)off, 8, 0);
                     uint32_t elem_size = 8;
@@ -4496,7 +4733,13 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 if (local_addsub) {
                     uint64_t off = 0;
                     map_get_str(&g->locals, s->exprs[0]->str, &off);
-                    if (addsub_op < 2) {
+                    uint8_t bound_reg = 0;
+                    uint64_t access = 3;
+                    map_get_str(&g->local_access, s->exprs[0]->str, &access);
+                    if (access == 3 && expr_size(g, s->exprs[0]) == 8 &&
+                        reg_local_lookup(g, s->exprs[0]->str, &bound_reg)) {
+                        emit_addsub_reg(b, bound_reg, addsub_op, addsub_imm);
+                    } else if (addsub_op < 2) {
                         emit_mem_op(b, 0xFF, addsub_op, (uint32_t)off);
                     } else {
                         uint8_t group = addsub_op == 2 ? 0 : 5;
@@ -4592,7 +4835,24 @@ static void compile_stmt(Gen* g, WStmt* s) {
             break;
         }
         case 4: { /* For */
+            /* Declare the induction variable first so try_bind_for_reg can
+             * find it in g->locals. */
             if (s->s1) compile_stmt(g, s->s1);
+            uint8_t loop_reg = 0;
+            WStr loop_name = {0};
+            uint64_t loop_init = 0;
+            int reg_loop = try_bind_for_reg(g, s, &loop_reg, &loop_name,
+                                            &loop_init);
+            uint64_t loop_off = 0;
+            if (reg_loop) {
+                map_get_str(&g->locals, loop_name, &loop_off);
+                emit_mov_imm64(b, loop_reg, loop_init);
+                emit_mov_reg_to_local(b, loop_reg, (uint32_t)loop_off);
+                RegLocal rl = {0};
+                rl.name = loop_name;
+                rl.reg = loop_reg;
+                RegLocalVec_push(&g->reg_locals, rl);
+            }
             size_t loop_start = b->len;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
@@ -4610,6 +4870,10 @@ static void compile_stmt(Gen* g, WStmt* s) {
             int32_t jmp = (int32_t)loop_start - (int32_t)(b->len + 5);
             buf_u8(b, 0xE9);
             buf_i32(b, jmp);
+            if (reg_loop) {
+                emit_mov_reg_to_local(b, loop_reg, (uint32_t)loop_off);
+                g->reg_locals.n--;
+            }
             patch_address(g, exit_patch, (int32_t)(b->len - (exit_patch + 4)));
             for (size_t i = 0; i < ctx.brk_n; i++) {
                 patch_address(g, ctx.brk[i], (int32_t)(b->len - (ctx.brk[i] + 4)));
