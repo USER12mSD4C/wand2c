@@ -4219,11 +4219,159 @@ static void spill_xmm_loop_locals(Gen* g, XmmLocalVec* xs) {
     }
 }
 
+/* r8 and r9 are unused by generated scalar code. They are caller-saved, so
+ * GPR loop binding is only enabled for loops without calls, jmpto, returns,
+ * or addresses of locals. */
+static int reg_in_use(Gen* g, uint8_t reg) {
+    for (size_t i = 0; i < g->reg_locals.n; i++) {
+        if (g->reg_locals.v[i].reg == reg) return 1;
+    }
+    return 0;
+}
+
+static int expr_unsafe_for_gpr(WExpr* e) {
+    if (!e) return 0;
+    if (e->tag == 4 || e->tag == 5 || e->tag == 9) return 1;
+    if (expr_unsafe_for_gpr(e->a) || expr_unsafe_for_gpr(e->b)) return 1;
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_unsafe_for_gpr(e->args[i])) return 1;
+    }
+    return 0;
+}
+
+static int stmt_has_call_deep(WStmt* s);
+
+static int stmt_has_call_deep_tree(WStmt** v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (stmt_has_call_deep(v[i])) return 1;
+    }
+    return 0;
+}
+
+static int stmt_has_call_deep(WStmt* s) {
+    if (!s) return 0;
+    if (expr_has_call_deep(s->e1) || expr_has_call_deep(s->e2)) return 1;
+    for (size_t i = 0; i < s->expr_count; i++) {
+        if (expr_has_call_deep(s->exprs[i])) return 1;
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        if (expr_has_call_deep(s->cases[i].expr)) return 1;
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            if (stmt_has_call_deep(s->cases[i].body[j])) return 1;
+        }
+    }
+    return stmt_has_call_deep(s->s1) || stmt_has_call_deep(s->s2) ||
+           stmt_has_call_deep_tree(s->stmts1, s->stmt1_count) ||
+           stmt_has_call_deep_tree(s->stmts2, s->stmt2_count);
+}
+
+static int stmt_unsafe_for_gpr(WStmt* s);
+
+static int stmt_unsafe_for_gpr_tree(WStmt** v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (stmt_unsafe_for_gpr(v[i])) return 1;
+    }
+    return 0;
+}
+
+static int stmt_unsafe_for_gpr(WStmt* s) {
+    if (!s) return 0;
+    if (s->tag == 5 || s->tag == 6 || s->tag == 7 || s->tag == 8) return 1;
+    if (expr_unsafe_for_gpr(s->e1) || expr_unsafe_for_gpr(s->e2)) return 1;
+    for (size_t i = 0; i < s->expr_count; i++) {
+        if (expr_unsafe_for_gpr(s->exprs[i])) return 1;
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        if (expr_unsafe_for_gpr(s->cases[i].expr)) return 1;
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            if (stmt_unsafe_for_gpr(s->cases[i].body[j])) return 1;
+        }
+    }
+    return stmt_unsafe_for_gpr(s->s1) || stmt_unsafe_for_gpr(s->s2) ||
+           stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count) ||
+           stmt_unsafe_for_gpr_tree(s->stmts2, s->stmt2_count);
+}
+
+static int gpr_bindable_local(Gen* g, WStr name) {
+    uint64_t off = 0;
+    uint64_t access = 3;
+    uint64_t is_param = 0;
+    uint64_t type_ptr = 0;
+    uint8_t dummy = 0;
+    if (!map_get_str(&g->locals, name, &off)) return 0;
+    map_get_str(&g->local_access, name, &access);
+    map_get_str(&g->local_is_param, name, &is_param);
+    if (access != 3 || is_param) return 0;
+    if (reg_local_lookup(g, name, &dummy) || xmm_local_lookup(g, name, &dummy)) {
+        return 0;
+    }
+    WType* t = map_get_str(&g->local_types, name, &type_ptr)
+                   ? AS_PTR(WType, type_ptr) : NULL;
+    WType* scalar = peel_typedefs(t);
+    if (!scalar || scalar->tag == 8 || scalar->tag == 10 || scalar->tag == 12 ||
+        type_size(g, t) != 8) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Collect scalar locals assigned in a loop body for r8/r9 binding. */
+static void collect_gpr_loop_locals(Gen* g, WStmt* s, RegLocalVec* out,
+                                    uint8_t* next_reg) {
+    if (!s || *next_reg > 9) return;
+    if (s->tag == 1 && s->expr_count > 0 && s->exprs[0] &&
+        s->exprs[0]->tag == 3 && gpr_bindable_local(g, s->exprs[0]->str)) {
+        WStr name = s->exprs[0]->str;
+        int already = 0;
+        for (size_t i = 0; i < out->n; i++) {
+            if (wstr_eq(out->v[i].name, name)) already = 1;
+        }
+        if (!already) {
+            while (*next_reg <= 9 && reg_in_use(g, *next_reg)) (*next_reg)++;
+            if (*next_reg <= 9) {
+                RegLocal r = {0};
+                r.name = name;
+                r.reg = (*next_reg)++;
+                RegLocalVec_push(out, r);
+            }
+        }
+    }
+    /* A nested loop owns its init and post expressions. Scanning them here
+     * would bind its induction variable at the outer loop level. */
+    if (s->tag == 3 || s->tag == 4) {
+        for (size_t i = 0; i < s->stmt1_count; i++)
+            collect_gpr_loop_locals(g, s->stmts1[i], out, next_reg);
+        return;
+    }
+    collect_gpr_loop_locals(g, s->s1, out, next_reg);
+    collect_gpr_loop_locals(g, s->s2, out, next_reg);
+    for (size_t i = 0; i < s->stmt1_count; i++)
+        collect_gpr_loop_locals(g, s->stmts1[i], out, next_reg);
+    for (size_t i = 0; i < s->stmt2_count; i++)
+        collect_gpr_loop_locals(g, s->stmts2[i], out, next_reg);
+    for (size_t i = 0; i < s->case_count; i++) {
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            collect_gpr_loop_locals(g, s->cases[i].body[j], out, next_reg);
+        }
+    }
+}
+
+/* Write GPR-bound locals back to their stack slots. */
+static void spill_gpr_loop_locals(Gen* g, RegLocalVec* rs) {
+    Buf* b = &g->code;
+    for (size_t i = 0; i < rs->n; i++) {
+        uint64_t off = 0;
+        if (map_get_str(&g->locals, rs->v[i].name, &off)) {
+            emit_mov_reg_to_local(b, rs->v[i].reg, (uint32_t)off);
+        }
+    }
+}
+
 /* Recognise a canonical for loop: i = constant literal, i < bound, i = i + 1.
  * The bound may be any expression that does not mention i and has no call. */
 static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
                             uint64_t* init) {
-    if (!s || !s->s1 || !s->e1 || !s->s2 || g->reg_locals.n != 0) {
+    if (!s || !s->s1 || !s->e1 || !s->s2) {
         return 0;
     }
     WExpr* init_expr = NULL;
@@ -4242,7 +4390,9 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
         return 0;
     }
     uint64_t off = 0, access = 3, type_ptr = 0, is_param = 0;
-    if (!map_get_str(&g->locals, var, &off)) {
+    uint8_t bound_reg = 0;
+    if (!map_get_str(&g->locals, var, &off) ||
+        reg_local_lookup(g, var, &bound_reg)) {
         return 0;
     }
     map_get_str(&g->local_access, var, &access);
@@ -4276,7 +4426,18 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
     for (size_t i = 0; i < s->stmt1_count; i++) {
         if (stmt_forbidden_reg_loop(g, s->stmts1[i], var)) return 0;
     }
-    *reg = 11;
+    static const uint8_t candidates[3] = {11, 9, 8};
+    uint8_t chosen = 0;
+    for (size_t i = 0; i < sizeof(candidates); i++) {
+        if (!reg_in_use(g, candidates[i])) {
+            chosen = candidates[i];
+            break;
+        }
+    }
+    if (!chosen) {
+        return 0;
+    }
+    *reg = chosen;
     *name = var;
     *init = init_expr->num;
     return 1;
@@ -5338,6 +5499,23 @@ static void compile_stmt(Gen* g, WStmt* s) {
             break;
         }
         case 3: { /* While */
+            size_t gpr_base = g->reg_locals.n;
+            RegLocalVec gpr_bindings = {0};
+            if (!expr_has_call_deep(s->e1) &&
+                !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
+                uint8_t next_gpr = 8;
+                for (size_t i = 0; i < s->stmt1_count; i++) {
+                    collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
+                                            &next_gpr);
+                }
+                for (size_t i = 0; i < gpr_bindings.n; i++) {
+                    uint64_t off = 0;
+                    if (map_get_str(&g->locals, gpr_bindings.v[i].name, &off)) {
+                        emit_mem_load(b, gpr_bindings.v[i].reg, (uint32_t)off, 8, 0);
+                    }
+                    RegLocalVec_push(&g->reg_locals, gpr_bindings.v[i]);
+                }
+            }
             size_t loop_start = b->len;
             /* A backedge re-enters at loop_start without re-executing the
              * store that fed the rax-store peephole. Never elide the
@@ -5357,9 +5535,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
             int32_t jmp = (int32_t)loop_start - (int32_t)(b->len + 5);
             buf_u8(b, 0xE9);
             buf_i32(b, jmp);
-            patch_address(g, exit_patch, (int32_t)(b->len - (exit_patch + 4)));
+            /* Exits must enter the spill block, not jump past it. */
+            size_t after_loop = b->len;
+            if (gpr_bindings.n) {
+                spill_gpr_loop_locals(g, &gpr_bindings);
+                g->reg_locals.n = gpr_base;
+            }
+            patch_address(g, exit_patch, (int32_t)(after_loop - (exit_patch + 4)));
             for (size_t i = 0; i < ctx.brk_n; i++) {
-                patch_address(g, ctx.brk[i], (int32_t)(b->len - (ctx.brk[i] + 4)));
+                patch_address(g, ctx.brk[i], (int32_t)(after_loop - (ctx.brk[i] + 4)));
             }
             break;
         }
@@ -5381,6 +5565,24 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 rl.name = loop_name;
                 rl.reg = loop_reg;
                 RegLocalVec_push(&g->reg_locals, rl);
+            }
+            size_t gpr_base = g->reg_locals.n;
+            RegLocalVec gpr_bindings = {0};
+            if (!expr_has_call_deep(s->e1) &&
+                (!s->s2 || !stmt_has_call_deep(s->s2)) &&
+                !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
+                uint8_t next_gpr = 8;
+                for (size_t i = 0; i < s->stmt1_count; i++) {
+                    collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
+                                            &next_gpr);
+                }
+                for (size_t i = 0; i < gpr_bindings.n; i++) {
+                    uint64_t off = 0;
+                    if (map_get_str(&g->locals, gpr_bindings.v[i].name, &off)) {
+                        emit_mem_load(b, gpr_bindings.v[i].reg, (uint32_t)off, 8, 0);
+                    }
+                    RegLocalVec_push(&g->reg_locals, gpr_bindings.v[i]);
+                }
             }
             size_t xmm_base = g->xmm_locals.n;
             int xmm_loop = 0;
@@ -5420,6 +5622,12 @@ static void compile_stmt(Gen* g, WStmt* s) {
             int32_t jmp = (int32_t)loop_start - (int32_t)(b->len + 5);
             buf_u8(b, 0xE9);
             buf_i32(b, jmp);
+            /* Exits must enter the spill block, not jump past it. */
+            size_t after_loop = b->len;
+            if (gpr_bindings.n) {
+                spill_gpr_loop_locals(g, &gpr_bindings);
+                g->reg_locals.n = gpr_base;
+            }
             if (reg_loop) {
                 emit_mov_reg_to_local(b, loop_reg, (uint32_t)loop_off);
                 g->reg_locals.n--;
@@ -5428,9 +5636,9 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 spill_xmm_loop_locals(g, &xmm_bindings);
                 g->xmm_locals.n = xmm_base;
             }
-            patch_address(g, exit_patch, (int32_t)(b->len - (exit_patch + 4)));
+            patch_address(g, exit_patch, (int32_t)(after_loop - (exit_patch + 4)));
             for (size_t i = 0; i < ctx.brk_n; i++) {
-                patch_address(g, ctx.brk[i], (int32_t)(b->len - (ctx.brk[i] + 4)));
+                patch_address(g, ctx.brk[i], (int32_t)(after_loop - (ctx.brk[i] + 4)));
             }
             break;
         }
