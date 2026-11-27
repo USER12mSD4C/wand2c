@@ -3989,6 +3989,36 @@ static int is_f64_store_target(Gen* g, WExpr* e) {
     return t && t->tag == 8;
 }
 
+/* Recognise x = x + 1 or x = x - 1 on a plain 64-bit stack slot. The
+ * caller can replace the load/add/store sequence with a single incq/decq. */
+static int is_local_self_incdec(Gen* g, WExpr* target, WExpr* e, uint8_t* opreg) {
+    if (!target || target->tag != 3 || !e || e->tag != 8) {
+        return 0;
+    }
+    int is_add = wstr_eq_c(e->str, "OpAdd");
+    int is_sub = wstr_eq_c(e->str, "OpSub");
+    if (!is_add && !is_sub) {
+        return 0;
+    }
+    if (!e->b || e->b->tag != 0 || e->b->num != 1) {
+        return 0;
+    }
+    if (!e->a || e->a->tag != 3 || !wstr_eq(e->a->str, target->str)) {
+        return 0;
+    }
+    uint64_t access = 3;
+    map_get_str(&g->local_access, target->str, &access);
+    uint64_t off = 0;
+    if (access != 3 || !map_get_str(&g->locals, target->str, &off)) {
+        return 0;
+    }
+    if (expr_size(g, target) != 8 || is_float_expr(g, target)) {
+        return 0;
+    }
+    *opreg = is_add ? 0 : 1; /* FF /0 = incq, FF /1 = decq */
+    return 1;
+}
+
 static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
     Buf* b = &g->code;
     if (!target) {
@@ -4434,11 +4464,18 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 1: { /* Assignment */
             if (s->expr_count == 1) {
                 int copied = try_compile_string_copy_to_u8_array(g, s->exprs[0], s->e1);
+                uint8_t incdec_reg = 0;
+                int local_incdec = !copied &&
+                    is_local_self_incdec(g, s->exprs[0], s->e1, &incdec_reg);
                 int direct_float_store =
                     !copied && is_f64_store_target(g, s->exprs[0]) &&
                     !is_volatile_member_expr(g, s->exprs[0]) &&
                     is_float_expr(g, s->e1);
-                if (!copied && direct_float_store) {
+                if (local_incdec) {
+                    uint64_t off = 0;
+                    map_get_str(&g->locals, s->exprs[0]->str, &off);
+                    emit_mem_op(b, 0xFF, incdec_reg, (uint32_t)off);
+                } else if (!copied && direct_float_store) {
                     /* Keep the f64 value in xmm0, compute the destination in
                      * rbx, and store with movsd. This removes the rax/r10
                      * save-restore used by the generic integer store path. */
