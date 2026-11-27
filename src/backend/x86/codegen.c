@@ -3532,6 +3532,14 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
         compile_expr(g, e->b, 3, 1);
         compile_expr(g, e->a, 0, 1);
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
+    } else if (!expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
+        /* Keep LHS in r10 instead of push/pop. No calls in either operand,
+         * so r10 survives the RHS evaluation. */
+        compile_expr(g, e->a, 10, 1);
+        compile_expr(g, e->b, 0, 1);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
+        buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
+        buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
     } else {
         compile_expr(g, e->a, 0, 1);
         buf_u8(b, 0x50);
