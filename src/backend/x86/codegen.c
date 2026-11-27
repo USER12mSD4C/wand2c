@@ -937,6 +937,7 @@ typedef struct {
     size_t pos;
     WStr key;
     uint8_t is_rip;
+    uint8_t patch_end;
 } AddrPatch;
 
 typedef struct {
@@ -1324,6 +1325,7 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
     p.pos = pos;
     p.key = key;
     p.is_rip = 1;
+    p.patch_end = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -1356,6 +1358,31 @@ static WType* peel_typedefs(WType* t) {
         t = t->inner;
     }
     return t;
+}
+
+/* Resolve named type references (tag 11) and inline typedef nodes (tag 13)
+ * back to their concrete type. Struct and enum names are left unchanged. */
+static WType* resolve_named_type(Gen* g, WType* t) {
+    for (int guard = 0; t && guard < 32; guard++) {
+        if (t->tag == 13 && t->inner) {
+            t = t->inner;
+            continue;
+        }
+        if (t->tag == 11 && t->name.ptr) {
+            uint64_t v;
+            if (map_get_str(&g->typedefs, t->name, &v)) {
+                t = AS_PTR(WType, v);
+                continue;
+            }
+        }
+        break;
+    }
+    return t;
+}
+
+static int is_float_type_named(Gen* g, WType* t) {
+    WType* r = resolve_named_type(g, t);
+    return r && r->tag == 8;
 }
 
 static WType* type_u64(void) {
@@ -2009,6 +2036,7 @@ static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
     p.pos = pos;
     p.key = key;
     p.is_rip = 1;
+    p.patch_end = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -2024,6 +2052,7 @@ static void emit_load_float_lit_xmm0(Gen* g, WStr lit) {
     p.pos = pos;
     p.key = key;
     p.is_rip = 1;
+    p.patch_end = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -2417,29 +2446,18 @@ static int is_float_expr(Gen* g, WExpr* e) {
         case 0:
         case 1:
             return 0;
-        case 3: {
-            uint64_t v;
-            if (map_get_str(&g->local_types, e->str, &v)) {
-                return AS_PTR(WType, v)->tag == 8;
+        case 3:
+        case 6:
+            return is_float_type_named(g, resolve_expr_type(g, e));
+        case 10: { /* Index: classify by the element type of the base object. */
+            WType* base = resolve_named_type(g, resolve_expr_type(g, e->a));
+            if (base && (base->tag == 12 || base->tag == 10)) {
+                return is_float_type_named(g, base->inner);
             }
             return 0;
         }
         case 8:
             return is_float_expr(g, e->a) || is_float_expr(g, e->b);
-        case 10: { /* Index: classify by the element type of the base object.
-                    * Without this, x[j] - x[i] was compiled as an integer
-                    * subtraction of the raw IEEE-754 bit patterns. */
-            if (e->a && e->a->tag == 3) {
-                uint64_t v;
-                if (map_get_str(&g->local_types, e->a->str, &v)) {
-                    WType* t = AS_PTR(WType, v);
-                    if (t && (t->tag == 10 || t->tag == 12 || t->tag == 13)) {
-                        return is_float_type(t->inner);
-                    }
-                }
-            }
-            return 0;
-        }
         case 9:
             return wstr_eq_c(e->str, "sin") || wstr_eq_c(e->str, "cos") ||
                    wstr_eq_c(e->str, "tan") || wstr_eq_c(e->str, "sqrt");
@@ -2598,6 +2616,34 @@ static void emit_atomic_rax_extend(Buf* b, uint32_t size, int is_signed) {
     } else if (size == 4) {
         buf_u8(b, 0x89); buf_u8(b, 0xC0);
     }
+}
+
+/* True for a simple 64-bit integer expression that can be evaluated straight
+ * into rdi without a push/reload round trip. Used only for calls whose callee
+ * takes one plain integer argument. */
+static int simple_int_call_arg(Gen* g, WExpr* e, int depth) {
+    if (!e || depth > 8 || e->tag == 4 || e->tag == 5 || e->tag == 9) {
+        return 0;
+    }
+    if (e->tag == 0) {
+        return 1;
+    }
+    if (e->tag == 3) {
+        uint64_t off = 0, access = 3, type_ptr = 0;
+        if (!map_get_str(&g->locals, e->str, &off)) return 0;
+        map_get_str(&g->local_access, e->str, &access);
+        if (access != 3) return 0;
+        WType* t = map_get_str(&g->local_types, e->str, &type_ptr)
+                       ? AS_PTR(WType, type_ptr)
+                       : NULL;
+        t = peel_typedefs(t);
+        return t && (t->tag == 3 || t->tag == 7) && type_size(g, t) == 8;
+    }
+    if (e->tag == 8 && e->b && (e->b->tag == 0 || e->b->tag == 1) &&
+        has_binary_imm(e->str)) {
+        return simple_int_call_arg(g, e->a, depth + 1);
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3026,8 +3072,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                                 ? AS_PTR(WType, ta) : NULL;
                 WType* vb = map_get_str(&g->local_types, e->b->str, &tb)
                                 ? AS_PTR(WType, tb) : NULL;
-                if (acca == 3 && accb == 3 && va && vb && va->tag == 8 &&
-                    vb->tag == 8) {
+                if (acca == 3 && accb == 3 &&
+                    is_float_type_named(g, va) && is_float_type_named(g, vb)) {
                     buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
                     buf_u8(b, offa <= 127 ? 0x45 : 0x85);
                     if (offa <= 127) buf_u8(b, (uint8_t)(-(int32_t)offa));
@@ -3541,8 +3587,42 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
 
-            /* Ordinary call: classify arguments by the callee signature. */
             WFunc* callee = func_by_name(g, name);
+
+            /* Simple one-argument integer calls can evaluate the argument
+             * straight into rdi. Recursive fibonacci used to push the value,
+             * reload rdi, and adjust rsp for each of its two calls. */
+            if (argc == 1 && callee && callee->param_count) {
+                WParam* param = &callee->params[0];
+                WType* pt = resolve_named_type(g, param->type);
+                if (param->access == 3 && pt &&
+                    (pt->tag == 3 || pt->tag == 7) && type_size(g, pt) == 8 &&
+                    simple_int_call_arg(g, e->args[0], 0)) {
+                    compile_expr(g, e->args[0], 7, 1);
+                    uint32_t align_pad = 0;
+                    if ((g->stack_depth % 16) != 0) {
+                        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xEC); buf_u8(b, 0x08);
+                        g->stack_depth += 8;
+                        align_pad = 8;
+                    }
+                    emit_call_patch(g, name);
+                    if (align_pad) {
+                        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xC4); buf_u8(b, 0x08);
+                        g->stack_depth -= 8;
+                    }
+                    if (callee->return_count) {
+                        WType* rt = resolve_named_type(g, callee->returns[0]);
+                        if (rt && rt->tag == 8) {
+                            buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F);
+                            buf_u8(b, 0x7E); buf_u8(b, 0xC0);
+                        }
+                    }
+                    move_rax_to_reg(b, reg);
+                    return;
+                }
+            }
+
+            /* Ordinary call: classify arguments by the callee signature. */
             uint8_t* is_float = (uint8_t*)arena_alloc(g_arena, argc ? argc : 1);
             size_t* class_pos = (size_t*)arena_alloc(g_arena, (argc ? argc : 1) * sizeof(size_t));
             int int_count = 0, float_count = 0;
@@ -3551,7 +3631,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 int f = 0;
                 int p = 0;
                 if (callee && i < callee->param_count) {
-                    WType* pt = peel_typedefs(callee->params[i].type);
+                    WType* pt = resolve_named_type(g, callee->params[i].type);
                     uint8_t access = callee->params[i].access;
                     f = pt && pt->tag == 8;
                     /* An access modifier (in, out, in-out) makes a pointer
@@ -3569,6 +3649,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             size_t stack_arg_count = (size_t)(int_count - (int)int_reg_count) +
                                      (size_t)(float_count - (int)float_reg_count);
             size_t reg_arg_count = argc - stack_arg_count;
+            size_t* stack_off = (size_t*)arena_alloc(
+                g_arena, (stack_arg_count ? stack_arg_count : 1) * sizeof(size_t));
+            size_t stack_i = 0;
+            for (size_t i = 0; i < argc; i++) {
+                size_t pos = class_pos[i];
+                if ((is_float[i] && pos >= float_reg_count) ||
+                    (!is_float[i] && pos >= int_reg_count)) {
+                    stack_off[stack_i++] = (argc - 1 - i) * 8;
+                }
+            }
             g->stack_depth += 8 * argc;
             for (size_t i = 0; i < argc; i++) {
                 compile_expr(g, e->args[i], 0, want_pointer[i] ? 0 : 1);
@@ -3592,7 +3682,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 /* Args were pushed in reverse order, so the first stack
                  * argument is at (stack_arg_count - 1) * 8 from rsp. */
                 for (size_t i = 0; i < stack_arg_count; i++) {
-                    emit_mov_from_stack(b, 0, (stack_arg_count - 1 - i) * 8);
+                    emit_mov_from_stack(b, 0, stack_off[i]);
                     emit_mov_to_stack(b, 0, reg_arg_count * 8 + i * 8);
                 }
                 uint32_t remove = (uint32_t)(reg_arg_count * 8);
@@ -3635,7 +3725,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 g->stack_depth -= cleanup;
             }
             if (callee && callee->return_count) {
-                WType* rt = callee->returns[0];
+                WType* rt = resolve_named_type(g, callee->returns[0]);
                 if (rt && rt->tag == 8) {
                     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
                 }
@@ -4107,6 +4197,9 @@ static int expr_mentions_name(WExpr* e, WStr name, int addr_only) {
             return 1;
         }
     }
+    if (e->tag == 5 && e->a && e->a->tag == 3 && wstr_eq(e->a->str, name)) {
+        return 1;
+    }
     return expr_mentions_name(e->a, name, addr_only) ||
            expr_mentions_name(e->b, name, addr_only) ||
            expr_mentions_name_args(e, name, addr_only);
@@ -4119,7 +4212,7 @@ static void collect_escaped_expr(Gen* g, WExpr* e) {
     if (!e) {
         return;
     }
-    if (e->tag == 4) { /* AddrOf */
+    if (e->tag == 4 || e->tag == 5) { /* AddrOf, parenthesized AddrOf */
         if (e->str.ptr) {
             map_put_str(&g->escaped_locals, e->str, 1);
         }
@@ -4227,10 +4320,21 @@ static int stmt_forbidden_reg_loop(Gen* g, WStmt* s, WStr name) {
 
 /* True when e contains a call or takes the address of any local. Used to
  * guard XMM register binding for f64 loop locals. */
+static int expr_unsafe_for_xmm(WExpr* e);
+
+static int expr_unsafe_for_xmm_args(WExpr* e) {
+    if (!e) return 0;
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_unsafe_for_xmm(e->args[i])) return 1;
+    }
+    return 0;
+}
+
 static int expr_unsafe_for_xmm(WExpr* e) {
     if (!e) return 0;
-    if (e->tag == 9 || e->tag == 4) return 1;
-    return expr_unsafe_for_xmm(e->a) || expr_unsafe_for_xmm(e->b);
+    if (e->tag == 9 || e->tag == 4 || e->tag == 5) return 1;
+    return expr_unsafe_for_xmm(e->a) || expr_unsafe_for_xmm(e->b) ||
+           expr_unsafe_for_xmm_args(e);
 }
 
 static int stmt_unsafe_for_xmm(WStmt* s);
@@ -5205,6 +5309,7 @@ static void emit_rip_relative_mem_rmw(Gen* g, WStr key, uint8_t op, int64_t imm)
     p.pos = pos;
     p.key = key;
     p.is_rip = 1;
+    p.patch_end = (uint8_t)(op >= 2);
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -6531,8 +6636,8 @@ static void compile_function(Gen* g, WFunc* f) {
     }
 }
 
-static void patch_rel32(Buf* b, size_t pos, uint64_t target) {
-    int32_t rel = (int32_t)target - (int32_t)(pos + 4);
+static void patch_rel32(Buf* b, size_t pos, uint64_t target, int64_t extra) {
+    int32_t rel = (int32_t)target - (int32_t)(pos + 4 + extra);
     patch_i32(b, pos, rel);
 }
 
@@ -6602,7 +6707,7 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
     if (entry_patch != SIZE_MAX) {
         uint64_t off;
         if (map_get_str(&g->function_offsets, entry_target, &off)) {
-            patch_rel32(b, entry_patch, off);
+            patch_rel32(b, entry_patch, off, 0);
         }
     }
 
@@ -6611,7 +6716,7 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
         CallPatch p = g->call_patches.v[i];
         uint64_t off;
         if (map_get_str(&g->function_offsets, p.target, &off)) {
-            patch_rel32(b, p.pos, off);
+            patch_rel32(b, p.pos, off, 0);
         } else {
             g->call_patches.v[out++] = p;
         }
@@ -6624,8 +6729,15 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
         map_get_str(&g->global_offsets, p.key, &local_off);
         uint64_t target = (uint64_t)global_start + local_off;
         if (p.is_rip) {
-            /* RIP-relative displacements are invariant under relocation. */
-            patch_rel32(b, p.pos, target);
+            /* RIP-relative displacements are invariant under relocation. For
+             * add/sub the immediate follows disp32, so RIP at the memory
+             * operand is pos + 4 + imm_size. */
+            int64_t extra = 0;
+            if (p.patch_end) {
+                uint8_t opcode = b->data[p.pos - 2];
+                extra = opcode == 0x81 ? 4 : 1;
+            }
+            patch_rel32(b, p.pos, target, extra);
         } else if (format == WAND_OUTPUT_WEXP) {
             /* Leave the module-relative offset in place. The P46 loader adds
              * the module base when it applies the relocation entry. */
@@ -6777,6 +6889,7 @@ WandCompileResult wand_x86_compile_program(
             result.addr_patches[i].position = g->address_patches.v[i].pos;
             result.addr_patches[i].key = dup_wstr(g->address_patches.v[i].key);
             result.addr_patches[i].is_rip = g->address_patches.v[i].is_rip;
+            result.addr_patches[i].patch_end = g->address_patches.v[i].patch_end;
             result.addr_patch_count++;
         }
     }
@@ -7231,6 +7344,10 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
         map_get_str(&data_sym, ap->key, &sym);
         uint64_t type = ap->is_rip ? 2u : 1u;
         int64_t addend = ap->is_rip ? -4 : 0;
+        if (ap->is_rip && ap->patch_end) {
+            uint8_t opcode = g->code.data[ap->pos - 2];
+            addend -= opcode == 0x81 ? 4 : 1;
+        }
         elf_push_u64(&rela, (uint64_t)ap->pos);
         elf_push_u64(&rela, ((uint64_t)(uint32_t)sym << 32) | type);
         elf_push_i64(&rela, addend);
