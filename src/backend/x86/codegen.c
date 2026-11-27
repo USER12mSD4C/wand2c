@@ -2781,6 +2781,38 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
+            if (float_op && e->a && e->b && e->a->tag == 3 && e->b->tag == 3 &&
+                emit_float_op_xmm1(NULL, op)) {
+                /* Both operands are plain f64 stack slots. Load the LHS
+                 * straight into xmm0 and apply the op to the RHS memory
+                 * operand, skipping the GPR/movq round trips entirely. */
+                uint64_t offa = 0, offb = 0;
+                uint64_t acca = 3, accb = 3;
+                map_get_str(&g->locals, e->a->str, &offa);
+                map_get_str(&g->locals, e->b->str, &offb);
+                map_get_str(&g->local_access, e->a->str, &acca);
+                map_get_str(&g->local_access, e->b->str, &accb);
+                uint64_t ta = 0, tb = 0;
+                WType* va = map_get_str(&g->local_types, e->a->str, &ta)
+                                ? AS_PTR(WType, ta) : NULL;
+                WType* vb = map_get_str(&g->local_types, e->b->str, &tb)
+                                ? AS_PTR(WType, tb) : NULL;
+                if (acca == 3 && accb == 3 && va && vb && va->tag == 8 &&
+                    vb->tag == 8) {
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+                    buf_u8(b, offa <= 127 ? 0x45 : 0x85);
+                    if (offa <= 127) buf_u8(b, (uint8_t)(-(int32_t)offa));
+                    else buf_u32(b, (uint32_t)(-(int32_t)offa));
+                    uint8_t code = (uint8_t)float_op_code(op);
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
+                    buf_u8(b, offb <= 127 ? 0x45 : 0x85);
+                    if (offb <= 127) buf_u8(b, (uint8_t)(-(int32_t)offb));
+                    else buf_u32(b, (uint32_t)(-(int32_t)offb));
+                    emit_movq_xmm0_to_rax(b);
+                    if (reg != 0) move_rax_to_reg(b, reg);
+                    return;
+                }
+            }
             if (float_op && simple_left(g, e->a) && emit_float_op_xmm1(NULL, op)) {
                 /* Same shuffle removal as the integer path: evaluate the RHS
                  * straight into rbx, then the simple LHS into rax. */
