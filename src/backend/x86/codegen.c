@@ -4937,6 +4937,102 @@ static int is_local_self_addsub(Gen* g, WExpr* target, WExpr* e,
     return 1;
 }
 
+/* Recognise state:x = state:x + imm on a plain 64-bit section variable.
+ * Volatile, enum, float, and narrow variables keep the generic load/store path. */
+static int is_section_self_addsub(Gen* g, WExpr* target, WExpr* e,
+                                  uint8_t* op, int64_t* imm) {
+    if (!target || target->tag != 7 || !e || e->tag != 8) {
+        return 0;
+    }
+    if (map_has(&g->enums, target->str.ptr, target->str.len)) {
+        return 0;
+    }
+    WStr key = wstr_pair(target->str, target->str2);
+    if (map_has(&g->section_volatile, key.ptr, key.len)) {
+        return 0;
+    }
+    uint64_t type_ptr = 0;
+    WType* t = map_get_str(&g->section_types, key, &type_ptr)
+                   ? AS_PTR(WType, type_ptr)
+                   : NULL;
+    while (t && t->tag == 13) {
+        t = t->inner;
+    }
+    if (!t || (t->tag != 3 && t->tag != 7)) {
+        return 0;
+    }
+    uint64_t size = 0;
+    if (!map_get_str(&g->section_var_sizes, key, &size) || size != 8) {
+        return 0;
+    }
+    int is_add = wstr_eq_c(e->str, "OpAdd");
+    int is_sub = wstr_eq_c(e->str, "OpSub");
+    if (!is_add && !is_sub) {
+        return 0;
+    }
+    if (!e->b || e->b->tag != 0) {
+        return 0;
+    }
+    if (!e->a || e->a->tag != 7 || !wstr_eq(e->a->str, target->str) ||
+        !wstr_eq(e->a->str2, target->str2)) {
+        return 0;
+    }
+    int64_t sv = (int64_t)e->b->num;
+    int64_t delta = is_add ? sv : -sv;
+    if (delta == 0) {
+        return 0;
+    }
+    int negate = delta < 0;
+    if (negate) delta = -delta;
+    if (delta > INT32_MAX) {
+        return 0;
+    }
+    if (delta == 1) {
+        *op = negate ? 1 : 0;
+    } else {
+        *op = negate ? 3 : 2;
+        *imm = delta;
+    }
+    return 1;
+}
+
+/* RIP-relative read-modify-write for a section scalar. The four forms are
+ * incq [rip+d], decq [rip+d], addq [rip+d], imm and subq [rip+d], imm. */
+static void emit_rip_relative_mem_rmw(Gen* g, WStr key, uint8_t op, int64_t imm) {
+    Buf* b = &g->code;
+    size_t pos;
+    if (op < 2) {
+        buf_u8(b, 0x48);
+        buf_u8(b, 0xFF);
+        buf_u8(b, op == 0 ? 0x05 : 0x0D);
+        pos = b->len;
+        buf_u32(b, 0);
+    } else {
+        uint8_t group = op == 2 ? 0 : 5;
+        if (imm <= 127) {
+            buf_u8(b, 0x48);
+            buf_u8(b, 0x83);
+            buf_u8(b, (uint8_t)(0x05 | (group << 3)));
+            pos = b->len;
+            buf_u32(b, 0);
+            buf_u8(b, (uint8_t)imm);
+        } else {
+            buf_u8(b, 0x48);
+            buf_u8(b, 0x81);
+            buf_u8(b, (uint8_t)(0x05 | (group << 3)));
+            pos = b->len;
+            buf_u32(b, 0);
+            buf_u32(b, (uint32_t)imm);
+        }
+    }
+    AddrPatch p;
+    p.pos = pos;
+    p.key = key;
+    p.is_rip = 1;
+    AddrPatchVec_push(&g->address_patches, p);
+    g->patch_generation++;
+}
+
 static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
     Buf* b = &g->code;
     if (!target) {
@@ -5421,6 +5517,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 int local_addsub = !copied &&
                     is_local_self_addsub(g, s->exprs[0], s->e1,
                                          &addsub_op, &addsub_imm);
+                uint8_t sec_op = 0;
+                int64_t sec_imm = 0;
+                int section_addsub = !copied &&
+                    is_section_self_addsub(g, s->exprs[0], s->e1,
+                                           &sec_op, &sec_imm);
                 WStr addsub_var = {0};
                 int addsub_var_sub = 0;
                 int local_addsub_var = !copied && !local_addsub &&
@@ -5431,7 +5532,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     !copied && is_f64_store_target(g, s->exprs[0]) &&
                     !is_volatile_member_expr(g, s->exprs[0]) &&
                     is_float_expr(g, s->e1);
-                if (local_addsub) {
+                if (section_addsub) {
+                    emit_rip_relative_mem_rmw(
+                        g, wstr_pair(s->exprs[0]->str, s->exprs[0]->str2),
+                        sec_op, sec_imm);
+                } else if (local_addsub) {
                     uint64_t off = 0;
                     map_get_str(&g->locals, s->exprs[0]->str, &off);
                     uint8_t bound_reg = 0;
