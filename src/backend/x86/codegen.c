@@ -1026,6 +1026,8 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg);
 static void compile_bool_expr(Gen* g, WExpr* e);
 static int simple_left(Gen* g, WExpr* e);
 static int is_float_expr(Gen* g, WExpr* e);
+static int rax_only_expr(Gen* g, WExpr* e);
+static int expr_has_call(Gen* g, WExpr* e);
 
 /* ------------------------------------------------------------------ */
 /* Emitters                                                            */
@@ -2827,6 +2829,35 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     return;
                 }
             }
+            if (!float_op && has_binary_imm(op) && e->b && e->b->tag == 3) {
+                /* RHS is a plain stack slot: apply the op directly to memory,
+                 * avoiding rbx entirely. Handles i*128 + p style index math
+                 * without a push/pop in compile_address. */
+                uint64_t access = 3;
+                map_get_str(&g->local_access, e->b->str, &access);
+                uint64_t off = 0;
+                if (access == 3 && rax_only_expr(g, e->a) &&
+                    map_get_str(&g->locals, e->b->str, &off)) {
+                    uint8_t opcode = 0;
+                    if (wstr_eq_c(op, "OpAdd")) opcode = 0x03;
+                    else if (wstr_eq_c(op, "OpSub")) opcode = 0x2B;
+                    else if (wstr_eq_c(op, "OpBitAnd")) opcode = 0x23;
+                    else if (wstr_eq_c(op, "OpBitOr")) opcode = 0x0B;
+                    else if (wstr_eq_c(op, "OpBitXor")) opcode = 0x33;
+                    else if (wstr_eq_c(op, "OpMul")) opcode = 0xAF;
+                    if (opcode) {
+                        compile_expr(g, e->a, 0, 0);
+                        buf_u8(b, 0x48);
+                        if (opcode == 0xAF) buf_u8(b, 0x0F);
+                        buf_u8(b, opcode);
+                        buf_u8(b, off <= 127 ? 0x45 : 0x85);
+                        if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+                        else buf_u32(b, (uint32_t)(-(int32_t)off));
+                        if (reg != 0) move_rax_to_reg(b, reg);
+                        return;
+                    }
+                }
+            }
             if (!float_op && has_binary_imm(op) &&
                 (simple_left(g, e->a) || simple_left(g, e->b))) {
                 /* A simple operand never clobbers rbx, so it can be compiled
@@ -2838,6 +2869,24 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 } else {
                     compile_expr(g, e->a, 0, 0);
                     compile_expr(g, e->b, 3, 0);
+                }
+                emit_binary_rbx(b, op);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
+            if (!float_op && has_binary_imm(op) &&
+                !expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
+                /* Neither operand is simple. Keep the LHS in r10 across the
+                 * RHS evaluation, avoiding a push/pop stack round trip. r10
+                 * is caller-saved, so the LHS must not contain a call and
+                 * the RHS must not call while r10 is live. */
+                compile_expr(g, e->a, 10, 0);
+                compile_expr(g, e->b, 0, 0);
+                if (wstr_eq_c(op, "OpSub")) {
+                    buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
+                    buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
+                } else {
+                    buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD3); /* mov %r10,%rbx */
                 }
                 emit_binary_rbx(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
@@ -3532,8 +3581,51 @@ static void compile_float_to_xmm0(Gen* g, WExpr* e) {
     emit_movq_rax_to_xmm0(b);
 }
 
-/* True when e can be compiled into rax without touching rbx.  Lets the caller
- * evaluate the RHS into rbx first, removing the push/pop stack shuffle. */
+/* True when compiling e into rax cannot clobber rbx. This holds for plain
+ * stack slots, literals, binary ops with an immediate RHS, and shifts by a
+ * literal count. It does not hold for generic binary ops (which use rbx as
+ * scratch) or for calls. Used to skip a push/pop of the index base. */
+static int rax_only_expr(Gen* g, WExpr* e) {
+    if (!e) {
+        return 1;
+    }
+    if (e->tag == 0 || e->tag == 1 || e->tag == 11) {
+        return 1;
+    }
+    if (e->tag == 3) {
+        uint64_t access = 3;
+        map_get_str(&g->local_access, e->str, &access);
+        return access == 3;
+    }
+    if (e->tag == 8 && e->b && e->b->tag == 11 && has_binary_imm(e->str)) {
+        return rax_only_expr(g, e->a);
+    }
+    if (e->tag == 8 && e->b && (e->b->tag == 0 || e->b->tag == 1) &&
+        (wstr_eq_c(e->str, "OpShl") || wstr_eq_c(e->str, "OpShr")) &&
+        e->b->num >= 1 && e->b->num <= 63) {
+        return rax_only_expr(g, e->a);
+    }
+    if (e->tag == 8 && e->b && e->b->tag == 3 && has_binary_imm(e->str)) {
+        uint64_t access = 3;
+        map_get_str(&g->local_access, e->b->str, &access);
+        if (access == 3 && rax_only_expr(g, e->a)) {
+            return 1; /* memory-operand path: only rax is touched */
+        }
+    }
+    return 0;
+}
+
+/* True when e contains a function call, which would clobber caller-saved r10. */
+static int expr_has_call(Gen* g, WExpr* e) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 9) {
+        return 1;
+    }
+    return expr_has_call(g, e->a) || expr_has_call(g, e->b);
+}
+
 static int simple_left(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -3705,7 +3797,7 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
              * an lvalue so pointer parameters and local pointer variables stay
              * pointers. compile_expr(..., deref_ptr=1) used to load the first
              * element here, turning a[j] into a[0][j]. */
-            int index_simple = simple_left(g, e->b);
+            int index_simple = rax_only_expr(g, e->b);
             compile_address(g, e->a, 3);
             if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
             compile_expr(g, e->b, 0, 1);
