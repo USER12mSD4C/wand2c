@@ -4004,6 +4004,41 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
 }
 
 
+/* Recognise x = x + y or x = x - y where x and y are plain 64-bit stack
+ * slots and y is not x. The caller loads y once and applies an addq/subq
+ * with the destination still in memory, avoiding a load of x and a store. */
+static int is_local_self_addsub_var(Gen* g, WExpr* target, WExpr* e,
+                                    WStr* rhs_name, int* is_sub) {
+    if (!target || target->tag != 3 || !e || e->tag != 8) {
+        return 0;
+    }
+    int is_add = wstr_eq_c(e->str, "OpAdd");
+    *is_sub = wstr_eq_c(e->str, "OpSub");
+    if (!is_add && !*is_sub) {
+        return 0;
+    }
+    if (!e->a || e->a->tag != 3 || !wstr_eq(e->a->str, target->str) ||
+        !e->b || e->b->tag != 3 || wstr_eq(e->b->str, target->str)) {
+        return 0;
+    }
+    *rhs_name = e->b->str;
+    uint64_t access = 3, off = 0;
+    uint8_t dummy = 0;
+    map_get_str(&g->local_access, target->str, &access);
+    if (access != 3 || !map_get_str(&g->locals, target->str, &off) ||
+        expr_size(g, target) != 8 || is_float_expr(g, target) ||
+        reg_local_lookup(g, target->str, &dummy)) {
+        return 0;
+    }
+    access = 3;
+    map_get_str(&g->local_access, e->b->str, &access);
+    if (access != 3 || !map_get_str(&g->locals, e->b->str, &off) ||
+        expr_size(g, e->b) != 8 || is_float_expr(g, e->b)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int simple_left(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -4804,6 +4839,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 int local_addsub = !copied &&
                     is_local_self_addsub(g, s->exprs[0], s->e1,
                                          &addsub_op, &addsub_imm);
+                WStr addsub_var = {0};
+                int addsub_var_sub = 0;
+                int local_addsub_var = !copied && !local_addsub &&
+                    is_local_self_addsub_var(g, s->exprs[0], s->e1,
+                                             &addsub_var, &addsub_var_sub);
                 int direct_float_store =
                     !copied && is_f64_store_target(g, s->exprs[0]) &&
                     !is_volatile_member_expr(g, s->exprs[0]) &&
@@ -4829,6 +4869,16 @@ static void compile_stmt(Gen* g, WStmt* s) {
                             buf_u32(b, (uint32_t)addsub_imm);
                         }
                     }
+                } else if (local_addsub_var) {
+                    uint64_t off = 0;
+                    map_get_str(&g->locals, s->exprs[0]->str, &off);
+                    uint8_t rhs_reg = 0;
+                    if (reg_local_lookup(g, addsub_var, &rhs_reg)) {
+                        emit_mov_reg_to_reg(b, rhs_reg, 0);
+                    } else {
+                        compile_expr(g, s->e1->b, 0, 0);
+                    }
+                    emit_mem_op(b, addsub_var_sub ? 0x29 : 0x01, 0, (uint32_t)off);
                 } else if (!copied && direct_float_store) {
                     /* Keep the f64 value in xmm0, compute the destination in
                      * rbx, and store with movsd. This removes the rax/r10
@@ -4837,8 +4887,34 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     compile_address(g, s->exprs[0], 3);
                     buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
                 } else if (!copied) {
-                    compile_expr(g, s->e1, 0, 1);
-                    store_assignment_target_from_rax(g, s->exprs[0]);
+                    WExpr* tgt = s->exprs[0];
+                    int addr_first = tgt && tgt->tag == 10 &&
+                        simple_left(g, tgt->b) && rax_only_expr(g, s->e1) &&
+                        !expr_has_call(g, s->e1);
+                    if (addr_first) {
+                        /* Compute the address into rbx first, then compile
+                         * the value into rax. The value never touches rbx,
+                         * so no r10 save/restore is needed. */
+                        compile_address(g, tgt, 3);
+                        uint32_t store_size = expr_size(g, tgt);
+                        if (store_size == 1 && s->e1->tag == 0 &&
+                            s->e1->num <= 255) {
+                            /* movb $imm,(%rbx) avoids a byte register load. */
+                            buf_u8(b, 0xC6); buf_u8(b, 0x03);
+                            buf_u8(b, (uint8_t)s->e1->num);
+                        } else {
+                            compile_expr(g, s->e1, 0, 0);
+                            switch (store_size) {
+                                case 1: buf_u8(b, 0x88); buf_u8(b, 0x03); break;
+                                case 2: buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+                                case 4: buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+                                default: buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0x03); break;
+                            }
+                        }
+                    } else {
+                        compile_expr(g, s->e1, 0, 1);
+                        store_assignment_target_from_rax(g, tgt);
+                    }
                 }
                 WExpr* target = s->exprs[0];
                 if (target->tag == 3) {
