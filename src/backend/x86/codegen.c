@@ -1333,6 +1333,27 @@ static uint32_t type_size(Gen* g, WType* t) {
     }
 }
 
+/* Array initializers are lowered into the data image element by element.
+ * Return the declared element width so u32/u64 arrays do not collapse into a
+ * byte-per-entry layout.  Non-arrays fall back to one byte per initializer. */
+static uint32_t array_element_size(Gen* g, WType* t) {
+    WType* peeled = peel_typedefs(t);
+    if (!peeled || peeled->tag != 12) {
+        return 1;
+    }
+    uint32_t size = type_size(g, peeled->inner);
+    return size ? size : 1;
+}
+
+static int is_byte_array(WType* t) {
+    WType* peeled = peel_typedefs(t);
+    if (!peeled || peeled->tag != 12) {
+        return 0;
+    }
+    WType* elem = peel_typedefs(peeled->inner);
+    return elem && (elem->tag == 0 || elem->tag == 4);
+}
+
 static uint32_t type_alignment_of(Gen* g, WType* t) {
     if (!t) {
         return 1;
@@ -4453,8 +4474,33 @@ static void setup_program(Gen* g, Buf* global) {
             size_t start_len = global->len;
             if (var->has_init && var->init) {
                 if (var->init->tag == 12) {
+                    uint32_t elem_size = array_element_size(g, var->type);
                     for (size_t k = 0; k < var->init->arg_count; k++) {
-                        buf_u8(global, (uint8_t)(eval_const(g, var->init->args[k]) & 0xFFu));
+                        size_t written = global->len - start_len;
+                        if (written >= var_size) {
+                            break;
+                        }
+                        uint64_t value = eval_const(g, var->init->args[k]);
+                        uint32_t width = elem_size;
+                        if (width > var_size - written) {
+                            width = (uint32_t)(var_size - written);
+                        }
+                        for (uint32_t byte = 0; byte < width; byte++) {
+                            buf_u8(global, (uint8_t)(value >> (byte * 8)));
+                        }
+                    }
+                } else if (var->init->tag == 2 && is_byte_array(var->type)) {
+                    /* A string literal assigned to u8[N]/i8[N] is byte data,
+                     * not a pointer: copy its bytes plus a terminating NUL. */
+                    Buf bytes = {0};
+                    unescape_string(var->init->str, &bytes);
+                    size_t copy_len = bytes.len + 1;
+                    if (copy_len > var_size) {
+                        copy_len = var_size;
+                    }
+                    if (copy_len) {
+                        buf_bytes(global, bytes.data, copy_len - 1);
+                        buf_u8(global, 0);
                     }
                 } else {
                     uint64_t value = eval_const(g, var->init);
