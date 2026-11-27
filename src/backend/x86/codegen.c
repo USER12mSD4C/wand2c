@@ -4110,9 +4110,16 @@ static int stmt_forbidden_reg_loop(Gen* g, WStmt* s, WStr name) {
     if (s->tag == 0 && wstr_eq(s->name, name)) {
         return 1;
     }
-    if (s->tag == 1 && s->expr_count > 0 &&
-        expr_mentions_name(s->exprs[0], name, 0)) {
-        return 1;
+    if (s->tag == 1 && s->expr_count > 0) {
+        WExpr* target = s->exprs[0];
+        /* A direct assignment redefines the induction variable. An indexed
+         * or member target that merely reads it as an index is fine. */
+        if (target && target->tag == 3 && wstr_eq(target->str, name)) {
+            return 1;
+        }
+        if (expr_mentions_name(target, name, 1)) {
+            return 1;
+        }
     }
     WExpr* exprs[2] = {s->e1, s->e2};
     for (size_t i = 0; i < 2; i++) {
@@ -4367,10 +4374,45 @@ static void spill_gpr_loop_locals(Gen* g, RegLocalVec* rs) {
     }
 }
 
-/* Recognise a canonical for loop: i = constant literal, i < bound, i = i + 1.
- * The bound may be any expression that does not mention i and has no call. */
+/* True when e can be evaluated while an induction variable lives in a GPR.
+ * Calls and address-taking would clobber or alias the bound register, and
+ * float expressions use a different register class. */
+static int expr_safe_in_reg_loop(Gen* g, WExpr* e) {
+    if (!e || e->tag == 4 || e->tag == 5 || e->tag == 9) {
+        return 0;
+    }
+    if (expr_has_call_deep(e) || is_float_expr(g, e)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int stmt_has_nested_loop(WStmt* s);
+
+static int stmt_has_nested_loop_tree(WStmt** v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (stmt_has_nested_loop(v[i])) return 1;
+    }
+    return 0;
+}
+
+/* True when s contains another loop. Outer loops use only r11 so nested
+ * loops can keep r8 and r9 available for their own induction variables and
+ * accumulators. */
+static int stmt_has_nested_loop(WStmt* s) {
+    if (!s) return 0;
+    if (s->tag == 3 || s->tag == 4) return 1;
+    return stmt_has_nested_loop(s->s1) || stmt_has_nested_loop(s->s2) ||
+           stmt_has_nested_loop_tree(s->stmts1, s->stmt1_count) ||
+           stmt_has_nested_loop_tree(s->stmts2, s->stmt2_count);
+}
+
+/* Recognise a for loop whose induction variable can stay in a GPR:
+ *   var = init; var < bound; var = var + step
+ * The init must not read var. The bound and step may read it because the
+ * generated code evaluates them after the binding is active. */
 static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
-                            uint64_t* init) {
+                            WExpr** init_expr_out) {
     if (!s || !s->s1 || !s->e1 || !s->s2) {
         return 0;
     }
@@ -4386,7 +4428,8 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
     } else {
         return 0;
     }
-    if (!var.ptr || !init_expr || init_expr->tag != 0) {
+    if (!var.ptr || !init_expr || !expr_safe_in_reg_loop(g, init_expr) ||
+        expr_mentions_name(init_expr, var, 0)) {
         return 0;
     }
     uint64_t off = 0, access = 3, type_ptr = 0, is_param = 0;
@@ -4405,30 +4448,52 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
     }
     if (s->e1->tag != 8 ||
         (!wstr_eq_c(s->e1->str, "OpLt") &&
-         !wstr_eq_c(s->e1->str, "OpLtEq"))) {
+         !wstr_eq_c(s->e1->str, "OpLtEq")) ||
+        !expr_safe_in_reg_loop(g, s->e1->a) ||
+        !expr_safe_in_reg_loop(g, s->e1->b)) {
         return 0;
     }
-    if (!s->e1->a || s->e1->a->tag != 3 ||
-        !wstr_eq(s->e1->a->str, var) || !s->e1->b ||
-        s->e1->b->tag != 0 ||
-        expr_mentions_name(s->e1->b, var, 0) || expr_has_call(g, s->e1)) {
+    if (!s->s2 || s->s2->tag != 1 || s->s2->expr_count == 0 ||
+        !s->s2->exprs[0] || s->s2->exprs[0]->tag != 3 ||
+        !wstr_eq(s->s2->exprs[0]->str, var) ||
+        !s->s2->e1 || s->s2->e1->tag != 8) {
         return 0;
     }
-    if (!s->s2 || s->s2->tag != 1) {
+    WExpr* assign = s->s2->e1;
+    int is_add = wstr_eq_c(assign->str, "OpAdd");
+    int is_sub = wstr_eq_c(assign->str, "OpSub");
+    if (!is_add && !is_sub) {
         return 0;
     }
-    uint8_t op = 0;
-    int64_t imm = 0;
-    if (!is_local_self_addsub(g, s->s2->exprs[0], s->s2->e1, &op, &imm) ||
-        op != 0) {
+    int lhs_is_var = assign->a && assign->a->tag == 3 &&
+                     wstr_eq(assign->a->str, var);
+    int rhs_is_var = assign->b && assign->b->tag == 3 &&
+                     wstr_eq(assign->b->str, var);
+    WExpr* step = NULL;
+    if (is_add) {
+        if (!lhs_is_var && !rhs_is_var) {
+            return 0;
+        }
+        step = lhs_is_var ? assign->b : assign->a;
+    } else {
+        if (!lhs_is_var) {
+            return 0;
+        }
+        step = assign->b;
+    }
+    if (!expr_safe_in_reg_loop(g, step)) {
         return 0;
     }
     for (size_t i = 0; i < s->stmt1_count; i++) {
         if (stmt_forbidden_reg_loop(g, s->stmts1[i], var)) return 0;
     }
-    static const uint8_t candidates[3] = {11, 9, 8};
+    static const uint8_t inner_candidates[3] = {11, 9, 8};
+    static const uint8_t outer_candidates[1] = {11};
+    int nested = stmt_has_nested_loop_tree(s->stmts1, s->stmt1_count);
+    const uint8_t* candidates = nested ? outer_candidates : inner_candidates;
+    size_t candidate_count = nested ? 1 : 3;
     uint8_t chosen = 0;
-    for (size_t i = 0; i < sizeof(candidates); i++) {
+    for (size_t i = 0; i < candidate_count; i++) {
         if (!reg_in_use(g, candidates[i])) {
             chosen = candidates[i];
             break;
@@ -4439,7 +4504,7 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
     }
     *reg = chosen;
     *name = var;
-    *init = init_expr->num;
+    *init_expr_out = init_expr;
     return 1;
 }
 
@@ -5553,13 +5618,18 @@ static void compile_stmt(Gen* g, WStmt* s) {
             if (s->s1) compile_stmt(g, s->s1);
             uint8_t loop_reg = 0;
             WStr loop_name = {0};
-            uint64_t loop_init = 0;
+            WExpr* loop_init_expr = NULL;
             int reg_loop = try_bind_for_reg(g, s, &loop_reg, &loop_name,
-                                            &loop_init);
+                                            &loop_init_expr);
             uint64_t loop_off = 0;
             if (reg_loop) {
                 map_get_str(&g->locals, loop_name, &loop_off);
-                emit_mov_imm64(b, loop_reg, loop_init);
+                if (loop_init_expr->tag == 0) {
+                    emit_mov_imm64(b, loop_reg, loop_init_expr->num);
+                } else {
+                    compile_expr(g, loop_init_expr, 0, 0);
+                    emit_mov_reg_to_reg(b, 0, loop_reg);
+                }
                 emit_mov_reg_to_local(b, loop_reg, (uint32_t)loop_off);
                 RegLocal rl = {0};
                 rl.name = loop_name;
