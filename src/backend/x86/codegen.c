@@ -2393,6 +2393,12 @@ static WFunc* func_by_name(Gen* g, WStr name) {
     return &g->prog.funcs[v - 1];
 }
 
+/* True when name is declared as an extern (body-less) function. */
+static int is_extern_func(Gen* g, WStr name) {
+    WFunc* f = func_by_name(g, name);
+    return f && (f->is_extern || !f->has_body);
+}
+
 static int is_float_type(WType* t) {
     while (t && (t->tag == 10 || t->tag == 12 || t->tag == 13)) {
         t = t->inner;
@@ -2763,6 +2769,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                             emit_rip_relative_lea(g, reg, fnkey);
                         } else {
                             emit_mov_imm64(b, reg, LOAD_BASE + off);
+                        }
+                    } else if (is_extern_func(g, e->str)) {
+                        if (g->format == WAND_OUTPUT_OBJECT ||
+                            g->format == WAND_OUTPUT_WEXP) {
+                            WStr fnkey = wstr_prefix("fn:", e->str);
+                            emit_rip_relative_lea(g, reg, fnkey);
+                        } else {
+                            /* A flat image has no linker to resolve an
+                             * extern symbol. Keep the placeholder explicit. */
+                            emit_mov_imm64(b, reg, 0);
                         }
                     }
                 }
@@ -6319,6 +6335,18 @@ static void elf_append_global_slice(Buf* body, Buf* global_data, uint32_t start,
         }                                                                            \
     } while (0)
 
+static void elf_note_undefined(Gen* g, WStr target, WStr** undefined,
+                               size_t* n, size_t* cap) {
+    if (map_has(&g->function_offsets, target.ptr, target.len)) {
+        return;
+    }
+    for (size_t i = 0; i < *n; i++) {
+        if (wstr_eq((*undefined)[i], target)) return;
+    }
+    ELF_GROW(*undefined, *n, *cap, WStr);
+    (*undefined)[(*n)++] = target;
+}
+
 static void build_relocatable_elf(Gen* g, Buf* global_data) {
     Arena tmp_arena = {0};
     Arena* saved_arena = g_arena;
@@ -6537,22 +6565,17 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     WStr* undefined = NULL;
     size_t undefined_n = 0, undefined_cap = 0;
     for (size_t i = 0; i < g->call_patches.n; i++) {
-        WStr target = g->call_patches.v[i].target;
-        if (map_has(&g->function_offsets, target.ptr, target.len)) {
-            continue;
+        elf_note_undefined(g, g->call_patches.v[i].target,
+                           &undefined, &undefined_n, &undefined_cap);
+    }
+    /* Taking the address of an extern function records an fn: address
+     * patch but no call patch, so it must also create an undefined symbol. */
+    for (size_t i = 0; i < g->address_patches.n; i++) {
+        AddrPatch* ap = &g->address_patches.v[i];
+        if (wstr_starts_with(ap->key, "fn:")) {
+            elf_note_undefined(g, wstr_sub(ap->key, 3, ap->key.len - 3),
+                               &undefined, &undefined_n, &undefined_cap);
         }
-        int seen = 0;
-        for (size_t j = 0; j < undefined_n; j++) {
-            if (wstr_eq(undefined[j], target)) {
-                seen = 1;
-                break;
-            }
-        }
-        if (seen) {
-            continue;
-        }
-        ELF_GROW(undefined, undefined_n, undefined_cap, WStr);
-        undefined[undefined_n++] = target;
     }
     for (size_t i = 0; i < undefined_n; i++) {
         uint32_t name_off = elf_strtab_insert(&strtab, &str_cache, undefined[i]);
