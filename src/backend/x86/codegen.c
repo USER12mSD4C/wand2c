@@ -1949,6 +1949,21 @@ static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
     g->patch_generation++;
 }
 
+/* xmm0 = float literal, loaded directly from the constant pool. */
+static void emit_load_float_lit_xmm0(Gen* g, WStr lit) {
+    Buf* b = &g->code;
+    WStr key = wstr_prefix("float:", lit);
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10); buf_u8(b, 0x05);
+    size_t pos = b->len;
+    buf_u32(b, 0);
+    AddrPatch p;
+    p.pos = pos;
+    p.key = key;
+    p.is_rip = 1;
+    AddrPatchVec_push(&g->address_patches, p);
+    g->patch_generation++;
+}
+
 /* Compile a float expression so its bit pattern ends in xmm0. Chained binary
  * ops with literal RHS stay in xmm0, removing a movq round trip per link. */
 static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch);
@@ -3773,6 +3788,56 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         buf_u8(b, 0xC0);
         return;
     }
+    /* Literal LHS with a plain f64 stack slot RHS: movsd the literal from
+     * the constant pool straight into xmm0, then apply the op with the RHS
+     * as a memory operand. Skips movabs, movq, and scratch copies. */
+    if (e && e->tag == 8 && e->a && e->a->tag == 11 &&
+        e->b && e->b->tag == 3 && float_op_code(e->str) &&
+        is_float_expr(g, e->b)) {
+        uint64_t off = 0, access = 3;
+        uint8_t bound = 0;
+        map_get_str(&g->locals, e->b->str, &off);
+        map_get_str(&g->local_access, e->b->str, &access);
+        if (access == 3 && !reg_local_lookup(g, e->b->str, &bound)) {
+            emit_load_float_lit_xmm0(g, e->a->str);
+            uint8_t code = (uint8_t)float_op_code(e->str);
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
+            buf_u8(b, off <= 127 ? 0x45 : 0x85);
+            if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+            else buf_u32(b, (uint32_t)(-(int32_t)off));
+            return;
+        }
+    }
+    /* Both operands are plain f64 stack slots: load the LHS into xmm0 and
+     * apply the op with the RHS as a memory operand. Avoids the scratch copy
+     * and the GPR round trip used by the general path. */
+    if (e && e->tag == 8 && e->a && e->a->tag == 3 &&
+        e->b && e->b->tag == 3 && float_op_code(e->str) &&
+        is_float_expr(g, e->a) && is_float_expr(g, e->b)) {
+        uint64_t offa = 0, offb = 0, acca = 3, accb = 3;
+        uint8_t bounda = 0, boundb = 0;
+        map_get_str(&g->locals, e->a->str, &offa);
+        map_get_str(&g->locals, e->b->str, &offb);
+        map_get_str(&g->local_access, e->a->str, &acca);
+        map_get_str(&g->local_access, e->b->str, &accb);
+        if (acca == 3 && accb == 3 &&
+            !reg_local_lookup(g, e->a->str, &bounda) &&
+            !reg_local_lookup(g, e->b->str, &boundb)) {
+            if (offa <= 127) {
+                buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+                buf_u8(b, 0x45); buf_u8(b, (uint8_t)(-(int32_t)offa));
+            } else {
+                buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+                buf_u8(b, 0x85); buf_u32(b, (uint32_t)(-(int32_t)offa));
+            }
+            uint8_t code = (uint8_t)float_op_code(e->str);
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
+            buf_u8(b, offb <= 127 ? 0x45 : 0x85);
+            if (offb <= 127) buf_u8(b, (uint8_t)(-(int32_t)offb));
+            else buf_u32(b, (uint32_t)(-(int32_t)offb));
+            return;
+        }
+    }
     /* General f64 binary op: keep both operands in XMM registers. The
      * scratch copy holds the LHS while the RHS is compiled recursively;
      * each nesting level uses a higher register so nested ops are safe. */
@@ -4326,7 +4391,28 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
  * write xmm0 directly with movsd instead of round-tripping the bits through
  * rax and r10. */
 static int is_f64_store_target(Gen* g, WExpr* e) {
-    if (!e || (e->tag != 6 && e->tag != 10)) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 3) {
+        uint64_t type_ptr = 0;
+        if (!map_get_str(&g->local_types, e->str, &type_ptr)) {
+            return 0;
+        }
+        WType* t = AS_PTR(WType, type_ptr);
+        if (!is_float_type(t) || type_size(g, t) != 8) {
+            return 0;
+        }
+        uint64_t access = 3, off = 0;
+        uint8_t bound_reg = 0;
+        map_get_str(&g->local_access, e->str, &access);
+        if (access != 3 || reg_local_lookup(g, e->str, &bound_reg) ||
+            !map_get_str(&g->locals, e->str, &off)) {
+            return 0;
+        }
+        return 1;
+    }
+    if (e->tag != 6 && e->tag != 10) {
         return 0;
     }
     WType* t = peel_typedefs(resolve_expr_type(g, e));
@@ -4826,8 +4912,20 @@ static void compile_stmt(Gen* g, WStmt* s) {
             map_put_str(&g->local_access, s->name, s->access);
             map_put_str(&g->local_types, s->name, PTR(s->type));
             if (s->e1) {
-                compile_expr(g, s->e1, 0, 1);
-                emit_mem_store(b, 0, off, var_size);
+                WType* vtype = s->type;
+                if (var_size == 8 && s->access == 3 && is_float_type(vtype) &&
+                    is_float_expr(g, s->e1)) {
+                    /* Store the f64 bit pattern straight from xmm0 instead of
+                     * routing it through rax and emit_mem_store. */
+                    compile_float_to_xmm0(g, s->e1);
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11);
+                    buf_u8(b, off <= 127 ? 0x45 : 0x85);
+                    if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+                    else buf_u32(b, (uint32_t)(-(int32_t)off));
+                } else {
+                    compile_expr(g, s->e1, 0, 1);
+                    emit_mem_store(b, 0, off, var_size);
+                }
             }
             break;
         }
@@ -4884,8 +4982,17 @@ static void compile_stmt(Gen* g, WStmt* s) {
                      * rbx, and store with movsd. This removes the rax/r10
                      * save-restore used by the generic integer store path. */
                     compile_float_to_xmm0(g, s->e1);
-                    compile_address(g, s->exprs[0], 3);
-                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
+                    if (s->exprs[0]->tag == 3) {
+                        uint64_t off = 0;
+                        map_get_str(&g->locals, s->exprs[0]->str, &off);
+                        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11);
+                        buf_u8(b, off <= 127 ? 0x45 : 0x85);
+                        if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+                        else buf_u32(b, (uint32_t)(-(int32_t)off));
+                    } else {
+                        compile_address(g, s->exprs[0], 3);
+                        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
+                    }
                 } else if (!copied) {
                     WExpr* tgt = s->exprs[0];
                     int addr_first = tgt && tgt->tag == 10 &&
