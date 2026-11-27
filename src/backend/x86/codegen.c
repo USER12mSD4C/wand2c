@@ -983,6 +983,7 @@ struct Gen {
     Map local_access;
     Map local_types;
     Map local_is_param; /* set for function parameters; array-typed params are pointers */
+    Map escaped_locals; /* locals whose address escapes and can alias stack slots */
     Map next_offsets; /* not used; kept for symmetry with function state */
     uint32_t next_offset;
 
@@ -4084,6 +4085,18 @@ static int expr_has_call_deep(WExpr* e) {
     return 0;
 }
 
+static int expr_mentions_name(WExpr* e, WStr name, int addr_only);
+
+static int expr_mentions_name_args(WExpr* e, WStr name, int addr_only) {
+    if (!e) {
+        return 0;
+    }
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_mentions_name(e->args[i], name, addr_only)) return 1;
+    }
+    return 0;
+}
+
 /* True when e reads or writes the named local, or takes its address. */
 static int expr_mentions_name(WExpr* e, WStr name, int addr_only) {
     if (!e) {
@@ -4095,16 +4108,72 @@ static int expr_mentions_name(WExpr* e, WStr name, int addr_only) {
         }
     }
     return expr_mentions_name(e->a, name, addr_only) ||
-           expr_mentions_name(e->b, name, addr_only);
+           expr_mentions_name(e->b, name, addr_only) ||
+           expr_mentions_name_args(e, name, addr_only);
 }
 
-/* A loop body cannot keep its induction variable in r11 if it might call,
- * return, redefine the variable, take its address, or start a jmpto. */
+/* Record locals whose address is taken anywhere in the current function. A
+ * pointer to such a local can alias its stack slot, so the slot and a bound
+ * register would diverge. */
+static void collect_escaped_expr(Gen* g, WExpr* e) {
+    if (!e) {
+        return;
+    }
+    if (e->tag == 4) { /* AddrOf */
+        if (e->str.ptr) {
+            map_put_str(&g->escaped_locals, e->str, 1);
+        }
+        if (e->a && e->a->tag == 3) {
+            map_put_str(&g->escaped_locals, e->a->str, 1);
+        }
+    }
+    collect_escaped_expr(g, e->a);
+    collect_escaped_expr(g, e->b);
+    for (size_t i = 0; i < e->arg_count; i++) {
+        collect_escaped_expr(g, e->args[i]);
+    }
+}
+
+static void collect_escaped_stmt_tree(Gen* g, WStmt** v, size_t n);
+
+static void collect_escaped_stmt(Gen* g, WStmt* s) {
+    if (!s) {
+        return;
+    }
+    collect_escaped_expr(g, s->e1);
+    collect_escaped_expr(g, s->e2);
+    for (size_t i = 0; i < s->expr_count; i++) {
+        collect_escaped_expr(g, s->exprs[i]);
+    }
+    for (size_t i = 0; i < s->return_count; i++) {
+        collect_escaped_expr(g, s->returns[i].expr);
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        collect_escaped_expr(g, s->cases[i].expr);
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            collect_escaped_stmt(g, s->cases[i].body[j]);
+        }
+    }
+    collect_escaped_stmt(g, s->s1);
+    collect_escaped_stmt(g, s->s2);
+    collect_escaped_stmt_tree(g, s->stmts1, s->stmt1_count);
+    collect_escaped_stmt_tree(g, s->stmts2, s->stmt2_count);
+}
+
+static void collect_escaped_stmt_tree(Gen* g, WStmt** v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        collect_escaped_stmt(g, v[i]);
+    }
+}
+
+/* A loop body cannot keep its induction variable in a caller-saved register
+ * if it might call, return, redefine the variable, take its address, or start
+ * a jmpto. Returns bypass the exit spill block, and callees may clobber r11. */
 static int stmt_forbidden_reg_loop(Gen* g, WStmt* s, WStr name) {
     if (!s) {
         return 0;
     }
-    if (s->tag == 5 || s->tag == 8) { /* jmpto or return */
+    if (s->tag == 5 || s->tag == 6 || s->tag == 8) {
         return 1;
     }
     if (s->tag == 0 && wstr_eq(s->name, name)) {
@@ -4199,7 +4268,7 @@ static void collect_xmm_loop_locals(Gen* g, WStmt* s, XmmLocalVec* out,
     if (!s || *next_reg > 15) return;
     if (s->tag == 0 && s->type && is_float_type(s->type) &&
         type_size(g, s->type) == 8 && s->access == 3 && s->name.ptr &&
-        s->e1) {
+        !map_has(&g->escaped_locals, s->name.ptr, s->name.len) && s->e1) {
         uint64_t existing = 0;
         if (map_get_str(&g->locals, s->name, &existing)) return;
         XmmLocal x = {0};
@@ -4309,6 +4378,7 @@ static int gpr_bindable_local(Gen* g, WStr name) {
     map_get_str(&g->local_access, name, &access);
     map_get_str(&g->local_is_param, name, &is_param);
     if (access != 3 || is_param) return 0;
+    if (map_has(&g->escaped_locals, name.ptr, name.len)) return 0;
     if (reg_local_lookup(g, name, &dummy) || xmm_local_lookup(g, name, &dummy)) {
         return 0;
     }
@@ -4442,8 +4512,10 @@ static int try_bind_for_reg(Gen* g, WStmt* s, uint8_t* reg, WStr* name,
     map_get_str(&g->local_is_param, var, &is_param);
     WType* t = map_get_str(&g->local_types, var, &type_ptr)
                    ? AS_PTR(WType, type_ptr) : NULL;
-    if (access != 3 || is_param || !t || t->tag == 8 || t->tag == 10 ||
-        t->tag == 12 || type_size(g, t) != 8) {
+    if (access != 3 || is_param ||
+        map_has(&g->escaped_locals, var.ptr, var.len) ||
+        !t || t->tag == 8 || t->tag == 10 || t->tag == 12 ||
+        type_size(g, t) != 8) {
         return 0;
     }
     if (s->e1->tag != 8 ||
@@ -6247,11 +6319,19 @@ static void compile_function(Gen* g, WFunc* f) {
     g->local_access.slots = NULL;
     g->local_types.slots = NULL;
     g->local_is_param.slots = NULL;
+    g->escaped_locals.slots = NULL;
     g->locals.len = g->local_access.len = g->local_types.len = g->local_is_param.len = 0;
+    g->escaped_locals.len = 0;
     g->next_offset = 16;
     g->current_is_irq = f->is_irq;
     g->stack_depth = 0;
     g->loop_stack.n = 0;
+
+    if (f->has_body) {
+        for (size_t i = 0; i < f->body_count; i++) {
+            collect_escaped_stmt(g, f->body[i]);
+        }
+    }
 
     Buf* b = &g->code;
     if (f->is_irq) {
@@ -6481,6 +6561,7 @@ WandCompileResult wand_x86_compile_program(
     map_init(&g->local_access, 32);
     map_init(&g->local_types, 32);
     map_init(&g->local_is_param, 32);
+    map_init(&g->escaped_locals, 32);
     g->format = format;
     g->entry_name = wstr_make(entry_name ? (const void*)entry_name : (const void*)"", entry_name ? entry_len : 0);
 
