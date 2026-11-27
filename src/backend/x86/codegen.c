@@ -1020,6 +1020,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr);
 static void compile_address(Gen* g, WExpr* e, uint8_t reg);
 static void compile_bool_expr(Gen* g, WExpr* e);
 static int simple_left(Gen* g, WExpr* e);
+static int is_float_expr(Gen* g, WExpr* e);
 
 /* ------------------------------------------------------------------ */
 /* Emitters                                                            */
@@ -1858,6 +1859,26 @@ static int float_rhs_safe(WExpr* e) {
     return e->tag != 8 && e->tag != 9;
 }
 
+/* True when e can be compiled to xmm0 without clobbering xmm1 or xmm2.
+ * Used by the fused float-op path to hold the LHS in xmm1 while the RHS is
+ * evaluated. Index loads use rbx/rax; variables and literals use rax only. */
+static int float_direct_safe(Gen* g, WExpr* e) {
+    if (!e) {
+        return 1;
+    }
+    if (e->tag == 10 || e->tag == 3) {
+        return is_float_expr(g, e);
+    }
+    if (e->tag == 11) {
+        return 1;
+    }
+    if (e->tag == 8 && e->b && e->b->tag == 11 &&
+        float_op_code(e->str) && float_direct_safe(g, e->a)) {
+        return 1;
+    }
+    return 0;
+}
+
 /* Start a float op with the LHS bit pattern already in rax: stash it in xmm1
  * so the RHS can be evaluated without a push/pop shuffle. The caller must
  * emit the RHS into rax, then call emit_float_op_after_rhs(). */
@@ -2687,6 +2708,31 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            /* Fused path for LHS op (RHS op2 literal), the dominant pattern
+             * in vector kernels: a[i] + b[i] * s. Both operands stay in XMM
+             * registers; no push/pop or GPR/XMM round trip for the outer op. */
+            if (float_op && e->b && e->b->tag == 8 && e->b->b &&
+                e->b->b->tag == 11 && float_op_code(op) &&
+                float_op_code(e->b->str) && float_direct_safe(g, e->b)) {
+                int code = float_op_code(op);
+                compile_float_to_xmm0(g, e->a);
+                buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC8);
+                compile_float_to_xmm0(g, e->b->a);
+                emit_float_op_xmm0_mem(g, e->b->str, e->b->b->str);
+                if (code == 0x5C || code == 0x5E) {
+                    /* Non-commutative: xmm1 (LHS) op xmm0 (RHS) -> xmm0 */
+                    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xD0);
+                    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC1);
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+                    buf_u8(b, 0xC2);
+                } else {
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+                    buf_u8(b, 0xC1);
+                }
+                emit_movq_xmm0_to_rax(b);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
             if (float_op && e->b && e->b->tag == 11 && float_op_code(op)) {
                 compile_float_to_xmm0(g, e->a);
                 emit_float_op_xmm0_mem(g, op, e->b->str);
@@ -3408,6 +3454,19 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
     }
 }
 
+/* Compile an f64 index expression straight into xmm0. The address stays in
+ * rbx, so movsd (%rbx),%xmm0 replaces the old load-to-rax plus movq path.
+ * Returns 1 when e is an f64 index; 0 otherwise. */
+static int compile_f64_index_to_xmm0(Gen* g, WExpr* e) {
+    if (!e || e->tag != 10 || !is_float_expr(g, e)) {
+        return 0;
+    }
+    Buf* b = &g->code;
+    compile_address(g, e, 3);
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10); buf_u8(b, 0x03);
+    return 1;
+}
+
 /* Compile e leaving its f64 bit pattern in xmm0. Binary ops with a literal
  * RHS recurse so a chain such as a * 0.5 + 1.0 keeps the value in xmm0
  * between links instead of round-tripping through rax. */
@@ -3425,6 +3484,9 @@ static void compile_float_to_xmm0(Gen* g, WExpr* e) {
          * round trip that the generic rax-based cast emits. */
         compile_expr(g, e->a, 0, 0);
         buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        return;
+    }
+    if (compile_f64_index_to_xmm0(g, e)) {
         return;
     }
     compile_expr(g, e, 0, 0);
