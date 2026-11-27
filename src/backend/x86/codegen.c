@@ -3778,7 +3778,7 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
      * each nesting level uses a higher register so nested ops are safe. */
     if (e && e->tag == 8 && e->a && e->b && float_op_code(e->str) &&
         (is_float_expr(g, e->a) || is_float_expr(g, e->b)) &&
-        scratch < 7) {
+        !expr_has_call(g, e->b) && scratch < 7) {
         int code = float_op_code(e->str);
         compile_float_to_xmm0_s(g, e->a, (uint8_t)(scratch + 1));
         emit_movapd_xmm0_to(b, scratch);
