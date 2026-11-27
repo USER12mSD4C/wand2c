@@ -34,6 +34,7 @@ typedef struct {
     uint64_t position;
     char* key;
     uint8_t is_rip;
+    uint8_t patch_end;
 } WandAddrPatch;
 
 typedef struct {
