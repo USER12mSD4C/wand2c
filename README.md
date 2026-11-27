@@ -1,401 +1,247 @@
-# wand2c - Wand Version 2 Compiler
+# wand2c
 
-wand2c compiles the Wand systems programming language.
-It translates source code directly to native x86_64 machine code.
-It does not use LLVM or GCC.
+wand2c compiles Wand source files to native x86_64 code.
 
-The compiler generates ELF64 executables, relocatable object files, flat binary images, and dynamic execution modules.
-It adds Standard 4/6 binary metadata to custom ELF sections.
+## Overview
+
+Wand is a systems programming language.
+wand2c is the compiler for Wand.
+The compiler emits machine code from an in-tree x86_64 backend.
+
+wand2c writes these outputs:
+
+- ELF64 executables with `-fp`.
+- Relocatable ELF64 objects with `-fo`.
+- Flat binaries with `-fr` or `-fk`.
+- `.wexp` continuation modules with `-fw`.
+
+A `.wexp` file is a flat Standard 4/6 image called a continuation module.
+A loader maps the image and calls its `main` function.
+Standard 4/6 is a binary interface for typed and versioned modules.
+ELF and `.wexp` outputs carry Standard 4/6 metadata.
+Read [standart-46.md](documentation/standart-46.md) for the binary layout.
 
 ## Documentation
 
-- [Learning Wand](documentation/LEARN.md): tutorial and runnable examples.
-- [Documentation map](documentation/README.md): document index and reading order.
-- [Quick reference](documentation/CHEATSHEET.md): commands and syntax section index.
-- [Syntax reference](documentation/SYNTAX.md): authoritative language rules.
-- [Troubleshooting](documentation/TROUBLESHOOTING.md): errors and known limitations.
+| Need | Document |
+|---|---|
+| Tutorial and runnable concepts | [LEARN.md](documentation/LEARN.md) |
+| Document map | [documentation/README.md](documentation/README.md) |
+| Command and syntax index | [CHEATSHEET.md](documentation/CHEATSHEET.md) |
+| Authoritative language rules | [SYNTAX.md](documentation/SYNTAX.md) |
+| Standard library | [STDLIB.md](documentation/STDLIB.md) |
+| Example catalog | [EXAMPLES.md](documentation/EXAMPLES.md) |
+| Errors and known limits | [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md) |
+| Binary interface | [standart-46.md](documentation/standart-46.md) |
 
-## Architecture
+## Requirements
 
-The compiler uses a modular multi-pass pipeline:
+| Item | Requirement |
+|---|---|
+| Target platform | Linux on x86_64 |
+| Build tools | Cargo and a Rust toolchain with edition 2021 support |
+| C compiler | Required by the `cc` build script for the C backend |
+| Optional Nix shell | The flake provides `cargo`, `rustc`, and `nasm` |
 
-* `src/ast.rs`: Defines the Abstract Syntax Tree (AST). Includes data types, pointer modifiers, expressions, and declarations.
-* `src/token.rs`: Defines lexical tokens.
-* `src/lexer.rs`: Scans source text into tokens. Tracks line and column numbers for error reporting.
-* `src/parser.rs`: Parses tokens into the AST. Uses a two-pass system for functions.
-* `src/checker.rs`: Checks types. Calculates structure sizes and field offsets.
-* `src/optimizer.rs`: Optimizes the AST. Folds constants, propagates immutable values, removes dead code, applies algebraic simplifications, and performs type-aware strength reduction.
-* `src/safety.rs`: Checks memory safety. Detects memory leaks, use-after-free errors, uninitialized pointers and struct fields, and null pointer dereferences.
-* `src/codegen.rs`: Serializes the checked AST and calls the C backend through a small FFI shim.
-* `src/backend/wand_backend.h`: Shared C/Rust ABI for serialized programs and generated output.
-* `src/backend/x86/codegen.c`: C x86_64 backend. Emits machine code from the serialized AST.
-* `src/backend/x86/abi.c`: C helpers for ELF/metadata generation using growable buffers with explicit cleanup.
-* `src/abi.rs`: Consumes backend output, builds string tables and type records, and writes Standard 4/6 metadata.
-* `src/main.rs`: Manages the command line interface. Resolves imports and installs libraries.
+The compiler emits x86_64 machine code.
+The package definition declares Linux support.
 
-## Build the Compiler
+## Build and install
 
-Use Cargo to build the compiler:
+Build the compiler from the repository root:
 
 ```bash
 cargo build --release
 ```
 
-The binary is located at `target/release/wand2c`.
+The binary is at `target/release/wand2c`.
 
-## Editor Support
-
-A Zed extension lives in [`zed-wand/`](zed-wand/README.md).
-It teaches Zed to recognize `.w` and `.wh` files and provides Wand highlighting, brackets, indentation, outline, and text objects.
-
-Install it in Zed with `zed: install dev extension` and select the `zed-wand` directory.
-
-## Standard Library Installation
-
-The standard library sources are in `libw/llibw.86/`.
-
-Install all standard library modules:
+Install the compiler with the repository script:
 
 ```bash
-wand2c -il libw/llibw.86
+./install.sh
 ```
 
-Install one module:
+The script runs `cargo build --release`.
+The script then runs `sudo install target/release/wand2c /usr/bin/`.
+The script installs the binary at `/usr/bin/wand2c`.
+The script does not install the standard library.
+
+Install the standard library separately:
 
 ```bash
-wand2c -il libw/llibw.86/io
+target/release/wand2c -il libw/llibw.86
 ```
 
-Directory installation is non-recursive. The compiler validates `.w` and `.wh` files before copying them to `~/.local/lib/libw/`, or to `$WAND_LIB_PATH` when that variable is set.
+Run this command from the repository root.
+The install flag must be the first argument.
+Use `--install-library` in place of `-il`.
+The tool validates `.w` and `.wh` files before copying them.
+The tool copies files to `$HOME/.local/lib/libw/`.
+The tool uses `$WAND_LIB_PATH` when that variable is set.
+Directory installs are not recursive.
 
-## Compilation Commands
+## Quick start
 
-Compile a source file to an executable program:
+1. Build the compiler and install the standard library as shown above.
+2. Create `hello.w` with this text:
 
-```bash
-wand2c main.w -o main -fp
+   ```wand
+   sc.true
+   #import <io>
+
+   fn main(u64 argc, u64 argv, u64 envp) -> u64 {
+       print_string("Hello, Wand!\n");
+       return(0);
+   }
+   ```
+
+3. Compile the file:
+
+   ```bash
+   target/release/wand2c hello.w -o hello -fp
+   ```
+
+4. Run the program:
+
+   ```bash
+   ./hello
+   ```
+
+The program prints `Hello, Wand!`.
+The program exits with status 0.
+
+## Command line
+
+Use this form for compilation:
+
+```text
+wand2c <input_files> [options]
 ```
 
-Compile with verbose output:
+Put `--install-library` or `-il` first when you install a library.
 
-```bash
-wand2c main.w -o main -fp -v
-```
+| Option | Meaning |
+|---|---|
+| `-o <file>` | Set the output path. |
+| `-f <name>` | Set the output format by name. |
+| `-f=<name>` | Set the output format by name. |
+| `--format <name>` | Set the output format by name. |
+| `--format=<name>` | Set the output format by name. |
+| `-fp` | Use the `program` format. |
+| `-fo` | Use the `object` format. |
+| `-fr` | Use the `raw` format. |
+| `-fk` | Use the `kernel` format. |
+| `-fw` | Use the `wexp` format. |
+| `--entry <name>` | Set the entry function for `raw` or `kernel`. |
+| `-v`, `--verbose` | Print compiler stages. |
+| `-il <path>`, `--install-library <path>` | Install one library or a library directory. |
 
-Compile to a relocatable object file:
+Valid format names are `program`, `object`, `raw`, `kernel`, and `wexp`.
+You must not combine two different format options.
 
-```bash
-wand2c module.w -o module.o -fo
-```
+## Output formats
 
-Compile to a flat binary:
+| Option | Format | Output | Requirements |
+|---|---|---|---|
+| `-fp` | `program` | Hosted ELF64 executable | `sc.true` and `main` |
+| `-fo` | `object` | Relocatable ELF64 object | None |
+| `-fr` | `raw` | Flat binary without an ELF header | `sc.false`, optional `--entry` |
+| `-fk` | `kernel` | Freestanding flat binary | `sc.false`, optional `--entry` |
+| `-fw` | `wexp` | Flat Standard 4/6 continuation module | `main`, a loader at run time |
 
-```bash
-wand2c boot.w -o boot.bin -fr --entry start
-```
+Raw and kernel formats use `main` as the default entry.
+Use `--entry <name>` to select another function.
 
-Compile to a freestanding kernel image:
+## Language outline
 
-```bash
-wand2c kernel.w -o kernel.kbin -fk --entry kmain
-```
+Wand uses `.w` files for implementation and `.wh` files for declarations.
+Every source file must start with `sc.true` or `sc.false`.
+Use `sc.true` for hosted code.
+Use `sc.false` for freestanding code.
+Hosted code runs under an operating system.
+Freestanding code runs without an operating system.
+Use `#import <name>` for system modules.
+Use `#import "name"` for local modules.
+Import paths must not include file extensions.
+Local imports resolve from the current working directory.
 
-Compile to a dynamic execution module:
-
-```bash
-wand2c module.w -o module.wexp -fw
-```
-
-## Output Formats
-
-| Flag | Format | Description |
+| Topic | Terms | Reference |
 |---|---|---|
-| `-fp` | program | Hosted ELF64 executable. Requires `sc.true`. |
-| `-fo` | object | Relocatable ELF object file. |
-| `-fr` | raw | Flat binary image. No ELF header. |
-| `-fk` | kernel | Freestanding kernel image. Requires `sc.false`. |
-| `-fw` | wexp | Dynamic execution module. |
+| Environment | `sc.true`, `sc.false` | [SYNTAX.md, section 2](documentation/SYNTAX.md#2-environment-token) |
+| Functions | `fn`, `export`, `extern`, multiple results | [SYNTAX.md, sections 21 and 22](documentation/SYNTAX.md#21-functions) |
+| Types | `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f64`, `void` | [SYNTAX.md, section 7](documentation/SYNTAX.md#7-primitive-types) |
+| Arrays | `u8 buf[32]`, brace initializers | [SYNTAX.md, section 9](documentation/SYNTAX.md#9-arrays) |
+| User types | `struct`, `enum`, `union`, `typedef`, `version` | [SYNTAX.md, section 12](documentation/SYNTAX.md#12-structures) |
+| Pointer data flow | `*i`, `*o`, `*io` | [SYNTAX.md, section 16](documentation/SYNTAX.md#16-pointer-modifiers) |
+| Addresses | `*adr` | [SYNTAX.md, section 17](documentation/SYNTAX.md#17-the-adr-operator) |
+| Sections | `sect`, `EOS`, `section:variable`, `volatile`, `atomic` | [SYNTAX.md, sections 23 to 25](documentation/SYNTAX.md#23-global-sections) |
+| Reflection | `sizeof`, `alignof`, `offsetof`, `fieldsof`, `versionof`, `nameof` | [SYNTAX.md, section 30](documentation/SYNTAX.md#30-compile-time-reflection) |
+| Raw memory | `mem_load_u32`, `mem_store_u32`, `volatile_load_u32`, `volatile_store_u32` | [SYNTAX.md, section 25](documentation/SYNTAX.md#25-atomic-variables) |
+| Atomics | `atomic_load`, `atomic_store`, `atomic_add`, `atomic_cas`, `memory_barrier` | [SYNTAX.md, section 25](documentation/SYNTAX.md#25-atomic-variables) |
+| Hardware | `inb`, `outb`, `critical`, `irq`, `::nasm::{}` | [SYNTAX.md, sections 26 to 28](documentation/SYNTAX.md#26-critical-sections) |
+| Continuations | `jmpto`, `.wexp`, `wand_p46_load` | [SYNTAX.md, section 29](documentation/SYNTAX.md#29-jmpto-statement) |
 
-## Compiler Flags
+The [loader API](include/wand_p46.h) declares `wand_p46_load` and `wand_p46_call`.
+Build the loader library with `make -C loader`.
+Use [LEARN.md](documentation/LEARN.md) for a tutorial.
+Use [SYNTAX.md](documentation/SYNTAX.md) for all language rules.
 
-| Flag | Description |
-|---|---|
-| `-o <file>` | Set output file path |
-| `-v, --verbose` | Show detailed compilation pipeline output |
-| `-fp, -fo, -fr, -fk, -fw` | Set output format |
-| `--entry <name>` | Set entry function (raw and kernel formats only) |
-| `-il <path>` | Install a library or library directory |
+## Testing
 
-## Language Features
+Run all Cargo tests from the repository root:
 
-### Environment Tokens
-
-Every Wand source file starts with an environment token:
-
-* `sc.true`: Hosted environment. The program runs under an operating system. Requires a `main` function. Allows system calls.
-* `sc.false`: Freestanding environment. The program runs on bare metal. Raw and kernel formats use `main` as the default entry; pass `--entry kmain` to select `kmain`. Allows `critical` blocks and IRQ handlers.
-
-### Import System
-
-System modules use angle brackets. Local modules use double quotes.
-
-```
-#import <io>
-#import <mem>
-#import "my_module"
+```bash
+cargo test --release
 ```
 
-### Pointer Modifiers
+The regression probes and benchmark suite live outside this checkout.
+The paths below assume this checkout stays at `/home/user12ms/Projects/wand2c`.
+Run one probe with the compiler built above:
 
-WandC uses explicit pointer modifiers to declare data flow direction:
-
-* `*i`: The function reads through this pointer.
-* `*o`: The function writes through this pointer.
-* `*io`: The function reads and writes through this pointer.
-* `*adr`: Takes the address of a variable.
-
-Multi-level pointers (`u8**`) are not allowed.
-
-### Control Flow
-
-WandC supports `if`, `else`, `while`, `for`, `match`, `continue`, and `break`.
-
-### Compound Assignment
-
-The compiler supports compound assignment operators:
-
-`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`
-
-### Array Initialization
-
-Arrays in global sections can be initialized with brace syntax:
-
-```
-sect.data
-    u8 buffer[4] = {
-        0x00, 0x01, 0x02, 0x03
-    };
-EOS
+```bash
+(cd ../../experiment/probes && /home/user12ms/Projects/wand2c/target/release/wand2c f64_cast.w -o /tmp/f64_cast_wand -fp && /tmp/f64_cast_wand)
 ```
 
-### Multiple Return Values
+Run the continuation probes with the same compiler:
 
-Functions can return tuples:
-
-```
-fn divmod(u64 a, u64 b) -> (u64, u64) {
-    return(a / b, a % b);
-}
-
-u64 q, r;
-[q, r] = divmod(17, 5);
+```bash
+(cd ../../experiment/probes/wexp && WAND2C_CHECKOUT=/home/user12ms/Projects/wand2c ./run_all.sh)
 ```
 
-Use `_` to ignore a return value:
+Run the benchmark suite:
 
-```
-[_, r] = divmod(17, 5);
-```
-
-> Fixed: multi-value returns now assign each result to the correct target. See [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md#multiple-return-values-give-the-same-result) for the historical bug.
-
-### Structures with Versioning
-
-Structures and fields carry version metadata for ABI stability:
-
-```
-struct Config version 2 {
-    u32 flags version 1;
-    u8* name version 2;
-}
+```bash
+(cd ../../experiment && python3 bench.py all --reps 5)
 ```
 
-### Global Sections
+Set `WAND2C` when `wand2c` is not on `PATH`.
 
-Global variables live in named sections, terminated by `EOS`:
+## Known limits
 
-```
-sect.state
-    u64 ticks = 0;
-    volatile u64 status = 0;
-EOS
-```
+- Multi-level pointers are not allowed.
+- The language requires explicit casts at narrowing boundaries.
+- The checker accepts some integer narrowing and truncates the value.
+- Array sizes must be compile-time constants.
+- System imports must be logical names without extensions or path separators.
+- Local imports resolve from the current working directory.
+- `critical` and `irq` require `sc.false`.
+- System calls require `sc.true`.
+- `::nasm::{}` supports a small instruction set. The compiler warns and drops unknown lines.
+- Wand has no raw pointer dereference expression. Use raw-memory builtins.
+- A `.wexp` file does not run directly on Linux. Use a Standard 4/6 loader.
+- `jmpto` passes at most six arguments and receives at most four results.
+- Function `version` suffixes do not change exported symbol names.
 
-Access section variables with `section:variable` syntax.
+Read [TROUBLESHOOTING.md](documentation/TROUBLESHOOTING.md) for the complete list.
 
-### Inline Assembly
+## Development
 
-Use `::nasm::{}` blocks for raw x86_64 instructions:
+You must pass all tests before you merge or install a change.
+Run the commands in [Testing](#testing) before you merge.
+Use [SYNTAX.md](documentation/SYNTAX.md) for language rules.
 
-```
-fn halt() {
-    ::nasm::{
-        hlt
-    }
-}
-```
+## Editor support
 
-This is a small built-in encoder, not a full assembler; unsupported lines are
-ignored with a warning. See `documentation/SYNTAX.md` section 28 for the exact
-instruction list.
-
-### Compile-Time Reflection
-
-Built-in functions inspect types at compile time:
-
-* `sizeof(Type)`: Size in bytes.
-* `alignof(Type)`: Alignment requirement.
-* `offsetof(Struct:field)`: Field byte offset.
-* `fieldsof(Type)`: Number of fields.
-* `versionof(Type)`: Type version number.
-* `nameof(Type)`: Type name as a string.
-
-## Memory Safety Analysis
-
-The compiler performs static memory safety analysis during Stage 3. It detects:
-
-* Use of uninitialized variables and struct fields.
-* Use-after-free violations.
-* Potential null pointer dereferences.
-* Potential memory leaks.
-* Freeing potentially null pointers.
-
-Errors abort compilation. Warnings are reported but do not stop the build.
-
-## Optimizer
-
-The optimizer runs up to 10 iterations per function. It performs:
-
-* Constant folding and propagation.
-* Copy propagation for variables that are never reassigned.
-* Dead variable and dead store elimination.
-* Algebraic simplifications (`x + 0`, `x * 1`, `x ^ x`, etc.).
-* Unsigned power-of-two division to shifts and modulo to masks.
-* Nested shift folding.
-* Commutative chain folding.
-* Loop, branch, and unreachable statement elimination.
-
-Volatile and atomic variables are never optimized. Signed division and modulo are not strength-reduced. Calls and memory loads are never dropped or duplicated.
-
-## Memory Allocation
-
-The standard library provides two allocation systems:
-
-### Arena Allocator (`mem` module)
-
-Call `mem_init(size)` to allocate an arena. Then use `malloc`, `calloc`, `mrealloc`, and `mfree`.
-
-### Raw Allocator (`syscall` module)
-
-The `mloc` function allocates memory through the `mmap` system call.
-It stores the block size in an 8-byte header before the returned pointer.
-The `mfree` function reads the header and calls `munmap`.
-
-## Hardware Support
-
-The compiler supports direct hardware access on x86_64:
-
-* **Port I/O**: `inb`, `outb`, `inw`, `outw`, `inl`, `outl`.
-* **Inline Assembly**: `::nasm::{}` blocks for a supported subset of x86_64 instructions (`pause`, `rdtsc`, `hlt`, fences, `cli`/`sti`, narrow `mov`, and the fixed encodings). Unsupported lines produce a compiler warning. See `documentation/SYNTAX.md` section 28.
-* **Atomics**: `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_inc`, `atomic_dec`, `atomic_swap`, `atomic_cas`. Operations are sized from the variable's type (1/2/4/8 bytes), so a `u32` lock cannot clobber adjacent data.
-* **Barriers**: `memory_barrier`, `compiler_barrier`.
-* **Critical Sections**: `critical { }` blocks disable interrupts in `sc.false` code.
-* **IRQ Handlers**: `irq fn handler() { }` generates interrupt-safe function prologues and epilogues.
-
-## Binary Metadata
-
-The compiler adds custom sections to the ELF file:
-
-| Section | Content |
-|---|---|
-| `.text` | Executable machine code |
-| `.p46_header` | Standard 4/6 magic and metadata |
-| `.p46_types` | TLV structure and type definitions |
-| `.p46_exports` | Exported function signatures |
-| `.p46_imports` | External symbol dependencies |
-| `.p46_deps` | Module dependency list |
-| `.p46_reflect` | Qualified-name lookup index |
-| `.p46_strtab` | Metadata string table |
-
-## Dynamic Modules (.wexp)
-
-The `-fw` flag produces a continuation object: a flat Standard 4/6 Raw Binary
-image, not an ELF executable. It has no `_start` stub, no fixed load address and
-no process entry point. A loader maps the module image at any convenient
-address, applies its relocations, resolves imports and then calls `main` as a
-continuation. Export addresses are offsets from that module base.
-
-Two vendor sections carry the executable part:
-
-| Type | Name | Content |
-|------|------|---------|
-| 100 | `P46_SECTION_WEXP_IMAGE` | Relocatable module image (code and globals) |
-| 101 | `P46_SECTION_WEXP_RELOCS` | 24-byte relocation entries applied after mapping |
-
-The loader API is declared in `include/wand_p46.h`. Build the standalone loader
-library with `make -C loader`; it provides `wand_p46_load`,
-`wand_p46_get_symbol`, `wand_p46_call`, a module registry for `jmpto`, and the
-`__wand_jmpto_loader` entry point. On Linux use `-fp` for a stand-alone
-executable; `.wexp` files are only for loaders.
-
-### Why continuations are useful
-
-- **No process ABI to inherit.** The module has no ELF entry stub and no fixed
-  addresses, so the same bytes can be loaded into a kernel, a boot image, a
-  sandboxed process or a hosted test harness.
-- **Small, explicit ABI.** `main` takes up to six `u64` values and returns up to
-  four (`rax`, `rdx`, `rcx`, `r8`). There is no `argc`/`argv`/`envp` convention,
-  no libc startup and no compiler-chosen load address.
-- **Metadata travels with the code.** Types, signatures, function versions,
-  imports, dependencies and a reflection index let a loader validate and link
-  a module before calling it.
-- **One door in and out.** Values enter as arguments and leave as results; a
-  module cannot run code on its own. This fits drivers, plugins and updatable
-  kernel components, and keeps the host's C ABI surface small.
-
-### Loading a module from C
-
-```c
-#include "wand_p46.h"
-
-static void* resolve(const char* module, const char* symbol,
-                     uint32_t version, void* ctx) {
-    /* Return the host address of `symbol`, or NULL if unavailable. */
-    return NULL;
-}
-
-/* bytes/len are the contents of module.wexp. The loader copies them. */
-WandP46Status status = WAND_P46_OK;
-WandP46Options options = {resolve, NULL, NULL};
-WandP46Module* m = wand_p46_load(bytes, len, &options, &status);
-if (!m) { /* wand_p46_status_string(status) explains the failure */ }
-
-uint64_t args[1] = {4};
-uint64_t results[4] = {0};
-size_t count = 0;
-status = wand_p46_call(m, args, 1, results, 4, &count);
-wand_p46_unload(m);
-```
-
-`wand_p46_get_symbol(module, "name", version, &fn)` resolves any exported
-function, not just `main`. The reference loader maps the image read/write/exec
-while applying relocations; an OS loader can map read/write first and switch to
-read/execute afterwards for W^X.
-
-### Calling a module from Wand (`jmpto`)
-
-```wandc
-jmpto "worker.wexp" {
-    u64 input_value = argc + 21;
-    return(input_value);
-}
-return(input_value);
-```
-
-Variables prepared in the block become arguments (at most six, in order);
-`return(var)` names a caller variable that receives a result (at most four).
-If the worker's `.w` source is present at compile time the call is inlined;
-otherwise the generated code calls `__wand_jmpto_loader`. For the dynamic path,
-register the module once with
-`wand_p46_register_path("worker.wexp", "/path/to/worker.wexp", &options)`;
-up to 32 modules can be registered. A failed lookup returns 0.
+The [Zed extension](zed-wand/README.md) adds `.w` and `.wh` support.
+Install it in Zed with `zed: install dev extension` and select `zed-wand`.
