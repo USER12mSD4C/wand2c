@@ -1829,6 +1829,13 @@ static int emit_float_op_xmm1(Buf* b, WStr op) {
     return 1;
 }
 
+/* Convert an f64 bit pattern in rax to a signed 64-bit integer in rax. */
+static void emit_cvttsd2si_rax(Buf* b) {
+    static const uint8_t seq[] = {0x66,0x48,0x0F,0x6E,0xC0,
+                                  0xF2,0x48,0x0F,0x2C,0xC0};
+    buf_bytes(b, seq, sizeof(seq));
+}
+
 /* Move f64 bit patterns between rax and xmm0. */
 static void emit_movq_rax_to_xmm0(Buf* b) {
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC0);
@@ -1884,6 +1891,46 @@ static int float_direct_safe(Gen* g, WExpr* e) {
     }
     if (e->tag == 8 && e->b && e->b->tag == 11 &&
         float_op_code(e->str) && float_direct_safe(g, e->a)) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Compile a float binary op whose result is left in xmm0. Covers the two XMM
+ * forms used by vector kernels: LHS op (RHS op2 literal) and LHS op literal.
+ * Returns 0 when e needs a different codegen path. */
+static int compile_float_binary_to_xmm0(Gen* g, WExpr* e) {
+    if (!e || e->tag != 8 || !float_op_code(e->str)) {
+        return 0;
+    }
+    WStr op = e->str;
+    if (!is_float_expr(g, e->a) && !is_float_expr(g, e->b)) {
+        return 0;
+    }
+    Buf* b = &g->code;
+
+    if (e->b && e->b->tag == 8 && e->b->b && e->b->b->tag == 11 &&
+        float_op_code(e->b->str) && float_direct_safe(g, e->b)) {
+        int code = float_op_code(op);
+        compile_float_to_xmm0(g, e->a);
+        buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC8);
+        compile_float_to_xmm0(g, e->b->a);
+        emit_float_op_xmm0_mem(g, e->b->str, e->b->b->str);
+        if (code == 0x5C || code == 0x5E) {
+            buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xD0);
+            buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC1);
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+            buf_u8(b, 0xC2);
+        } else {
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+            buf_u8(b, 0xC1);
+        }
+        return 1;
+    }
+
+    if (e->b && e->b->tag == 11) {
+        compile_float_to_xmm0(g, e->a);
+        emit_float_op_xmm0_mem(g, op, e->b->str);
         return 1;
     }
     return 0;
@@ -2691,14 +2738,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCastInt")) {
-                compile_expr(g, e->a, reg, deref_ptr);
+                compile_expr(g, e->a, 0, deref_ptr);
                 if (is_float_expr(g, e->a)) {
-                    /* cvttsd2si (F2), not cvttss2si (F3): the source is an
-                     * IEEE-754 double. The old prefix truncated a double as
-                     * if it were a float, producing 0 for ordinary values. */
-                    static const uint8_t seq[] = {0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF2, 0x48, 0x0F, 0x2C, 0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
+                    emit_cvttsd2si_rax(b);
                 }
+                if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
             /* Integer casts now carry the target width in the op name.
@@ -2708,7 +2752,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             if (wstr_eq_c(op, "OpCastU8") || wstr_eq_c(op, "OpCastU16") ||
                 wstr_eq_c(op, "OpCastU32") || wstr_eq_c(op, "OpCastI8") ||
                 wstr_eq_c(op, "OpCastI16") || wstr_eq_c(op, "OpCastI32")) {
+                int from_float = is_float_expr(g, e->a);
                 compile_expr(g, e->a, 0, deref_ptr);
+                if (from_float) {
+                    emit_cvttsd2si_rax(b);
+                }
                 if (wstr_eq_c(op, "OpCastU8")) {
                     buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0); /* movzx eax, al */
                 } else if (wstr_eq_c(op, "OpCastU16")) {
@@ -2726,7 +2774,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCastU64") || wstr_eq_c(op, "OpCastI64")) {
-                compile_expr(g, e->a, reg, deref_ptr);
+                compile_expr(g, e->a, 0, deref_ptr);
+                if (is_float_expr(g, e->a)) {
+                    emit_cvttsd2si_rax(b);
+                }
+                if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
             if (wstr_eq_c(op, "OpCast")) {
@@ -2740,34 +2792,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
-            /* Fused path for LHS op (RHS op2 literal), the dominant pattern
-             * in vector kernels: a[i] + b[i] * s. Both operands stay in XMM
-             * registers; no push/pop or GPR/XMM round trip for the outer op. */
-            if (float_op && e->b && e->b->tag == 8 && e->b->b &&
-                e->b->b->tag == 11 && float_op_code(op) &&
-                float_op_code(e->b->str) && float_direct_safe(g, e->b)) {
-                int code = float_op_code(op);
-                compile_float_to_xmm0(g, e->a);
-                buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC8);
-                compile_float_to_xmm0(g, e->b->a);
-                emit_float_op_xmm0_mem(g, e->b->str, e->b->b->str);
-                if (code == 0x5C || code == 0x5E) {
-                    /* Non-commutative: xmm1 (LHS) op xmm0 (RHS) -> xmm0 */
-                    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xD0);
-                    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC1);
-                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
-                    buf_u8(b, 0xC2);
-                } else {
-                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
-                    buf_u8(b, 0xC1);
-                }
-                emit_movq_xmm0_to_rax(b);
-                if (reg != 0) move_rax_to_reg(b, reg);
-                return;
-            }
-            if (float_op && e->b && e->b->tag == 11 && float_op_code(op)) {
-                compile_float_to_xmm0(g, e->a);
-                emit_float_op_xmm0_mem(g, op, e->b->str);
+            /* Fused and literal-RHS float ops stay in XMM registers. */
+            if (compile_float_binary_to_xmm0(g, e)) {
                 emit_movq_xmm0_to_rax(b);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3600,6 +3626,9 @@ static int compile_f64_index_to_xmm0(Gen* g, WExpr* e) {
  * between links instead of round-tripping through rax. */
 static void compile_float_to_xmm0(Gen* g, WExpr* e) {
     Buf* b = &g->code;
+    if (compile_float_binary_to_xmm0(g, e)) {
+        return;
+    }
     if (e && e->tag == 8 && e->b && e->b->tag == 11 &&
         float_op_code(e->str) && (is_float_expr(g, e->a) || is_float_expr(g, e->b))) {
         compile_float_to_xmm0(g, e->a);
@@ -3947,6 +3976,17 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
         buf_u8(b, 0x89);
         buf_u8(b, (uint8_t)(0xC0 | (3 << 3) | (reg & 7)));
     }
+}
+
+/* True for an Index/MemberAccess whose declared type is f64. Such stores can
+ * write xmm0 directly with movsd instead of round-tripping the bits through
+ * rax and r10. */
+static int is_f64_store_target(Gen* g, WExpr* e) {
+    if (!e || (e->tag != 6 && e->tag != 10)) {
+        return 0;
+    }
+    WType* t = peel_typedefs(resolve_expr_type(g, e));
+    return t && t->tag == 8;
 }
 
 static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
@@ -4394,7 +4434,18 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 1: { /* Assignment */
             if (s->expr_count == 1) {
                 int copied = try_compile_string_copy_to_u8_array(g, s->exprs[0], s->e1);
-                if (!copied) {
+                int direct_float_store =
+                    !copied && is_f64_store_target(g, s->exprs[0]) &&
+                    !is_volatile_member_expr(g, s->exprs[0]) &&
+                    is_float_expr(g, s->e1);
+                if (!copied && direct_float_store) {
+                    /* Keep the f64 value in xmm0, compute the destination in
+                     * rbx, and store with movsd. This removes the rax/r10
+                     * save-restore used by the generic integer store path. */
+                    compile_float_to_xmm0(g, s->e1);
+                    compile_address(g, s->exprs[0], 3);
+                    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
+                } else if (!copied) {
                     compile_expr(g, s->e1, 0, 1);
                     store_assignment_target_from_rax(g, s->exprs[0]);
                 }
