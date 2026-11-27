@@ -4558,75 +4558,81 @@ static int invariant_pointer_bindable(Gen* g, WStr name) {
     return t && t->tag == 10 && type_size(g, t) == 8;
 }
 
-static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found);
+static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found,
+                                       WStr exclude);
 
-static int expr_find_invariant_pointer_args(Gen* g, WExpr* e, WStr* found) {
+static int expr_find_invariant_pointer_args(Gen* g, WExpr* e, WStr* found,
+                                            WStr exclude) {
     if (!e) return 0;
     for (size_t i = 0; i < e->arg_count; i++) {
-        if (expr_find_invariant_pointer(g, e->args[i], found)) return 1;
+        if (expr_find_invariant_pointer(g, e->args[i], found, exclude)) return 1;
     }
     return 0;
 }
 
 /* Find a pointer local used as the base of an index or arrow access. */
-static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found) {
+static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found,
+                                       WStr exclude) {
     if (!e) return 0;
     if ((e->tag == 10 || (e->tag == 6 && e->flag)) && e->a &&
-        e->a->tag == 3 && invariant_pointer_bindable(g, e->a->str)) {
+        e->a->tag == 3 && invariant_pointer_bindable(g, e->a->str) &&
+        (!exclude.ptr || !wstr_eq(e->a->str, exclude))) {
         *found = e->a->str;
         return 1;
     }
-    return expr_find_invariant_pointer(g, e->a, found) ||
-           expr_find_invariant_pointer(g, e->b, found) ||
-           expr_find_invariant_pointer_args(g, e, found);
+    return expr_find_invariant_pointer(g, e->a, found, exclude) ||
+           expr_find_invariant_pointer(g, e->b, found, exclude) ||
+           expr_find_invariant_pointer_args(g, e, found, exclude);
 }
 
-static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found);
+static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found,
+                                       WStr exclude);
 
 static int stmt_find_invariant_pointer_tree(Gen* g, WStmt** v, size_t n,
-                                            WStr* found) {
+                                            WStr* found, WStr exclude) {
     for (size_t i = 0; i < n; i++) {
-        if (stmt_find_invariant_pointer(g, v[i], found)) return 1;
+        if (stmt_find_invariant_pointer(g, v[i], found, exclude)) return 1;
     }
     return 0;
 }
 
-static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found) {
+static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found,
+                                       WStr exclude) {
     if (!s) return 0;
-    if (expr_find_invariant_pointer(g, s->e1, found) ||
-        expr_find_invariant_pointer(g, s->e2, found)) {
+    if (expr_find_invariant_pointer(g, s->e1, found, exclude) ||
+        expr_find_invariant_pointer(g, s->e2, found, exclude)) {
         return 1;
     }
     for (size_t i = 0; i < s->expr_count; i++) {
-        if (expr_find_invariant_pointer(g, s->exprs[i], found)) return 1;
+        if (expr_find_invariant_pointer(g, s->exprs[i], found, exclude)) return 1;
     }
     for (size_t i = 0; i < s->return_count; i++) {
-        if (expr_find_invariant_pointer(g, s->returns[i].expr, found)) return 1;
+        if (expr_find_invariant_pointer(g, s->returns[i].expr, found, exclude)) return 1;
     }
     for (size_t i = 0; i < s->case_count; i++) {
-        if (expr_find_invariant_pointer(g, s->cases[i].expr, found)) return 1;
+        if (expr_find_invariant_pointer(g, s->cases[i].expr, found, exclude)) return 1;
         for (size_t j = 0; j < s->cases[i].body_count; j++) {
-            if (stmt_find_invariant_pointer(g, s->cases[i].body[j], found)) return 1;
+            if (stmt_find_invariant_pointer(g, s->cases[i].body[j], found, exclude)) return 1;
         }
     }
-    return stmt_find_invariant_pointer(g, s->s1, found) ||
-           stmt_find_invariant_pointer(g, s->s2, found) ||
-           stmt_find_invariant_pointer_tree(g, s->stmts1, s->stmt1_count, found) ||
-           stmt_find_invariant_pointer_tree(g, s->stmts2, s->stmt2_count, found);
+    return stmt_find_invariant_pointer(g, s->s1, found, exclude) ||
+           stmt_find_invariant_pointer(g, s->s2, found, exclude) ||
+           stmt_find_invariant_pointer_tree(g, s->stmts1, s->stmt1_count, found, exclude) ||
+           stmt_find_invariant_pointer_tree(g, s->stmts2, s->stmt2_count, found, exclude);
 }
 
 static int stmt_has_nested_loop_tree(WStmt** v, size_t n);
 
-/* Bind one loop-invariant pointer base to r8. Only r8 is used so induction
- * and accumulators keep their existing r11/r9 paths. Nested loops reserve r8
- * for their own bindings, and calls or returns are handled by the existing
- * loop safety scans at the call sites. */
+/* Bind a loop-invariant pointer base to reg (8 or 12). exclude skips a
+ * pointer already bound to another register. Nested loops reserve r8 for
+ * their own bindings, and calls or returns are handled by the existing loop
+ * safety scans at the call sites. */
 static int try_bind_invariant_pointer(Gen* g, WStmt** body, size_t body_count,
-                                      WStr* name) {
-    if (!body_count || reg_in_use(g, 8)) return 0;
+                                      uint8_t reg, WStr exclude, WStr* name) {
+    if (!body_count || reg_in_use(g, reg)) return 0;
     if (stmt_has_nested_loop_tree(body, body_count)) return 0;
     WStr found = {0};
-    if (!stmt_find_invariant_pointer_tree(g, body, body_count, &found)) return 0;
+    if (!stmt_find_invariant_pointer_tree(g, body, body_count, &found, exclude)) return 0;
     if (!invariant_pointer_bindable(g, found)) return 0;
     for (size_t i = 0; i < body_count; i++) {
         if (stmt_forbidden_reg_loop(g, body[i], found)) return 0;
@@ -5955,14 +5961,19 @@ static void compile_stmt(Gen* g, WStmt* s) {
             if (!expr_has_call_deep(s->e1) &&
                 !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
                 uint8_t next_gpr = 8;
-                WStr ptr_name = {0};
-                if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
-                                               &ptr_name)) {
-                    RegLocal r = {0};
-                    r.name = ptr_name;
-                    r.reg = 8;
-                    RegLocalVec_push(&gpr_bindings, r);
-                    next_gpr = 9;
+                WStr skip = {0};
+                const uint8_t ptr_regs[2] = {8, 12};
+                for (size_t pi = 0; pi < 2; pi++) {
+                    WStr ptr_name = {0};
+                    if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
+                                                   ptr_regs[pi], skip, &ptr_name)) {
+                        RegLocal r = {0};
+                        r.name = ptr_name;
+                        r.reg = ptr_regs[pi];
+                        RegLocalVec_push(&gpr_bindings, r);
+                        skip = ptr_name;
+                        if (ptr_regs[pi] == 8) next_gpr = 9;
+                    }
                 }
                 for (size_t i = 0; i < s->stmt1_count; i++) {
                     collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
@@ -6037,14 +6048,19 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 (!s->s2 || !stmt_has_call_deep(s->s2)) &&
                 !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
                 uint8_t next_gpr = 8;
-                WStr ptr_name = {0};
-                if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
-                                               &ptr_name)) {
-                    RegLocal r = {0};
-                    r.name = ptr_name;
-                    r.reg = 8;
-                    RegLocalVec_push(&gpr_bindings, r);
-                    next_gpr = 9;
+                WStr skip = {0};
+                const uint8_t ptr_regs[2] = {8, 12};
+                for (size_t pi = 0; pi < 2; pi++) {
+                    WStr ptr_name = {0};
+                    if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
+                                                   ptr_regs[pi], skip, &ptr_name)) {
+                        RegLocal r = {0};
+                        r.name = ptr_name;
+                        r.reg = ptr_regs[pi];
+                        RegLocalVec_push(&gpr_bindings, r);
+                        skip = ptr_name;
+                        if (ptr_regs[pi] == 8) next_gpr = 9;
+                    }
                 }
                 for (size_t i = 0; i < s->stmt1_count; i++) {
                     collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
@@ -6159,7 +6175,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     }
                 }
             }
-            buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x65); buf_u8(b, 0xF8);
+            buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x65);
+            buf_u8(b, g->current_is_irq ? 0xF8 : 0xF0);
+            if (!g->current_is_irq) {
+                buf_u8(b, 0x41); buf_u8(b, 0x5C); /* pop r12 */
+            }
             buf_u8(b, 0x5B);
             buf_u8(b, 0x5D);
             emit_function_epilogue(g);
@@ -6549,7 +6569,7 @@ static void compile_function(Gen* g, WFunc* f) {
     g->escaped_locals.slots = NULL;
     g->locals.len = g->local_access.len = g->local_types.len = g->local_is_param.len = 0;
     g->escaped_locals.len = 0;
-    g->next_offset = 16;
+    g->next_offset = f->is_irq ? 16 : 24; /* leave rbp-16 for saved r12 */
     g->current_is_irq = f->is_irq;
     g->stack_depth = 0;
     g->loop_stack.n = 0;
@@ -6570,6 +6590,9 @@ static void compile_function(Gen* g, WFunc* f) {
     buf_u8(b, 0x55);
     buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xE5);
     buf_u8(b, 0x53);
+    if (!f->is_irq) {
+        buf_u8(b, 0x41); buf_u8(b, 0x54); /* push r12 */
+    }
 
     size_t sub_rsp_offset = b->len;
     buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xEC);
@@ -6630,6 +6653,9 @@ static void compile_function(Gen* g, WFunc* f) {
     if (!has_explicit_return) {
         buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xC4);
         buf_u32(b, final_stack_size);
+        if (!g->current_is_irq) {
+            buf_u8(b, 0x41); buf_u8(b, 0x5C); /* pop r12 */
+        }
         buf_u8(b, 0x5B);
         buf_u8(b, 0x5D);
         emit_function_epilogue(g);
