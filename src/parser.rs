@@ -1629,6 +1629,14 @@ impl Parser {
 
                     let op_str = match cast_type {
                         DataType::F64 => "OpCastF64".to_string(),
+                        DataType::U8 => "OpCastU8".to_string(),
+                        DataType::U16 => "OpCastU16".to_string(),
+                        DataType::U32 => "OpCastU32".to_string(),
+                        DataType::U64 => "OpCastU64".to_string(),
+                        DataType::I8 => "OpCastI8".to_string(),
+                        DataType::I16 => "OpCastI16".to_string(),
+                        DataType::I32 => "OpCastI32".to_string(),
+                        DataType::I64 => "OpCastI64".to_string(),
                         _ => "OpCastInt".to_string(),
                     };
 
