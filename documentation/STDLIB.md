@@ -186,9 +186,12 @@ fn print_char(u8 c);
 fn print_string(u8* s);
 fn print_number(u64 num);
 fn print_signed_number(i64 num);
-fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3);
-fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64;
+fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7, u64 arg8);
+fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7, u64 arg8) -> i64;
 ```
+
+The formatters accept up to eight argument values. Calls may pass fewer values;
+unused slots are ignored.
 
 The `printf` function supports three format specifiers.
 
@@ -204,7 +207,7 @@ It returns the number of characters written.
 Pass pointer arguments as `u64` casts.
 
 ```wandc
-printf("name: %s, count: %v\n", (u64)name, count, 0);
+printf("name: %s, count: %v, tag: %v\n", (u64)name, count, tag);
 ```
 
 ### Console Input
