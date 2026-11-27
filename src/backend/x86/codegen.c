@@ -1002,6 +1002,11 @@ struct Gen {
 
     AddrPatchVec address_patches;
     CallPatchVec call_patches;
+    size_t patch_generation; /* incremented whenever a branch/call patch is recorded */
+    size_t last_rax_store_pos; /* start of last rax-to-local store */
+    uint32_t last_rax_store_len; /* byte length of that store (0 = none) */
+    uint32_t last_rax_store_off; /* local stack offset stored to */
+    size_t last_rax_store_gen; /* patch_generation at store time */
     LoopCtxVec loop_stack;
     size_t stack_depth;
     size_t match_depth; /* active `match` scrutinee slots on the stack */
@@ -1232,6 +1237,7 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
     p.key = key;
     p.is_rip = 1;
     AddrPatchVec_push(&g->address_patches, p);
+    g->patch_generation++;
 }
 
 /* movsd xmm<N>, [rip+key] — loads a float constant in one instruction
@@ -1250,6 +1256,7 @@ static void emit_function_epilogue(Gen* g) {
 
 static void patch_address(Gen* g, size_t pos, int32_t offset) {
     patch_i32(&g->code, pos, offset);
+    g->patch_generation++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1843,6 +1850,7 @@ static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
     p.key = key;
     p.is_rip = 1;
     AddrPatchVec_push(&g->address_patches, p);
+    g->patch_generation++;
 }
 
 /* Compile a float expression so its bit pattern ends in xmm0. Chained binary
@@ -2261,6 +2269,7 @@ static void emit_call_patch(Gen* g, WStr target) {
     p.pos = pos;
     p.target = target;
     CallPatchVec_push(&g->call_patches, p);
+    g->patch_generation++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2409,6 +2418,25 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                                       ? AS_PTR(WType, type_ptr)
                                       : NULL;
                 uint32_t var_size = type_size(g, var_type);
+                /* Peephole: if an rax store to this exact slot was the last
+                 * emitted instruction and no patch was recorded since, the
+                 * load back into rax is redundant. Replace it with NOPs of
+                 * equal length so recorded patch positions stay valid. */
+                if (reg == 0 && access == 3 && var_size == 8 &&
+                    g->last_rax_store_len == 4 && g->last_rax_store_off == off &&
+                    g->last_rax_store_gen == g->patch_generation &&
+                    g->last_rax_store_pos + 4 == b->len &&
+                    b->data[g->last_rax_store_pos] == 0x48 &&
+                    b->data[g->last_rax_store_pos + 1] == 0x89 &&
+                    b->data[g->last_rax_store_pos + 2] == 0x45 &&
+                    b->data[g->last_rax_store_pos + 3] == (uint8_t)(-(int32_t)off)) {
+                    /* No load needed: rax still holds the stored value.
+                     * No patches were recorded since the store, so all
+                     * recorded positions are before this point and stay
+                     * valid when the 4-byte load is omitted. */
+                    g->last_rax_store_len = 0;
+                    break;
+                }
                 uint64_t is_param = 0;
                 map_get_str(&g->local_is_param, e->str, &is_param);
                 if (var_type && var_type->tag == 12 && !is_param) {
@@ -2542,7 +2570,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
         }
         case 6: /* MemberAccess */
         case 10: { /* Index */
-            compile_address(g, e, 1);
+            /* The load below uses (%rbx) directly, so keep the computed
+             * address in rbx and skip the dead mov %rbx,%rcx. */
+            compile_address(g, e, 3);
             WType* t = resolve_expr_type(g, e);
             if (t && t->tag == 12) {
                 if (reg == 0) {
@@ -2737,6 +2767,15 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 compile_float_to_xmm0(g, e->a);
                 emit_float_op_xmm0_mem(g, op, e->b->str);
                 emit_movq_xmm0_to_rax(b);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
+            if (float_op && e->a && e->b && e->a->tag == 3 && e->b->tag == 3 &&
+                wstr_eq(e->a->str, e->b->str) && emit_float_op_xmm1(NULL, op)) {
+                /* x op x: load once, copy to rbx; avoids a second stack load. */
+                compile_expr(g, e->a, 0, 0);
+                buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
+                emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
@@ -3807,7 +3846,14 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
                     }
                 } else {
                     uint32_t size = expr_size(g, target);
+                    size_t store_start = b->len;
                     emit_mem_store(b, 0, (uint32_t)off, size);
+                    if (size == 8 && access == 3) {
+                        g->last_rax_store_pos = store_start;
+                        g->last_rax_store_len = (uint32_t)(b->len - store_start);
+                        g->last_rax_store_off = (uint32_t)off;
+                        g->last_rax_store_gen = g->patch_generation;
+                    }
                 }
             } else {
                 WStr key = find_global_key(g, target->str);
@@ -3863,9 +3909,21 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
         }
         case 6: /* MemberAccess */
         case 10: { /* Index */
-            buf_u8(b, 0x50);
+            /* For simple indices, save rax in r10 instead of pushing it on
+             * the stack. compile_address uses only rbx/rax for simple
+             * operands, so r10 survives and no memory round-trip is needed. */
+            int use_r10 = target->tag == 10 && simple_left(g, target->b);
+            if (use_r10) {
+                buf_u8(b, 0x49); buf_u8(b, 0x89); buf_u8(b, 0xC2); /* mov %rax,%r10 */
+            } else {
+                buf_u8(b, 0x50); /* push %rax */
+            }
             compile_address(g, target, 3);
-            buf_u8(b, 0x58);
+            if (use_r10) {
+                buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
+            } else {
+                buf_u8(b, 0x58); /* pop %rax */
+            }
             uint32_t size = expr_size(g, target);
             switch (size) {
                 case 1: buf_u8(b, 0x88); buf_u8(b, 0x03); break;
