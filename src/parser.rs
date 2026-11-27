@@ -220,6 +220,11 @@ impl Parser {
             return Err(self.err("Program must start with sc.true or sc.false"));
         }
 
+        /* Top-level declarations are lowered into a synthetic section so the
+         * rest of the compiler sees them through the same data path as
+         * explicit `sect` variables.  They remain plain Wand declarations. */
+        let mut toplevel_vars = Vec::new();
+
         while self.current_token != Token::EOF {
             match &self.current_token {
                 Token::Import => {
@@ -532,11 +537,45 @@ impl Parser {
                     let func_decl = self.parse_function_signature()?;
                     program.functions.push(func_decl);
                 }
+                _ if self.starts_data_type() => {
+                    let var_type = self.parse_data_type()?;
+                    toplevel_vars.push(self.parse_var_decl_tail(var_type)?);
+                    if self.current_token == Token::Semicolon {
+                        self.step();
+                    }
+                }
                 _ => self.step(),
             }
         }
 
+        if !toplevel_vars.is_empty() {
+            program.sections.push(SectionDecl {
+                name: "__wand_global".to_string(),
+                variables: toplevel_vars,
+                alignment: 0,
+                is_ro: false,
+                is_noinit: false,
+            });
+        }
+
         Ok(program)
+    }
+
+    fn starts_data_type(&self) -> bool {
+        matches!(
+            self.current_token,
+            Token::TypeU8
+                | Token::TypeU16
+                | Token::TypeU32
+                | Token::TypeU64
+                | Token::TypeI8
+                | Token::TypeI16
+                | Token::TypeI32
+                | Token::TypeI64
+                | Token::TypeF64
+                | Token::TypeVoid
+                | Token::Ident(_)
+        )
     }
 
     pub fn seek_to_function(&mut self, name: &str) -> Result<(), ParseError> {
