@@ -4433,6 +4433,104 @@ static void collect_gpr_loop_locals(Gen* g, WStmt* s, RegLocalVec* out,
     }
 }
 
+/* True when name is a non-param pointer local that can safely live in r8 for
+ * one loop. Escaped locals are excluded because a pointer to the slot can
+ * desynchronize the register from the stack value. */
+static int invariant_pointer_bindable(Gen* g, WStr name) {
+    uint64_t off = 0, access = 3, is_param = 0, type_ptr = 0;
+    uint8_t bound = 0;
+    if (!name.ptr || !map_get_str(&g->locals, name, &off)) return 0;
+    map_get_str(&g->local_access, name, &access);
+    map_get_str(&g->local_is_param, name, &is_param);
+    if (access != 3 || is_param ||
+        map_has(&g->escaped_locals, name.ptr, name.len) ||
+        reg_local_lookup(g, name, &bound) || xmm_local_lookup(g, name, &bound)) {
+        return 0;
+    }
+    WType* t = map_get_str(&g->local_types, name, &type_ptr)
+                   ? AS_PTR(WType, type_ptr)
+                   : NULL;
+    t = peel_typedefs(t);
+    return t && t->tag == 10 && type_size(g, t) == 8;
+}
+
+static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found);
+
+static int expr_find_invariant_pointer_args(Gen* g, WExpr* e, WStr* found) {
+    if (!e) return 0;
+    for (size_t i = 0; i < e->arg_count; i++) {
+        if (expr_find_invariant_pointer(g, e->args[i], found)) return 1;
+    }
+    return 0;
+}
+
+/* Find a pointer local used as the base of an index or arrow access. */
+static int expr_find_invariant_pointer(Gen* g, WExpr* e, WStr* found) {
+    if (!e) return 0;
+    if ((e->tag == 10 || (e->tag == 6 && e->flag)) && e->a &&
+        e->a->tag == 3 && invariant_pointer_bindable(g, e->a->str)) {
+        *found = e->a->str;
+        return 1;
+    }
+    return expr_find_invariant_pointer(g, e->a, found) ||
+           expr_find_invariant_pointer(g, e->b, found) ||
+           expr_find_invariant_pointer_args(g, e, found);
+}
+
+static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found);
+
+static int stmt_find_invariant_pointer_tree(Gen* g, WStmt** v, size_t n,
+                                            WStr* found) {
+    for (size_t i = 0; i < n; i++) {
+        if (stmt_find_invariant_pointer(g, v[i], found)) return 1;
+    }
+    return 0;
+}
+
+static int stmt_find_invariant_pointer(Gen* g, WStmt* s, WStr* found) {
+    if (!s) return 0;
+    if (expr_find_invariant_pointer(g, s->e1, found) ||
+        expr_find_invariant_pointer(g, s->e2, found)) {
+        return 1;
+    }
+    for (size_t i = 0; i < s->expr_count; i++) {
+        if (expr_find_invariant_pointer(g, s->exprs[i], found)) return 1;
+    }
+    for (size_t i = 0; i < s->return_count; i++) {
+        if (expr_find_invariant_pointer(g, s->returns[i].expr, found)) return 1;
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        if (expr_find_invariant_pointer(g, s->cases[i].expr, found)) return 1;
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            if (stmt_find_invariant_pointer(g, s->cases[i].body[j], found)) return 1;
+        }
+    }
+    return stmt_find_invariant_pointer(g, s->s1, found) ||
+           stmt_find_invariant_pointer(g, s->s2, found) ||
+           stmt_find_invariant_pointer_tree(g, s->stmts1, s->stmt1_count, found) ||
+           stmt_find_invariant_pointer_tree(g, s->stmts2, s->stmt2_count, found);
+}
+
+static int stmt_has_nested_loop_tree(WStmt** v, size_t n);
+
+/* Bind one loop-invariant pointer base to r8. Only r8 is used so induction
+ * and accumulators keep their existing r11/r9 paths. Nested loops reserve r8
+ * for their own bindings, and calls or returns are handled by the existing
+ * loop safety scans at the call sites. */
+static int try_bind_invariant_pointer(Gen* g, WStmt** body, size_t body_count,
+                                      WStr* name) {
+    if (!body_count || reg_in_use(g, 8)) return 0;
+    if (stmt_has_nested_loop_tree(body, body_count)) return 0;
+    WStr found = {0};
+    if (!stmt_find_invariant_pointer_tree(g, body, body_count, &found)) return 0;
+    if (!invariant_pointer_bindable(g, found)) return 0;
+    for (size_t i = 0; i < body_count; i++) {
+        if (stmt_forbidden_reg_loop(g, body[i], found)) return 0;
+    }
+    *name = found;
+    return 1;
+}
+
 /* Write GPR-bound locals back to their stack slots. */
 static void spill_gpr_loop_locals(Gen* g, RegLocalVec* rs) {
     Buf* b = &g->code;
@@ -4767,7 +4865,13 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 }
                 uint64_t is_param = 0;
                 map_get_str(&g->local_is_param, e->str, &is_param);
-                int is_pointer = type && type->tag == 10;
+                WType* pointer_check = peel_typedefs(type);
+                int is_pointer = pointer_check && pointer_check->tag == 10;
+                uint8_t bound_reg = 0;
+                if (is_pointer && reg_local_lookup(g, e->str, &bound_reg)) {
+                    emit_mov_reg_to_reg(b, bound_reg, internal_reg);
+                    break;
+                }
                 /* An array-typed parameter is really a pointer passed by the
                  * caller, so its stack slot holds the address, not the array. */
                 int is_array = type && type->tag == 12 && !is_param;
@@ -5746,6 +5850,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
             if (!expr_has_call_deep(s->e1) &&
                 !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
                 uint8_t next_gpr = 8;
+                WStr ptr_name = {0};
+                if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
+                                               &ptr_name)) {
+                    RegLocal r = {0};
+                    r.name = ptr_name;
+                    r.reg = 8;
+                    RegLocalVec_push(&gpr_bindings, r);
+                    next_gpr = 9;
+                }
                 for (size_t i = 0; i < s->stmt1_count; i++) {
                     collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
                                             &next_gpr);
@@ -5819,6 +5932,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 (!s->s2 || !stmt_has_call_deep(s->s2)) &&
                 !stmt_unsafe_for_gpr_tree(s->stmts1, s->stmt1_count)) {
                 uint8_t next_gpr = 8;
+                WStr ptr_name = {0};
+                if (try_bind_invariant_pointer(g, s->stmts1, s->stmt1_count,
+                                               &ptr_name)) {
+                    RegLocal r = {0};
+                    r.name = ptr_name;
+                    r.reg = 8;
+                    RegLocalVec_push(&gpr_bindings, r);
+                    next_gpr = 9;
+                }
                 for (size_t i = 0; i < s->stmt1_count; i++) {
                     collect_gpr_loop_locals(g, s->stmts1[i], &gpr_bindings,
                                             &next_gpr);
