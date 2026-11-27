@@ -88,7 +88,7 @@ fn print_signed_number(i64 num) {
     }
 }
 
-fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) {
+fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7, u64 arg8) {
     u8* p*i = format;
     u8 active_char = 1;
     u64 arg_idx = 1;
@@ -104,18 +104,33 @@ fn printf(u8* format, u64 arg1, u64 arg2, u64 arg3) {
                     if (arg_idx == 1) { print_number(arg1); }
                     if (arg_idx == 2) { print_number(arg2); }
                     if (arg_idx == 3) { print_number(arg3); }
+                    if (arg_idx == 4) { print_number(arg4); }
+                    if (arg_idx == 5) { print_number(arg5); }
+                    if (arg_idx == 6) { print_number(arg6); }
+                    if (arg_idx == 7) { print_number(arg7); }
+                    if (arg_idx == 8) { print_number(arg8); }
                     arg_idx = arg_idx + 1;
                 } else {
                     if (active_char == 100) {
                         if (arg_idx == 1) { print_signed_number(arg1); }
                         if (arg_idx == 2) { print_signed_number(arg2); }
                         if (arg_idx == 3) { print_signed_number(arg3); }
+                        if (arg_idx == 4) { print_signed_number(arg4); }
+                        if (arg_idx == 5) { print_signed_number(arg5); }
+                        if (arg_idx == 6) { print_signed_number(arg6); }
+                        if (arg_idx == 7) { print_signed_number(arg7); }
+                        if (arg_idx == 8) { print_signed_number(arg8); }
                         arg_idx = arg_idx + 1;
                     } else {
                         if (active_char == 115) {
                             if (arg_idx == 1) { print_string(arg1); }
                             if (arg_idx == 2) { print_string(arg2); }
                             if (arg_idx == 3) { print_string(arg3); }
+                            if (arg_idx == 4) { print_string(arg4); }
+                            if (arg_idx == 5) { print_string(arg5); }
+                            if (arg_idx == 6) { print_string(arg6); }
+                            if (arg_idx == 7) { print_string(arg7); }
+                            if (arg_idx == 8) { print_string(arg8); }
                             arg_idx = arg_idx + 1;
                         } else {
                             print_char(37);
@@ -230,7 +245,7 @@ fn read_integer() {
     return(res * sign);
 }
 
-fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
+fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7, u64 arg8) -> i64 {
     if (size == 0) {
         return(0);
     }
@@ -263,6 +278,26 @@ fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
 
                 if (arg_idx == 3) {
                     s = arg3;
+                }
+
+                if (arg_idx == 4) {
+                    s = arg4;
+                }
+
+                if (arg_idx == 5) {
+                    s = arg5;
+                }
+
+                if (arg_idx == 6) {
+                    s = arg6;
+                }
+
+                if (arg_idx == 7) {
+                    s = arg7;
+                }
+
+                if (arg_idx == 8) {
+                    s = arg8;
                 }
 
                 arg_idx = arg_idx + 1;
@@ -308,6 +343,26 @@ fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
 
                     if (arg_idx == 3) {
                         num = arg3;
+                    }
+
+                    if (arg_idx == 4) {
+                        num = arg4;
+                    }
+
+                    if (arg_idx == 5) {
+                        num = arg5;
+                    }
+
+                    if (arg_idx == 6) {
+                        num = arg6;
+                    }
+
+                    if (arg_idx == 7) {
+                        num = arg7;
+                    }
+
+                    if (arg_idx == 8) {
+                        num = arg8;
                     }
 
                     arg_idx = arg_idx + 1;
@@ -359,6 +414,26 @@ fn snprintf(u8* buf, u64 size, u8* fmt, u64 arg1, u64 arg2, u64 arg3) -> i64 {
 
                         if (arg_idx == 3) {
                             num = arg3;
+                        }
+
+                        if (arg_idx == 4) {
+                            num = arg4;
+                        }
+
+                        if (arg_idx == 5) {
+                            num = arg5;
+                        }
+
+                        if (arg_idx == 6) {
+                            num = arg6;
+                        }
+
+                        if (arg_idx == 7) {
+                            num = arg7;
+                        }
+
+                        if (arg_idx == 8) {
+                            num = arg8;
                         }
 
                         arg_idx = arg_idx + 1;
