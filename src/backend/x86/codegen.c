@@ -958,10 +958,16 @@ typedef struct {
     uint8_t reg;
 } RegLocal;
 
+typedef struct {
+    WStr name;
+    uint8_t reg;
+} XmmLocal;
+
 DEFINE_VEC(AddrPatchVec, AddrPatch)
 DEFINE_VEC(CallPatchVec, CallPatch)
 DEFINE_VEC(LoopCtxVec, LoopCtx)
 DEFINE_VEC(RegLocalVec, RegLocal)
+DEFINE_VEC(XmmLocalVec, XmmLocal)
 DEFINE_VEC(LayoutVec, Layout)
 DEFINE_VEC(VolatileSetVec, VolatileSet)
 
@@ -1015,6 +1021,7 @@ struct Gen {
     size_t last_rax_store_gen; /* patch_generation at store time */
     LoopCtxVec loop_stack;
     RegLocalVec reg_locals; /* canonical loop induction variables kept in regs */
+    XmmLocalVec xmm_locals; /* f64 locals kept in XMM registers inside loops */
     size_t stack_depth;
     size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
@@ -1044,6 +1051,18 @@ static int reg_local_lookup(Gen* g, WStr name, uint8_t* reg) {
         RegLocal* r = &g->reg_locals.v[i - 1];
         if (wstr_eq(r->name, name)) {
             if (reg) *reg = r->reg;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Look up an f64 local currently kept in an XMM register. */
+static int xmm_local_lookup(Gen* g, WStr name, uint8_t* reg) {
+    for (size_t i = g->xmm_locals.n; i > 0; i--) {
+        XmmLocal* x = &g->xmm_locals.v[i - 1];
+        if (wstr_eq(x->name, name)) {
+            if (reg) *reg = x->reg;
             return 1;
         }
     }
@@ -1919,6 +1938,31 @@ static void emit_movq_gpr_to_xmm0(Buf* b, uint8_t gpr) {
     buf_u8(b, (uint8_t)(0xC0 | (gpr & 7)));
 }
 
+/* movapd %xmm0,%xmm<reg> including high registers. */
+static void emit_movapd_xmm0_to_xmm(Buf* b, uint8_t reg) {
+    if (!reg) return;
+    buf_u8(b, 0x66);
+    if (reg >= 8) buf_u8(b, 0x44);
+    buf_u8(b, 0x0F); buf_u8(b, 0x28);
+    buf_u8(b, (uint8_t)(0xC0 | ((reg & 7) << 3)));
+}
+
+/* movq %gpr,%xmm<reg> for 64-bit GPRs. */
+static void emit_movq_gpr_to_xmm(Buf* b, uint8_t gpr, uint8_t xmm) {
+    buf_u8(b, 0x66);
+    buf_u8(b, (uint8_t)(0x48 | (xmm >= 8 ? 4 : 0) | (gpr >= 8 ? 1 : 0)));
+    buf_u8(b, 0x0F); buf_u8(b, 0x6E);
+    buf_u8(b, (uint8_t)(0xC0 | ((xmm & 7) << 3) | (gpr & 7)));
+}
+
+/* movq %xmm<reg>,%gpr for 64-bit GPRs. */
+static void emit_movq_xmm_to_gpr(Buf* b, uint8_t xmm, uint8_t gpr) {
+    buf_u8(b, 0x66);
+    buf_u8(b, (uint8_t)(0x48 | (xmm >= 8 ? 4 : 0) | (gpr >= 8 ? 1 : 0)));
+    buf_u8(b, 0x0F); buf_u8(b, 0x7E);
+    buf_u8(b, (uint8_t)(0xC0 | ((xmm & 7) << 3) | (gpr & 7)));
+}
+
 /* movapd %xmm0,%xmm<reg> and the reverse, for XMM scratch copies. */
 static void emit_movapd_xmm0_to(Buf* b, uint8_t reg) {
     if (!reg) return;
@@ -1929,6 +1973,25 @@ static void emit_movapd_xmm0_to(Buf* b, uint8_t reg) {
 static void emit_movapd_to_xmm0(Buf* b, uint8_t reg) {
     if (!reg) return;
     buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28);
+    buf_u8(b, (uint8_t)(0xC0 | (reg & 7)));
+}
+
+/* movsd xmm<reg> -> stack slot. */
+static void emit_movsd_xmm_to_local(Buf* b, uint8_t reg, uint32_t off) {
+    buf_u8(b, 0xF2);
+    if (reg >= 8) buf_u8(b, 0x44);
+    buf_u8(b, 0x0F); buf_u8(b, 0x11);
+    buf_u8(b, (uint8_t)((off <= 127 ? 0x45 : 0x85) | ((reg & 7) << 3)));
+    if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+    else buf_u32(b, (uint32_t)(-(int32_t)off));
+}
+
+/* movapd xmm<reg> -> xmm0 and xmm0 -> xmm<reg> for high registers. */
+static void emit_movapd_xmm_to_xmm0(Buf* b, uint8_t reg) {
+    if (!reg) return;
+    buf_u8(b, 0x66);
+    if (reg >= 8) buf_u8(b, 0x41); /* REX.B extends the source rm field */
+    buf_u8(b, 0x0F); buf_u8(b, 0x28);
     buf_u8(b, (uint8_t)(0xC0 | (reg & 7)));
 }
 
@@ -2574,6 +2637,13 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                                       : NULL;
                 uint32_t var_size = type_size(g, var_type);
                 uint8_t bound_reg = 0;
+                uint8_t xmm_reg = 0;
+                if (var_type && is_float_type(var_type) && var_size == 8 &&
+                    xmm_local_lookup(g, e->str, &xmm_reg)) {
+                    if (reg == 0) emit_movapd_xmm_to_xmm0(b, xmm_reg);
+                    else emit_movq_xmm_to_gpr(b, xmm_reg, reg);
+                    break;
+                }
                 if (reg_local_lookup(g, e->str, &bound_reg) && access == 3 &&
                     var_size == 8) {
                     emit_mov_reg_to_reg(b, bound_reg, reg);
@@ -3009,9 +3079,26 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 map_get_str(&g->local_access, e->b->str, &access);
                 uint64_t off = 0;
                 uint8_t bound_reg = 0;
-                int is_bound = access == 3 && expr_size(g, e->b) == 8 &&
+                uint32_t rhs_size = expr_size(g, e->b);
+                int is_bound = access == 3 && rhs_size == 8 &&
                     reg_local_lookup(g, e->b->str, &bound_reg);
-                if (access == 3 && rax_only_expr(g, e->a) &&
+                if (access == 3 && rhs_size >= 1 && rhs_size < 8 &&
+                    rax_only_expr(g, e->a) &&
+                    map_get_str(&g->locals, e->b->str, &off) &&
+                    has_binary_imm(op)) {
+                    /* Narrow stack slots need an explicit zero/sign extension.
+                     * Preserve rbx because compile_address may already hold
+                     * an array base there when this expression is an index. */
+                    compile_expr(g, e->a, 0, 0);
+                    buf_u8(b, 0x53); /* push rbx */
+                    emit_mem_load(b, 3, (uint32_t)off, rhs_size,
+                                  is_signed_expr(g, e->b));
+                    emit_binary_rbx(b, op);
+                    buf_u8(b, 0x5B); /* pop rbx */
+                    if (reg != 0) move_rax_to_reg(b, reg);
+                    return;
+                }
+                if (access == 3 && rhs_size == 8 && rax_only_expr(g, e->a) &&
                     (is_bound || map_get_str(&g->locals, e->b->str, &off))) {
                     uint8_t opcode = 0;
                     if (wstr_eq_c(op, "OpAdd")) opcode = 0x03;
@@ -3764,7 +3851,12 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     if (e && e->tag == 3 && is_float_expr(g, e)) {
         uint64_t off = 0, access = 3;
         uint8_t bound_reg = 0;
+        uint8_t xmm_reg = 0;
         map_get_str(&g->local_access, e->str, &access);
+        if (xmm_local_lookup(g, e->str, &xmm_reg)) {
+            emit_movapd_xmm_to_xmm0(b, xmm_reg);
+            return;
+        }
         if (access == 3 && reg_local_lookup(g, e->str, &bound_reg)) {
             emit_movq_gpr_to_xmm0(b, bound_reg);
             return;
@@ -3795,10 +3887,11 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         e->b && e->b->tag == 3 && float_op_code(e->str) &&
         is_float_expr(g, e->b)) {
         uint64_t off = 0, access = 3;
-        uint8_t bound = 0;
+        uint8_t bound = 0, xmm_reg = 0;
         map_get_str(&g->locals, e->b->str, &off);
         map_get_str(&g->local_access, e->b->str, &access);
-        if (access == 3 && !reg_local_lookup(g, e->b->str, &bound)) {
+        if (access == 3 && !reg_local_lookup(g, e->b->str, &bound) &&
+            !xmm_local_lookup(g, e->b->str, &xmm_reg)) {
             emit_load_float_lit_xmm0(g, e->a->str);
             uint8_t code = (uint8_t)float_op_code(e->str);
             buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code);
@@ -3815,14 +3908,16 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         e->b && e->b->tag == 3 && float_op_code(e->str) &&
         is_float_expr(g, e->a) && is_float_expr(g, e->b)) {
         uint64_t offa = 0, offb = 0, acca = 3, accb = 3;
-        uint8_t bounda = 0, boundb = 0;
+        uint8_t bounda = 0, boundb = 0, xa = 0, xb = 0;
         map_get_str(&g->locals, e->a->str, &offa);
         map_get_str(&g->locals, e->b->str, &offb);
         map_get_str(&g->local_access, e->a->str, &acca);
         map_get_str(&g->local_access, e->b->str, &accb);
         if (acca == 3 && accb == 3 &&
             !reg_local_lookup(g, e->a->str, &bounda) &&
-            !reg_local_lookup(g, e->b->str, &boundb)) {
+            !reg_local_lookup(g, e->b->str, &boundb) &&
+            !xmm_local_lookup(g, e->a->str, &xa) &&
+            !xmm_local_lookup(g, e->b->str, &xb)) {
             if (offa <= 127) {
                 buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
                 buf_u8(b, 0x45); buf_u8(b, (uint8_t)(-(int32_t)offa));
@@ -3848,10 +3943,11 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         int lhs_in_scratch = 0;
         if (e->a->tag == 3 && is_float_expr(g, e->a)) {
             uint64_t off = 0, access = 3;
-            uint8_t bound = 0;
+            uint8_t bound = 0, xmm_reg = 0;
             map_get_str(&g->locals, e->a->str, &off);
             map_get_str(&g->local_access, e->a->str, &access);
-            if (access == 3 && !reg_local_lookup(g, e->a->str, &bound)) {
+            if (access == 3 && !reg_local_lookup(g, e->a->str, &bound) &&
+                !xmm_local_lookup(g, e->a->str, &xmm_reg)) {
                 /* movsd stack slot straight into the scratch register,
                  * skipping the xmm0 load and the movapd copy. */
                 buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
@@ -4022,6 +4118,76 @@ static int stmt_forbidden_reg_loop(Gen* g, WStmt* s, WStr name) {
         }
     }
     return 0;
+}
+
+/* True when e contains a call or takes the address of any local. Used to
+ * guard XMM register binding for f64 loop locals. */
+static int expr_unsafe_for_xmm(WExpr* e) {
+    if (!e) return 0;
+    if (e->tag == 9 || e->tag == 4) return 1;
+    return expr_unsafe_for_xmm(e->a) || expr_unsafe_for_xmm(e->b);
+}
+
+static int stmt_unsafe_for_xmm(WStmt* s);
+
+static int stmt_unsafe_for_xmm_tree(WStmt** v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (stmt_unsafe_for_xmm(v[i])) return 1;
+    }
+    return 0;
+}
+
+/* Scan a statement tree for anything that would make XMM binding unsafe. */
+static int stmt_unsafe_for_xmm(WStmt* s) {
+    if (!s) return 0;
+    if (s->tag == 3 || s->tag == 4 || s->tag == 5 || s->tag == 6 ||
+        s->tag == 8 || s->tag == 11 || s->tag == 12) return 1;
+    if (expr_unsafe_for_xmm(s->e1) || expr_unsafe_for_xmm(s->e2)) return 1;
+    for (size_t i = 0; i < s->expr_count; i++) {
+        if (expr_unsafe_for_xmm(s->exprs[i])) return 1;
+    }
+    for (size_t i = 0; i < s->case_count; i++) {
+        if (expr_unsafe_for_xmm(s->cases[i].expr)) return 1;
+        for (size_t j = 0; j < s->cases[i].body_count; j++) {
+            if (stmt_unsafe_for_xmm(s->cases[i].body[j])) return 1;
+        }
+    }
+    return stmt_unsafe_for_xmm(s->s1) || stmt_unsafe_for_xmm(s->s2) ||
+           stmt_unsafe_for_xmm_tree(s->stmts1, s->stmt1_count) ||
+           stmt_unsafe_for_xmm_tree(s->stmts2, s->stmt2_count);
+}
+
+/* Collect f64 VarDefinitions in a loop body for XMM register binding. */
+static void collect_xmm_loop_locals(Gen* g, WStmt* s, XmmLocalVec* out,
+                                    uint8_t* next_reg) {
+    if (!s || *next_reg > 15) return;
+    if (s->tag == 0 && s->type && is_float_type(s->type) &&
+        type_size(g, s->type) == 8 && s->access == 3 && s->name.ptr &&
+        s->e1) {
+        uint64_t existing = 0;
+        if (map_get_str(&g->locals, s->name, &existing)) return;
+        XmmLocal x = {0};
+        x.name = s->name;
+        x.reg = (*next_reg)++;
+        XmmLocalVec_push(out, x);
+    }
+    collect_xmm_loop_locals(g, s->s1, out, next_reg);
+    collect_xmm_loop_locals(g, s->s2, out, next_reg);
+    for (size_t i = 0; i < s->stmt1_count; i++)
+        collect_xmm_loop_locals(g, s->stmts1[i], out, next_reg);
+    for (size_t i = 0; i < s->stmt2_count; i++)
+        collect_xmm_loop_locals(g, s->stmts2[i], out, next_reg);
+}
+
+/* Write XMM-bound locals back to their stack slots. */
+static void spill_xmm_loop_locals(Gen* g, XmmLocalVec* xs) {
+    Buf* b = &g->code;
+    for (size_t i = 0; i < xs->n; i++) {
+        uint64_t off = 0;
+        if (map_get_str(&g->locals, xs->v[i].name, &off)) {
+            emit_movsd_xmm_to_local(b, xs->v[i].reg, (uint32_t)off);
+        }
+    }
 }
 
 /* Recognise a canonical for loop: i = constant literal, i < bound, i = i + 1.
@@ -4409,6 +4575,19 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
 /* True for an Index/MemberAccess whose declared type is f64. Such stores can
  * write xmm0 directly with movsd instead of round-tripping the bits through
  * rax and r10. */
+/* True when e is a plain f64 local currently bound to an XMM register. */
+static int is_xmm_bound_f64_local(Gen* g, WExpr* e, uint8_t* reg) {
+    if (!e || e->tag != 3 || !e->str.ptr) return 0;
+    uint64_t type_ptr = 0;
+    if (!map_get_str(&g->local_types, e->str, &type_ptr)) return 0;
+    WType* t = AS_PTR(WType, type_ptr);
+    if (!t || !is_float_type(t) || type_size(g, t) != 8) return 0;
+    uint8_t xmm_reg = 0;
+    if (!xmm_local_lookup(g, e->str, &xmm_reg)) return 0;
+    if (reg) *reg = xmm_reg;
+    return 1;
+}
+
 static int is_f64_store_target(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -4500,6 +4679,11 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
             uint64_t off;
             if (map_get_str(&g->locals, target->str, &off)) {
                 uint8_t bound_reg = 0;
+                uint8_t xmm_reg = 0;
+                if (is_xmm_bound_f64_local(g, target, &xmm_reg) && access == 3) {
+                    emit_movq_gpr_to_xmm(b, 0, xmm_reg);
+                    break;
+                }
                 if (reg_local_lookup(g, target->str, &bound_reg) && access == 3 &&
                     expr_size(g, target) == 8) {
                     emit_mov_reg_to_reg(b, 0, bound_reg);
@@ -4932,7 +5116,18 @@ static void compile_stmt(Gen* g, WStmt* s) {
             map_put_str(&g->local_types, s->name, PTR(s->type));
             if (s->e1) {
                 WType* vtype = s->type;
+                uint8_t xmm_reg = 0;
                 if (var_size == 8 && s->access == 3 && is_float_type(vtype) &&
+                    xmm_local_lookup(g, s->name, &xmm_reg)) {
+                    /* Keep f64 loop locals in an XMM register. */
+                    if (is_float_expr(g, s->e1)) {
+                        compile_float_to_xmm0(g, s->e1);
+                        emit_movapd_xmm0_to_xmm(b, xmm_reg);
+                    } else {
+                        compile_expr(g, s->e1, 0, 1);
+                        emit_movq_gpr_to_xmm(b, 0, xmm_reg);
+                    }
+                } else if (var_size == 8 && s->access == 3 && is_float_type(vtype) &&
                     is_float_expr(g, s->e1)) {
                     /* Store the f64 bit pattern straight from xmm0 instead of
                      * routing it through rax and emit_mem_store. */
@@ -4961,6 +5156,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 int local_addsub_var = !copied && !local_addsub &&
                     is_local_self_addsub_var(g, s->exprs[0], s->e1,
                                              &addsub_var, &addsub_var_sub);
+                uint8_t target_xmm = 0;
                 int direct_float_store =
                     !copied && is_f64_store_target(g, s->exprs[0]) &&
                     !is_volatile_member_expr(g, s->exprs[0]) &&
@@ -4996,6 +5192,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                         compile_expr(g, s->e1->b, 0, 0);
                     }
                     emit_mem_op(b, addsub_var_sub ? 0x29 : 0x01, 0, (uint32_t)off);
+                } else if (!copied && is_xmm_bound_f64_local(g, s->exprs[0], &target_xmm)) {
+                    /* Reassign an f64 local kept in an XMM register. The RHS
+                     * may read the same register; compile it before writing. */
+                    compile_float_to_xmm0(g, s->e1);
+                    emit_movapd_xmm0_to_xmm(b, target_xmm);
                 } else if (!copied && direct_float_store) {
                     /* Keep the f64 value in xmm0, compute the destination in
                      * rbx, and store with movsd. This removes the rax/r10
@@ -5133,6 +5334,24 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 rl.reg = loop_reg;
                 RegLocalVec_push(&g->reg_locals, rl);
             }
+            size_t xmm_base = g->xmm_locals.n;
+            int xmm_loop = 0;
+            XmmLocalVec xmm_bindings = {0};
+            if (!expr_unsafe_for_xmm(s->e1) &&
+                !stmt_unsafe_for_xmm(s->s2) &&
+                !stmt_unsafe_for_xmm_tree(s->stmts1, s->stmt1_count)) {
+                uint8_t next_xmm = 8;
+                for (size_t i = 0; i < s->stmt1_count; i++) {
+                    collect_xmm_loop_locals(g, s->stmts1[i], &xmm_bindings,
+                                            &next_xmm);
+                }
+                if (xmm_bindings.n) {
+                    for (size_t i = 0; i < xmm_bindings.n; i++) {
+                        XmmLocalVec_push(&g->xmm_locals, xmm_bindings.v[i]);
+                    }
+                    xmm_loop = 1;
+                }
+            }
             size_t loop_start = b->len;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
@@ -5153,6 +5372,10 @@ static void compile_stmt(Gen* g, WStmt* s) {
             if (reg_loop) {
                 emit_mov_reg_to_local(b, loop_reg, (uint32_t)loop_off);
                 g->reg_locals.n--;
+            }
+            if (xmm_loop) {
+                spill_xmm_loop_locals(g, &xmm_bindings);
+                g->xmm_locals.n = xmm_base;
             }
             patch_address(g, exit_patch, (int32_t)(b->len - (exit_patch + 4)));
             for (size_t i = 0; i < ctx.brk_n; i++) {
