@@ -1583,6 +1583,14 @@ fn optimize_lhs_expr_recursive(
     count
 }
 
+fn is_pointer_like(ty: &DataType) -> bool {
+    match ty {
+        DataType::Pointer(_) | DataType::Array(_, _) => true,
+        DataType::Typedef(_, inner) => is_pointer_like(inner),
+        _ => false,
+    }
+}
+
 fn optimize_statements(
     stmts: Vec<Stmt>,
     consts: &mut HashMap<String, Expr>,
@@ -1625,7 +1633,13 @@ fn optimize_statements(
                     let propagatable = !escaped.contains(&decl.name)
                         && !output_ptrs.contains(&decl.name)
                         && !is_mmio;
-                    if propagatable {
+                    /* A pointer local initialized from a differently typed
+                     * expression (for example `u8* p = ptr;` where ptr is a
+                     * u64) carries element-type information that the source
+                     * expression does not. Propagating it would turn p[i]
+                     * into ptr[i], making the backend scale by 8 and load a
+                     * full qword instead of one byte. */
+                    if propagatable && !is_pointer_like(&decl.data_type) {
                         if is_constant_expr(init) {
                             consts.insert(decl.name.clone(), *init.clone());
                         } else if env.single_assignment.contains(&decl.name) {

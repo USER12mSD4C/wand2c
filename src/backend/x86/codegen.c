@@ -2829,27 +2829,31 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 uint32_t size = expr_size(g, e);
                 WType* scalar = peel_typedefs(t);
                 int is_signed = scalar && scalar->tag >= 4 && scalar->tag <= 7;
-                uint8_t modrm = reg == 0 ? 0x03 : 0x1B;
+                uint8_t modrm = (uint8_t)(0x03 | ((reg & 7) << 3));
+                /* modrm puts the destination in the reg field, so an
+                 * extended destination needs REX.R as well as REX.W. */
+                uint8_t load_rex = reg >= 8 ? 0x4C : 0x48;
                 switch (size) {
                     case 1:
-                        buf_u8(b, 0x48); buf_u8(b, 0x0F);
+                        buf_u8(b, load_rex); buf_u8(b, 0x0F);
                         buf_u8(b, is_signed ? 0xBE : 0xB6);
                         buf_u8(b, modrm);
                         break;
                     case 2:
-                        buf_u8(b, 0x48); buf_u8(b, 0x0F);
+                        buf_u8(b, load_rex); buf_u8(b, 0x0F);
                         buf_u8(b, is_signed ? 0xBF : 0xB7);
                         buf_u8(b, modrm);
                         break;
                     case 4:
                         if (is_signed) {
-                            buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, modrm);
+                            buf_u8(b, load_rex); buf_u8(b, 0x63); buf_u8(b, modrm);
                         } else {
+                            if (reg >= 8) buf_u8(b, 0x44);
                             buf_u8(b, 0x8B); buf_u8(b, modrm);
                         }
                         break;
                     default:
-                        buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, modrm);
+                        buf_u8(b, load_rex); buf_u8(b, 0x8B); buf_u8(b, modrm);
                         break;
                 }
             }
@@ -3648,12 +3652,21 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
         switch (e->tag) {
             case 3: case 0: case 1: case 2: case 4: case 5: case 11:
                 break;
-            case 6: case 10: case 7:
-                if (reg != 3) {
+            case 6: case 10: {
+                /* Array member/index loads leave the computed address in
+                 * rbx. Scalar loads already used rbx as the load base and
+                 * wrote the value straight into reg, so only the array case
+                 * needs the extra move. */
+                WType* t = peel_typedefs(resolve_expr_type(g, e));
+                if (t && t->tag == 12 && reg != 3) {
                     buf_u8(b, reg >= 8 ? 0x49 : 0x48);
                     buf_u8(b, 0x89);
                     buf_u8(b, (uint8_t)(0xC0 | (3 << 3) | (reg & 7)));
                 }
+                break;
+            }
+            case 7:
+                /* SectionAccess already moved its loaded value into reg. */
                 break;
             case 8: case 9:
                 buf_u8(b, reg >= 8 ? 0x49 : 0x48);
@@ -4416,6 +4429,25 @@ static void compile_bool_expr(Gen* g, WExpr* e) {
     buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0);
 }
 
+/* True when compile_address() leaves the address of the base expression in
+ * the register instead of the pointer value it holds. An arrow access must
+ * load that pointer before adding the member offset. Plain pointer locals and
+ * parameters already load their value in compile_address(Variable), so they
+ * must not be loaded twice. */
+static int address_expr_needs_deref(WExpr* e) {
+    if (!e) {
+        return 0;
+    }
+    switch (e->tag) {
+        case 6: /* MemberAccess */
+        case 7: /* SectionAccess */
+        case 10: /* Index */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
     Buf* b = &g->code;
     uint8_t internal_reg = reg == 0 ? 0 : 3;
@@ -4512,15 +4544,11 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
         }
         case 6: { /* MemberAccess */
             compile_address(g, e->a, internal_reg);
-            if (e->flag) {
-                WType* base_type = peel_typedefs(resolve_expr_type(g, e->a));
-                int is_base_pointer = base_type && base_type->tag == 10;
-                if (!is_base_pointer) {
-                    if (internal_reg == 0) {
-                        buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x00);
-                    } else {
-                        buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B);
-                    }
+            if (e->flag && address_expr_needs_deref(e->a)) {
+                if (internal_reg == 0) {
+                    buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x00);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B);
                 }
             }
             WType* base = peel_typedefs(resolve_expr_type(g, e->a));
@@ -5311,6 +5339,10 @@ static void compile_stmt(Gen* g, WStmt* s) {
         }
         case 3: { /* While */
             size_t loop_start = b->len;
+            /* A backedge re-enters at loop_start without re-executing the
+             * store that fed the rax-store peephole. Never elide the
+             * condition's local load at a loop header. */
+            g->last_rax_store_len = 0;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
             ctx.match_depth = g->match_depth;
@@ -5369,6 +5401,9 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 }
             }
             size_t loop_start = b->len;
+            /* Same rax-store hazard as a while loop: the backedge jumps here
+             * directly, so the condition must always reload its locals. */
+            g->last_rax_store_len = 0;
             LoopCtx ctx;
             memset(&ctx, 0, sizeof(ctx));
             ctx.match_depth = g->match_depth;
