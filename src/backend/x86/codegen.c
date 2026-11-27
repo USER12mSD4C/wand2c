@@ -3845,8 +3845,27 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         (is_float_expr(g, e->a) || is_float_expr(g, e->b)) &&
         !expr_has_call(g, e->b) && scratch < 7) {
         int code = float_op_code(e->str);
-        compile_float_to_xmm0_s(g, e->a, (uint8_t)(scratch + 1));
-        emit_movapd_xmm0_to(b, scratch);
+        int lhs_in_scratch = 0;
+        if (e->a->tag == 3 && is_float_expr(g, e->a)) {
+            uint64_t off = 0, access = 3;
+            uint8_t bound = 0;
+            map_get_str(&g->locals, e->a->str, &off);
+            map_get_str(&g->local_access, e->a->str, &access);
+            if (access == 3 && !reg_local_lookup(g, e->a->str, &bound)) {
+                /* movsd stack slot straight into the scratch register,
+                 * skipping the xmm0 load and the movapd copy. */
+                buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+                buf_u8(b, (uint8_t)((off <= 127 ? 0x45 : 0x85) |
+                                    ((scratch & 7) << 3)));
+                if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+                else buf_u32(b, (uint32_t)(-(int32_t)off));
+                lhs_in_scratch = 1;
+            }
+        }
+        if (!lhs_in_scratch) {
+            compile_float_to_xmm0_s(g, e->a, (uint8_t)(scratch + 1));
+            emit_movapd_xmm0_to(b, scratch);
+        }
         compile_float_to_xmm0_s(g, e->b, (uint8_t)(scratch + 1));
         if (code == 0x5C || code == 0x5E) {
             buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
