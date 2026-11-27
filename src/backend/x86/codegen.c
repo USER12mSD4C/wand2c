@@ -1911,6 +1911,27 @@ static void emit_movq_xmm0_to_rax(Buf* b) {
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
 }
 
+/* movq %gpr,%xmm0 for 64-bit GPRs. */
+static void emit_movq_gpr_to_xmm0(Buf* b, uint8_t gpr) {
+    buf_u8(b, 0x66);
+    buf_u8(b, (uint8_t)(0x48 | (gpr >= 8 ? 1 : 0)));
+    buf_u8(b, 0x0F); buf_u8(b, 0x6E);
+    buf_u8(b, (uint8_t)(0xC0 | (gpr & 7)));
+}
+
+/* movapd %xmm0,%xmm<reg> and the reverse, for XMM scratch copies. */
+static void emit_movapd_xmm0_to(Buf* b, uint8_t reg) {
+    if (!reg) return;
+    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28);
+    buf_u8(b, (uint8_t)(0xC0 | ((reg & 7) << 3)));
+}
+
+static void emit_movapd_to_xmm0(Buf* b, uint8_t reg) {
+    if (!reg) return;
+    buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28);
+    buf_u8(b, (uint8_t)(0xC0 | (reg & 7)));
+}
+
 /* xmm0 = xmm0 <op> float literal. Caller ensures xmm0 holds the LHS bits.
  * The memory operand removes a separate constant load and its movq round trip. */
 static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
@@ -1930,7 +1951,7 @@ static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
 
 /* Compile a float expression so its bit pattern ends in xmm0. Chained binary
  * ops with literal RHS stay in xmm0, removing a movq round trip per link. */
-static void compile_float_to_xmm0(Gen* g, WExpr* e);
+static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch);
 
 /* The xmm1 scratch must survive evaluation of the RHS. A nested binary
  * expression may itself use xmm1 for its own float op, so only leaf-like
@@ -1965,7 +1986,7 @@ static int float_direct_safe(Gen* g, WExpr* e) {
 /* Compile a float binary op whose result is left in xmm0. Covers the two XMM
  * forms used by vector kernels: LHS op (RHS op2 literal) and LHS op literal.
  * Returns 0 when e needs a different codegen path. */
-static int compile_float_binary_to_xmm0(Gen* g, WExpr* e) {
+static int compile_float_binary_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     if (!e || e->tag != 8 || !float_op_code(e->str)) {
         return 0;
     }
@@ -1978,9 +1999,9 @@ static int compile_float_binary_to_xmm0(Gen* g, WExpr* e) {
     if (e->b && e->b->tag == 8 && e->b->b && e->b->b->tag == 11 &&
         float_op_code(e->b->str) && float_direct_safe(g, e->b)) {
         int code = float_op_code(op);
-        compile_float_to_xmm0(g, e->a);
+        compile_float_to_xmm0_s(g, e->a, scratch);
         buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xC8);
-        compile_float_to_xmm0(g, e->b->a);
+        compile_float_to_xmm0_s(g, e->b->a, scratch);
         emit_float_op_xmm0_mem(g, e->b->str, e->b->b->str);
         if (code == 0x5C || code == 0x5E) {
             buf_u8(b, 0x66); buf_u8(b, 0x0F); buf_u8(b, 0x28); buf_u8(b, 0xD0);
@@ -1995,11 +2016,15 @@ static int compile_float_binary_to_xmm0(Gen* g, WExpr* e) {
     }
 
     if (e->b && e->b->tag == 11) {
-        compile_float_to_xmm0(g, e->a);
+        compile_float_to_xmm0_s(g, e->a, scratch);
         emit_float_op_xmm0_mem(g, op, e->b->str);
         return 1;
     }
     return 0;
+}
+
+static int compile_float_binary_to_xmm0(Gen* g, WExpr* e) {
+    return compile_float_binary_to_xmm0_s(g, e, 3);
 }
 
 /* Start a float op with the LHS bit pattern already in rax: stash it in xmm1
@@ -3708,15 +3733,64 @@ static int compile_f64_index_to_xmm0(Gen* g, WExpr* e) {
 /* Compile e leaving its f64 bit pattern in xmm0. Binary ops with a literal
  * RHS recurse so a chain such as a * 0.5 + 1.0 keeps the value in xmm0
  * between links instead of round-tripping through rax. */
-static void compile_float_to_xmm0(Gen* g, WExpr* e) {
+static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     Buf* b = &g->code;
-    if (compile_float_binary_to_xmm0(g, e)) {
+    if (compile_float_binary_to_xmm0_s(g, e, scratch)) {
         return;
     }
     if (e && e->tag == 8 && e->b && e->b->tag == 11 &&
         float_op_code(e->str) && (is_float_expr(g, e->a) || is_float_expr(g, e->b))) {
-        compile_float_to_xmm0(g, e->a);
+        compile_float_to_xmm0_s(g, e->a, scratch);
         emit_float_op_xmm0_mem(g, e->str, e->b->str);
+        return;
+    }
+    /* Plain f64 stack slot: movsd straight into xmm0, skipping the rax and
+     * movq round trip. Register-bound slots come from a GPR instead. */
+    if (e && e->tag == 3 && is_float_expr(g, e)) {
+        uint64_t off = 0, access = 3;
+        uint8_t bound_reg = 0;
+        map_get_str(&g->local_access, e->str, &access);
+        if (access == 3 && reg_local_lookup(g, e->str, &bound_reg)) {
+            emit_movq_gpr_to_xmm0(b, bound_reg);
+            return;
+        }
+        if (access == 3 && map_get_str(&g->locals, e->str, &off)) {
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
+            buf_u8(b, off <= 127 ? 0x45 : 0x85);
+            if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
+            else buf_u32(b, (uint32_t)(-(int32_t)off));
+            return;
+        }
+    }
+    /* x op x: load once and apply the op to xmm0 itself. Avoids a second
+     * stack load and the scratch copy. Limited to commutative ops. */
+    if (e && e->tag == 8 && e->a && e->b && e->a->tag == 3 && e->b->tag == 3 &&
+        wstr_eq(e->a->str, e->b->str) && is_float_expr(g, e->a) &&
+        (wstr_eq_c(e->str, "OpAdd") || wstr_eq_c(e->str, "OpMul"))) {
+        compile_float_to_xmm0_s(g, e->a, scratch);
+        buf_u8(b, 0xF2); buf_u8(b, 0x0F);
+        buf_u8(b, wstr_eq_c(e->str, "OpAdd") ? 0x58 : 0x59);
+        buf_u8(b, 0xC0);
+        return;
+    }
+    /* General f64 binary op: keep both operands in XMM registers. The
+     * scratch copy holds the LHS while the RHS is compiled recursively;
+     * each nesting level uses a higher register so nested ops are safe. */
+    if (e && e->tag == 8 && e->a && e->b && float_op_code(e->str) &&
+        (is_float_expr(g, e->a) || is_float_expr(g, e->b)) &&
+        scratch < 7) {
+        int code = float_op_code(e->str);
+        compile_float_to_xmm0_s(g, e->a, (uint8_t)(scratch + 1));
+        emit_movapd_xmm0_to(b, scratch);
+        compile_float_to_xmm0_s(g, e->b, (uint8_t)(scratch + 1));
+        if (code == 0x5C || code == 0x5E) {
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+            buf_u8(b, (uint8_t)(0xC0 | ((scratch & 7) << 3)));
+            emit_movapd_to_xmm0(b, scratch);
+        } else {
+            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code);
+            buf_u8(b, (uint8_t)(0xC0 | (scratch & 7)));
+        }
         return;
     }
     if (e && e->tag == 8 && wstr_eq_c(e->str, "OpCastF64") && e->a &&
@@ -3732,6 +3806,10 @@ static void compile_float_to_xmm0(Gen* g, WExpr* e) {
     }
     compile_expr(g, e, 0, 0);
     emit_movq_rax_to_xmm0(b);
+}
+
+static void compile_float_to_xmm0(Gen* g, WExpr* e) {
+    compile_float_to_xmm0_s(g, e, 3);
 }
 
 /* True when compiling e into rax cannot clobber rbx. This holds for plain
