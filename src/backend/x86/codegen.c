@@ -1235,19 +1235,6 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
 
 /* movsd xmm<N>, [rip+key] — loads a float constant in one instruction
  * instead of lea/movsd/movq through rax. */
-static void emit_rip_relative_movsd(Gen* g, uint8_t xmm, WStr key) {
-    Buf* b = &g->code;
-    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10);
-    buf_u8(b, (uint8_t)(0x05 | ((xmm & 7) << 3)));
-    size_t pos = b->len;
-    buf_u32(b, 0);
-    AddrPatch p;
-    p.pos = pos;
-    p.key = key;
-    p.is_rip = 1;
-    AddrPatchVec_push(&g->address_patches, p);
-}
-
 static void emit_function_epilogue(Gen* g) {
     Buf* b = &g->code;
     if (g->current_is_irq) {
@@ -1602,8 +1589,27 @@ static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth) {
         }
         case 8: {
             if (wstr_eq_c(e->str, "OpCastF64") || wstr_eq_c(e->str, "OpCastInt") ||
-                wstr_eq_c(e->str, "OpCast")) {
+                wstr_eq_c(e->str, "OpCast") || wstr_eq_c(e->str, "OpCastU64") ||
+                wstr_eq_c(e->str, "OpCastI64")) {
                 return eval_const_depth(g, e->a, depth + 1);
+            }
+            if (wstr_eq_c(e->str, "OpCastU8")) {
+                return eval_const_depth(g, e->a, depth + 1) & 0xFFu;
+            }
+            if (wstr_eq_c(e->str, "OpCastU16")) {
+                return eval_const_depth(g, e->a, depth + 1) & 0xFFFFu;
+            }
+            if (wstr_eq_c(e->str, "OpCastU32")) {
+                return eval_const_depth(g, e->a, depth + 1) & 0xFFFFFFFFu;
+            }
+            if (wstr_eq_c(e->str, "OpCastI8")) {
+                return (uint64_t)(int64_t)(int8_t)eval_const_depth(g, e->a, depth + 1);
+            }
+            if (wstr_eq_c(e->str, "OpCastI16")) {
+                return (uint64_t)(int64_t)(int16_t)eval_const_depth(g, e->a, depth + 1);
+            }
+            if (wstr_eq_c(e->str, "OpCastI32")) {
+                return (uint64_t)(int64_t)(int32_t)eval_const_depth(g, e->a, depth + 1);
             }
             if (wstr_eq_c(e->str, "OpBitNot")) {
                 return ~eval_const_depth(g, e->a, depth + 1);
@@ -1785,14 +1791,21 @@ static int emit_binary_imm(Buf* b, WStr op, int64_t imm) {
     return 1;
 }
 
+/* Return the SSE opcode for a floating-point binary operator. */
+static int float_op_code(WStr op) {
+    if (wstr_eq_c(op, "OpAdd")) return 0x58;
+    if (wstr_eq_c(op, "OpSub")) return 0x5C;
+    if (wstr_eq_c(op, "OpMul")) return 0x59;
+    if (wstr_eq_c(op, "OpDiv")) return 0x5E;
+    return 0;
+}
+
 /* xmm0 = xmm0 <float op> xmm1 for the four ops with float sequences. */
 static int emit_float_op_xmm1(Buf* b, WStr op) {
-    uint8_t code;
-    if (wstr_eq_c(op, "OpAdd")) code = 0x58;
-    else if (wstr_eq_c(op, "OpSub")) code = 0x5C;
-    else if (wstr_eq_c(op, "OpMul")) code = 0x59;
-    else if (wstr_eq_c(op, "OpDiv")) code = 0x5E;
-    else return 0;
+    int code = float_op_code(op);
+    if (!code) {
+        return 0;
+    }
     if (b) {
         /* movq %rax,%xmm0 ; movq %rbx,%xmm1 ; <op>sd %xmm1,%xmm0 ;
          * movq %xmm0,%rax */
@@ -1800,11 +1813,40 @@ static int emit_float_op_xmm1(Buf* b, WStr op) {
                                        0x66,0x48,0x0F,0x6E,0xCB};
         static const uint8_t tail[] = {0x66,0x48,0x0F,0x7E,0xC0};
         buf_bytes(b, head, sizeof(head));
-        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, code); buf_u8(b, 0xC1);
+        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code); buf_u8(b, 0xC1);
         buf_bytes(b, tail, sizeof(tail));
     }
     return 1;
 }
+
+/* Move f64 bit patterns between rax and xmm0. */
+static void emit_movq_rax_to_xmm0(Buf* b) {
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC0);
+}
+
+static void emit_movq_xmm0_to_rax(Buf* b) {
+    buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
+}
+
+/* xmm0 = xmm0 <op> float literal. Caller ensures xmm0 holds the LHS bits.
+ * The memory operand removes a separate constant load and its movq round trip. */
+static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
+    Buf* b = &g->code;
+    int code = float_op_code(op);
+    WStr key = wstr_prefix("float:", lit);
+    buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, (uint8_t)code); buf_u8(b, 0x05);
+    size_t pos = b->len;
+    buf_u32(b, 0);
+    AddrPatch p;
+    p.pos = pos;
+    p.key = key;
+    p.is_rip = 1;
+    AddrPatchVec_push(&g->address_patches, p);
+}
+
+/* Compile a float expression so its bit pattern ends in xmm0. Chained binary
+ * ops with literal RHS stay in xmm0, removing a movq round trip per link. */
+static void compile_float_to_xmm0(Gen* g, WExpr* e);
 
 /* The xmm1 scratch must survive evaluation of the RHS. A nested binary
  * expression may itself use xmm1 for its own float op, so only leaf-like
@@ -2323,12 +2365,17 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             return;
         }
         case 11: {
-            WStr key = wstr_prefix("float:", e->str);
-            /* movsd float:key(%rip),%xmm0 ; movq %xmm0,%rax — one fewer
-             * instruction than lea/movsd/movq through rax. */
-            emit_rip_relative_movsd(g, 0, key);
-            buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
-            move_rax_to_reg(b, reg);
+            /* f64 values travel as bit patterns in a GPR. Materialize the
+             * literal directly instead of loading it into xmm and moving the
+             * bits back to rax. setup_program() uses the same strtod parse,
+             * so the emitted bits are identical. */
+            char* text = (char*)arena_alloc(g_arena, e->str.len + 1);
+            memcpy(text, e->str.ptr, e->str.len);
+            text[e->str.len] = '\0';
+            double value = strtod(text, NULL);
+            uint64_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            emit_mov_imm64(b, reg, bits);
             break;
         }
         case 3: { /* Variable */
@@ -2601,6 +2648,34 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 }
                 return;
             }
+            /* Integer casts now carry the target width in the op name.
+             * Narrow unsigned casts zero-extend; narrow signed casts sign-
+             * extend. This fixes (u64)(u32)x for negative x, which used to
+             * keep the sign extension from the i32 load. */
+            if (wstr_eq_c(op, "OpCastU8") || wstr_eq_c(op, "OpCastU16") ||
+                wstr_eq_c(op, "OpCastU32") || wstr_eq_c(op, "OpCastI8") ||
+                wstr_eq_c(op, "OpCastI16") || wstr_eq_c(op, "OpCastI32")) {
+                compile_expr(g, e->a, 0, deref_ptr);
+                if (wstr_eq_c(op, "OpCastU8")) {
+                    buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0); /* movzx eax, al */
+                } else if (wstr_eq_c(op, "OpCastU16")) {
+                    buf_u8(b, 0x0F); buf_u8(b, 0xB7); buf_u8(b, 0xC0); /* movzx eax, ax */
+                } else if (wstr_eq_c(op, "OpCastU32")) {
+                    buf_u8(b, 0x89); buf_u8(b, 0xC0); /* mov eax, eax */
+                } else if (wstr_eq_c(op, "OpCastI8")) {
+                    buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xBE); buf_u8(b, 0xC0);
+                } else if (wstr_eq_c(op, "OpCastI16")) {
+                    buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xBF); buf_u8(b, 0xC0);
+                } else {
+                    buf_u8(b, 0x48); buf_u8(b, 0x63); buf_u8(b, 0xC0); /* movslq eax, rax */
+                }
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
+            if (wstr_eq_c(op, "OpCastU64") || wstr_eq_c(op, "OpCastI64")) {
+                compile_expr(g, e->a, reg, deref_ptr);
+                return;
+            }
             if (wstr_eq_c(op, "OpCast")) {
                 compile_expr(g, e->a, reg, deref_ptr);
                 return;
@@ -2612,6 +2687,13 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            if (float_op && e->b && e->b->tag == 11 && float_op_code(op)) {
+                compile_float_to_xmm0(g, e->a);
+                emit_float_op_xmm0_mem(g, op, e->b->str);
+                emit_movq_xmm0_to_rax(b);
+                if (reg != 0) move_rax_to_reg(b, reg);
+                return;
+            }
             if (float_op && simple_left(g, e->a) && emit_float_op_xmm1(NULL, op)) {
                 /* Same shuffle removal as the integer path: evaluate the RHS
                  * straight into rbx, then the simple LHS into rax. */
@@ -3326,6 +3408,29 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
     }
 }
 
+/* Compile e leaving its f64 bit pattern in xmm0. Binary ops with a literal
+ * RHS recurse so a chain such as a * 0.5 + 1.0 keeps the value in xmm0
+ * between links instead of round-tripping through rax. */
+static void compile_float_to_xmm0(Gen* g, WExpr* e) {
+    Buf* b = &g->code;
+    if (e && e->tag == 8 && e->b && e->b->tag == 11 &&
+        float_op_code(e->str) && (is_float_expr(g, e->a) || is_float_expr(g, e->b))) {
+        compile_float_to_xmm0(g, e->a);
+        emit_float_op_xmm0_mem(g, e->str, e->b->str);
+        return;
+    }
+    if (e && e->tag == 8 && wstr_eq_c(e->str, "OpCastF64") && e->a &&
+        !is_float_expr(g, e->a)) {
+        /* Integer to f64: convert straight into xmm0, skipping the movq
+         * round trip that the generic rax-based cast emits. */
+        compile_expr(g, e->a, 0, 0);
+        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        return;
+    }
+    compile_expr(g, e, 0, 0);
+    emit_movq_rax_to_xmm0(b);
+}
+
 /* True when e can be compiled into rax without touching rbx.  Lets the caller
  * evaluate the RHS into rbx first, removing the push/pop stack shuffle. */
 static int simple_left(Gen* g, WExpr* e) {
@@ -3499,31 +3604,35 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
              * an lvalue so pointer parameters and local pointer variables stay
              * pointers. compile_expr(..., deref_ptr=1) used to load the first
              * element here, turning a[j] into a[0][j]. */
+            int index_simple = simple_left(g, e->b);
             compile_address(g, e->a, 3);
-            buf_u8(b, 0x53);
+            if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
             compile_expr(g, e->b, 0, 1);
+
+            /* lea rbx, [rbx + rax * scale] replaces shift plus add for the
+             * common element widths. SIB base=rbx (3), index=rax (0), and
+             * scale bits encode 1, 2, 4, or 8. */
+            int scale_bits = -1;
             switch (elem_size) {
-                case 1:
-                    break;
-                case 2:
-                    buf_u8(b, 0x48); buf_u8(b, 0xC1); buf_u8(b, 0xE0); buf_u8(b, 0x01);
-                    break;
-                case 4:
-                    buf_u8(b, 0x48); buf_u8(b, 0xC1); buf_u8(b, 0xE0); buf_u8(b, 0x02);
-                    break;
-                case 8:
-                    buf_u8(b, 0x48); buf_u8(b, 0xC1); buf_u8(b, 0xE0); buf_u8(b, 0x03);
-                    break;
-                default:
-                    /* imul rax, rax, imm32 is REX.W 69 C0 imm32; the old
-                     * 0F 69 prefix decoded as punpckhwd and corrupted the
-                     * instruction stream for struct arrays. */
-                    buf_u8(b, 0x48); buf_u8(b, 0x69); buf_u8(b, 0xC0);
-                    buf_u32(b, elem_size);
-                    break;
+                case 1: scale_bits = 0; break;
+                case 2: scale_bits = 1; break;
+                case 4: scale_bits = 2; break;
+                case 8: scale_bits = 3; break;
+                default: break;
             }
-            buf_u8(b, 0x5B);
-            buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xC3);
+            if (scale_bits >= 0) {
+                if (!index_simple) buf_u8(b, 0x5B); /* pop rbx */
+                buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x1C);
+                buf_u8(b, (uint8_t)((scale_bits << 6) | 0x03));
+            } else {
+                /* imul rax, rax, imm32 is REX.W 69 C0 imm32; the old
+                 * 0F 69 prefix decoded as punpckhwd and corrupted the
+                 * instruction stream for struct arrays. */
+                buf_u8(b, 0x48); buf_u8(b, 0x69); buf_u8(b, 0xC0);
+                buf_u32(b, elem_size);
+                if (!index_simple) buf_u8(b, 0x5B); /* pop rbx */
+                buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xC3);
+            }
             if (internal_reg == 0) {
                 buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xD8);
             }
