@@ -3989,9 +3989,11 @@ static int is_f64_store_target(Gen* g, WExpr* e) {
     return t && t->tag == 8;
 }
 
-/* Recognise x = x + 1 or x = x - 1 on a plain 64-bit stack slot. The
- * caller can replace the load/add/store sequence with a single incq/decq. */
-static int is_local_self_incdec(Gen* g, WExpr* target, WExpr* e, uint8_t* opreg) {
+/* Recognise x = x + imm or x = x - imm on a plain 64-bit stack slot. The
+ * caller replaces the load/op/store sequence with one incq, decq, addq, or
+ * subq memory instruction. op: 0=inc, 1=dec, 2=add imm, 3=sub imm. */
+static int is_local_self_addsub(Gen* g, WExpr* target, WExpr* e,
+                                uint8_t* op, int64_t* imm) {
     if (!target || target->tag != 3 || !e || e->tag != 8) {
         return 0;
     }
@@ -4000,7 +4002,7 @@ static int is_local_self_incdec(Gen* g, WExpr* target, WExpr* e, uint8_t* opreg)
     if (!is_add && !is_sub) {
         return 0;
     }
-    if (!e->b || e->b->tag != 0 || e->b->num != 1) {
+    if (!e->b || e->b->tag != 0) {
         return 0;
     }
     if (!e->a || e->a->tag != 3 || !wstr_eq(e->a->str, target->str)) {
@@ -4015,7 +4017,25 @@ static int is_local_self_incdec(Gen* g, WExpr* target, WExpr* e, uint8_t* opreg)
     if (expr_size(g, target) != 8 || is_float_expr(g, target)) {
         return 0;
     }
-    *opreg = is_add ? 0 : 1; /* FF /0 = incq, FF /1 = decq */
+    int64_t sv = (int64_t)e->b->num;
+    if (sv < INT32_MIN || sv > INT32_MAX) {
+        return 0;
+    }
+    int64_t delta = is_add ? sv : -sv;
+    if (delta == 0) {
+        return 0;
+    }
+    int negate = delta < 0;
+    if (negate) delta = -delta;
+    if (delta > INT32_MAX) {
+        return 0;
+    }
+    if (delta == 1) {
+        *op = negate ? 1 : 0;
+    } else {
+        *op = negate ? 3 : 2;
+        *imm = delta;
+    }
     return 1;
 }
 
@@ -4464,17 +4484,30 @@ static void compile_stmt(Gen* g, WStmt* s) {
         case 1: { /* Assignment */
             if (s->expr_count == 1) {
                 int copied = try_compile_string_copy_to_u8_array(g, s->exprs[0], s->e1);
-                uint8_t incdec_reg = 0;
-                int local_incdec = !copied &&
-                    is_local_self_incdec(g, s->exprs[0], s->e1, &incdec_reg);
+                uint8_t addsub_op = 0;
+                int64_t addsub_imm = 0;
+                int local_addsub = !copied &&
+                    is_local_self_addsub(g, s->exprs[0], s->e1,
+                                         &addsub_op, &addsub_imm);
                 int direct_float_store =
                     !copied && is_f64_store_target(g, s->exprs[0]) &&
                     !is_volatile_member_expr(g, s->exprs[0]) &&
                     is_float_expr(g, s->e1);
-                if (local_incdec) {
+                if (local_addsub) {
                     uint64_t off = 0;
                     map_get_str(&g->locals, s->exprs[0]->str, &off);
-                    emit_mem_op(b, 0xFF, incdec_reg, (uint32_t)off);
+                    if (addsub_op < 2) {
+                        emit_mem_op(b, 0xFF, addsub_op, (uint32_t)off);
+                    } else {
+                        uint8_t group = addsub_op == 2 ? 0 : 5;
+                        if (addsub_imm <= 127) {
+                            emit_mem_op(b, 0x83, group, (uint32_t)off);
+                            buf_u8(b, (uint8_t)addsub_imm);
+                        } else {
+                            emit_mem_op(b, 0x81, group, (uint32_t)off);
+                            buf_u32(b, (uint32_t)addsub_imm);
+                        }
+                    }
                 } else if (!copied && direct_float_store) {
                     /* Keep the f64 value in xmm0, compute the destination in
                      * rbx, and store with movsd. This removes the rax/r10
