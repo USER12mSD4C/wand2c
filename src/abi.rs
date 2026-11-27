@@ -978,10 +978,16 @@ pub fn generate_wexp_image(
         builder.add_import(name, &import_module(name, program), 1, 0);
     }
 
+    let func_addr_patches = gen
+        .addr_patches
+        .iter()
+        .filter(|(_, key, is_rip)| *is_rip && key.starts_with("fn:"))
+        .count();
     let mut relocs = Vec::with_capacity(
-        gen.call_patches.len()
+        (gen.call_patches.len()
             + gen.addr_patches.iter().filter(|(_, _, is_rip)| !*is_rip).count()
-                * WEXP_RELOC_ENTRY_SIZE,
+            + func_addr_patches)
+            * WEXP_RELOC_ENTRY_SIZE,
     );
     for (pos, name) in &gen.call_patches {
         if gen.function_offsets.contains_key(name) {
@@ -993,8 +999,15 @@ pub fn generate_wexp_image(
         relocs.extend_from_slice(&name_off.to_le_bytes());
         relocs.extend_from_slice(&(-4i64).to_le_bytes());
     }
-    for (pos, _key, is_rip) in &gen.addr_patches {
+    for (pos, key, is_rip) in &gen.addr_patches {
         if *is_rip {
+            if let Some(name) = key.strip_prefix("fn:") {
+                let name_off = builder.strtab.insert(name);
+                relocs.extend_from_slice(&(*pos as u64).to_le_bytes());
+                relocs.extend_from_slice(&WEXP_RELOC_PC32.to_le_bytes());
+                relocs.extend_from_slice(&name_off.to_le_bytes());
+                relocs.extend_from_slice(&(-4i64).to_le_bytes());
+            }
             continue;
         }
         let target = read_u64_at(payload_bytes, *pos);

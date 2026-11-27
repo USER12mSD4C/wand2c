@@ -1036,6 +1036,8 @@ struct Gen {
 static WStr wstr_pair(WStr a, WStr b);
 static WStr find_global_key(Gen* g, WStr name);
 static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth);
+static int is_signed_expr(Gen* g, WExpr* e);
+static int expr_has_call_deep(WExpr* e);
 static void compile_stmt(Gen* g, WStmt* s);
 static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr);
 static void compile_address(Gen* g, WExpr* e, uint8_t reg);
@@ -1692,6 +1694,16 @@ static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth) {
         case 0:
         case 1:
             return e->num;
+        case 11: {
+            if (!e->str.ptr) return 0;
+            char* text = (char*)arena_alloc(g_arena, e->str.len + 1);
+            memcpy(text, e->str.ptr, e->str.len);
+            text[e->str.len] = '\0';
+            double value = strtod(text, NULL);
+            uint64_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            return bits;
+        }
         case 13:
             return 0;
         case 3: {
@@ -1740,26 +1752,40 @@ static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth) {
             uint64_t a = eval_const_depth(g, e->a, depth + 1);
             uint64_t b = eval_const_depth(g, e->b, depth + 1);
             WStr op = e->str;
+            int sgn = is_signed_expr(g, e);
+            int64_t sa = (int64_t)a, sb = (int64_t)b;
             if (wstr_eq_c(op, "OpAdd")) return a + b;
             if (wstr_eq_c(op, "OpSub")) return a - b;
             if (wstr_eq_c(op, "OpMul")) return a * b;
-            if (wstr_eq_c(op, "OpDiv")) return b ? a / b : 0;
-            if (wstr_eq_c(op, "OpMod")) return b ? a % b : 0;
+            if (wstr_eq_c(op, "OpDiv")) {
+                if (!b) return 0;
+                if (!sgn) return a / b;
+                if (sa == INT64_MIN && sb == -1) return (uint64_t)INT64_MIN;
+                return (uint64_t)(sa / sb);
+            }
+            if (wstr_eq_c(op, "OpMod")) {
+                if (!b) return 0;
+                if (!sgn) return a % b;
+                if (sa == INT64_MIN && sb == -1) return 0;
+                return (uint64_t)(sa % sb);
+            }
             if (wstr_eq_c(op, "OpBitAnd")) return a & b;
             if (wstr_eq_c(op, "OpBitOr")) return a | b;
             if (wstr_eq_c(op, "OpBitXor")) return a ^ b;
             if (wstr_eq_c(op, "OpShl")) return a << (b & 63);
-            if (wstr_eq_c(op, "OpShr")) return a >> (b & 63);
+            if (wstr_eq_c(op, "OpShr")) return sgn ? (uint64_t)(sa >> (b & 63)) : a >> (b & 63);
             if (wstr_eq_c(op, "OpEq") || wstr_eq_c(op, "OpEqEq") || wstr_eq_c(op, "=="))
                 return a == b;
             if (wstr_eq_c(op, "OpNotEq") || wstr_eq_c(op, "OpNe") || wstr_eq_c(op, "!="))
                 return a != b;
-            if (wstr_eq_c(op, "OpLt") || wstr_eq_c(op, "Lt") || wstr_eq_c(op, "<")) return a < b;
+            if (wstr_eq_c(op, "OpLt") || wstr_eq_c(op, "Lt") || wstr_eq_c(op, "<"))
+                return sgn ? sa < sb : a < b;
             if (wstr_eq_c(op, "OpLtEq") || wstr_eq_c(op, "OpLe") || wstr_eq_c(op, "<="))
-                return a <= b;
-            if (wstr_eq_c(op, "OpGt") || wstr_eq_c(op, "Gt") || wstr_eq_c(op, ">")) return a > b;
+                return sgn ? sa <= sb : a <= b;
+            if (wstr_eq_c(op, "OpGt") || wstr_eq_c(op, "Gt") || wstr_eq_c(op, ">"))
+                return sgn ? sa > sb : a > b;
             if (wstr_eq_c(op, "OpGtEq") || wstr_eq_c(op, "OpGe") || wstr_eq_c(op, ">="))
-                return a >= b;
+                return sgn ? sa >= sb : a >= b;
             if (wstr_eq_c(op, "OpAnd") || wstr_eq_c(op, "&&")) return a != 0 && b != 0;
             if (wstr_eq_c(op, "OpOr") || wstr_eq_c(op, "||")) return a != 0 || b != 0;
             return 0;
@@ -2061,14 +2087,13 @@ static void emit_load_float_lit_xmm0(Gen* g, WStr lit) {
  * ops with literal RHS stay in xmm0, removing a movq round trip per link. */
 static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch);
 
-/* The xmm1 scratch must survive evaluation of the RHS. A nested binary
- * expression may itself use xmm1 for its own float op, so only leaf-like
- * operands are safe here. */
+/* Calls reload argument registers and xmm scratch registers, so any path that
+ * keeps a float value in xmm1/xmm2 must reject nested calls in full. */
 static int float_rhs_safe(WExpr* e) {
     if (!e) {
         return 1;
     }
-    return e->tag != 8 && e->tag != 9;
+    return e->tag != 8 && e->tag != 9 && !expr_has_call_deep(e);
 }
 
 /* True when e can be compiled to xmm0 without clobbering xmm1 or xmm2.
@@ -2079,13 +2104,14 @@ static int float_direct_safe(Gen* g, WExpr* e) {
         return 1;
     }
     if (e->tag == 10 || e->tag == 3) {
-        return is_float_expr(g, e);
+        return is_float_expr(g, e) && !expr_has_call_deep(e);
     }
     if (e->tag == 11) {
         return 1;
     }
     if (e->tag == 8 && e->b && e->b->tag == 11 &&
-        float_op_code(e->str) && float_direct_safe(g, e->a)) {
+        float_op_code(e->str) && !expr_has_call_deep(e) &&
+        float_direct_safe(g, e->a)) {
         return 1;
     }
     return 0;
@@ -2478,6 +2504,7 @@ static int is_signed_expr(Gen* g, WExpr* e) {
         case 3:
         case 5:
         case 6:
+        case 7:
         case 10: {
             WType* t = peel_typedefs(resolve_expr_type(g, e));
             return t && t->tag >= 4 && t->tag <= 7;
@@ -2979,11 +3006,38 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCastF64")) {
-                compile_expr(g, e->a, reg, deref_ptr);
-                if (!is_float_expr(g, e->a)) {
-                    static const uint8_t seq[] = {0xF2, 0x48, 0x0F, 0x2A, 0xC0, 0x66, 0x48, 0x0F, 0x7E, 0xC0};
-                    buf_bytes(b, seq, sizeof(seq));
+                int src_is_float = is_float_expr(g, e->a);
+                compile_expr(g, e->a, 0, deref_ptr);
+                if (!src_is_float) {
+                    int src_signed = is_signed_expr(g, e->a);
+                    if (!src_signed) {
+                        /* cvtsi2sd interprets its source as signed. For the
+                         * upper half of the u64 range, convert half the value
+                         * and double it so the low bit cannot flip the sign. */
+                        buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0); /* test rax,rax */
+                        buf_u8(b, 0x0F); buf_u8(b, 0x89);
+                        size_t pos_patch = b->len;
+                        buf_u32(b, 0);
+                        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC1); /* mov rcx,rax */
+                        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xE1); buf_u8(b, 0x01); /* and rcx,1 */
+                        buf_u8(b, 0x48); buf_u8(b, 0xD1); buf_u8(b, 0xE8); /* shr rax,1 */
+                        buf_u8(b, 0x48); buf_u8(b, 0x09); buf_u8(b, 0xC8); /* or rax,rcx */
+                        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0); /* cvtsi2sd xmm0,rax */
+                        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x58); buf_u8(b, 0xC0); /* addsd xmm0,xmm0 */
+                        buf_u8(b, 0xE9);
+                        size_t end_patch = b->len;
+                        buf_u32(b, 0);
+                        patch_address(g, pos_patch, (int32_t)(b->len - (pos_patch + 4)));
+                        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0); /* cvtsi2sd xmm0,rax */
+                        patch_address(g, end_patch, (int32_t)(b->len - (end_patch + 4)));
+                    } else {
+                        static const uint8_t seq[] = {0xF2, 0x48, 0x0F, 0x2A, 0xC0};
+                        buf_bytes(b, seq, sizeof(seq));
+                    }
+                    static const uint8_t bits[] = {0x66, 0x48, 0x0F, 0x7E, 0xC0}; /* movq rax,xmm0 */
+                    buf_bytes(b, bits, sizeof(bits));
                 }
+                if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
             if (wstr_eq_c(op, "OpCastInt")) {
@@ -3679,11 +3733,34 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             }
             uint32_t align_pad = 0;
             if (stack_arg_count > 0) {
-                /* Args were pushed in reverse order, so the first stack
-                 * argument is at (stack_arg_count - 1) * 8 from rsp. */
+                /* Sources and destinations overlap. Move each cycle with r10
+                 * as the scratch register so no unread source is clobbered. */
+                int* slot_owner = (int*)arena_alloc(g_arena, (argc ? argc : 1) * sizeof(int));
+                uint8_t* moved = (uint8_t*)arena_alloc(g_arena, (stack_arg_count ? stack_arg_count : 1));
+                for (size_t i = 0; i < argc; i++) slot_owner[i] = -1;
                 for (size_t i = 0; i < stack_arg_count; i++) {
-                    emit_mov_from_stack(b, 0, stack_off[i]);
-                    emit_mov_to_stack(b, 0, reg_arg_count * 8 + i * 8);
+                    slot_owner[stack_off[i] / 8] = (int)i;
+                    moved[i] = 0;
+                }
+                for (size_t i = 0; i < stack_arg_count; i++) {
+                    if (moved[i]) continue;
+                    moved[i] = 1;
+                    emit_mov_from_stack(b, 10, stack_off[i]);
+                    size_t cur = i;
+                    for (;;) {
+                        size_t dst = reg_arg_count * 8 + cur * 8;
+                        int next = slot_owner[dst / 8];
+                        if (next < 0 || moved[next]) {
+                            emit_mov_to_stack(b, 10, dst);
+                            break;
+                        }
+                        emit_mov_from_stack(b, 11, stack_off[next]);
+                        emit_mov_to_stack(b, 10, dst);
+                        static const uint8_t mov_r10_r11[] = {0x4D, 0x89, 0xDA};
+                        buf_bytes(b, mov_r10_r11, sizeof(mov_r10_r11));
+                        moved[next] = 1;
+                        cur = (size_t)next;
+                    }
                 }
                 uint32_t remove = (uint32_t)(reg_arg_count * 8);
                 if (remove) {
@@ -6751,6 +6828,12 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
 
     for (size_t i = 0; i < g->address_patches.n; i++) {
         AddrPatch p = g->address_patches.v[i];
+        if (format == WAND_OUTPUT_WEXP && p.is_rip &&
+            wstr_starts_with(p.key, "fn:")) {
+            /* WEXP keeps function addresses as relocations. The loader fills
+             * the disp32 after it chooses the module base. */
+            continue;
+        }
         uint64_t local_off = 0;
         map_get_str(&g->global_offsets, p.key, &local_off);
         uint64_t target = (uint64_t)global_start + local_off;
