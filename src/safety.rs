@@ -26,6 +26,7 @@ pub struct MemorySafetyAnalyzer {
     errors: Vec<String>,
     source_lines: Rc<Vec<String>>,
     base_line: usize,
+    typedefs: HashMap<String, DataType>,
 }
 
 impl MemorySafetyAnalyzer {
@@ -35,6 +36,14 @@ impl MemorySafetyAnalyzer {
             errors: Vec::new(),
             source_lines: Rc::new(Vec::new()),
             base_line: 0,
+            typedefs: HashMap::new(),
+        }
+    }
+
+    pub fn set_typedefs(&mut self, typedefs: &[(String, DataType)]) {
+        self.typedefs.clear();
+        for (name, dt) in typedefs {
+            self.typedefs.insert(name.clone(), dt.clone());
         }
     }
 
@@ -134,7 +143,7 @@ impl MemorySafetyAnalyzer {
 
         for (dt, name, _) in &func.params {
             self.states.insert(name.clone(), VarState::Safe);
-            self.register_struct_fields(name, dt, structs, VarState::Safe);
+            self.register_struct_fields(name, dt, structs, VarState::Safe, 0);
         }
 
         if let Some(body) = &func.body {
@@ -183,9 +192,40 @@ impl MemorySafetyAnalyzer {
         dt: &DataType,
         structs: &HashMap<String, StructDecl>,
         initial_state: VarState,
+        depth: usize,
     ) {
+        /* `get_expr_path()` collapses indices, so array elements and typedef
+         * aliases share the base object's field paths. The parser keeps a
+         * typedef use as `Struct(alias)`, so resolve aliases through the
+         * program's typedef table before giving up on field tracking. */
+        if depth > 8 {
+            return;
+        }
         let struct_name = match dt {
-            DataType::Struct(name) => name.clone(),
+            DataType::Struct(name) => {
+                if structs.contains_key(name) {
+                    name.clone()
+                } else if let Some(inner) = self.typedefs.get(name).cloned() {
+                    return self.register_struct_fields(
+                        prefix,
+                        &inner,
+                        structs,
+                        initial_state,
+                        depth + 1,
+                    );
+                } else {
+                    return;
+                }
+            }
+            DataType::Typedef(_, inner) | DataType::Array(inner, _) => {
+                return self.register_struct_fields(
+                    prefix,
+                    inner,
+                    structs,
+                    initial_state,
+                    depth + 1,
+                );
+            }
             _ => return,
         };
 
@@ -204,7 +244,81 @@ impl MemorySafetyAnalyzer {
 
                 self.states.insert(field_path.clone(), field_state.clone());
 
-                self.register_struct_fields(&field_path, &field.data_type, structs, field_state);
+                self.register_struct_fields(
+                    &field_path,
+                    &field.data_type,
+                    structs,
+                    field_state,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    /* Whole-object assignment behaves like initialization for field states:
+     * literal values initialize every field, aggregate values copy the source
+     * field states, and anything else leaves indeterminate fields. */
+    fn update_assigned_fields(
+        &mut self,
+        target_path: &str,
+        value: &Expr,
+        current_line: usize,
+    ) {
+        /* Null and scalar stores do not copy aggregate state. Leaving the old
+         * field facts alone avoids path-insensitive false positives when a
+         * pointer is reset to null and re-checked before a later use. */
+        if matches!(
+            value,
+            Expr::Null | Expr::Number(_) | Expr::SignedNumber(_) | Expr::FloatLit(_)
+        ) {
+            return;
+        }
+
+        let prefix = format!("{}.", target_path);
+        let old_fields: Vec<String> = self
+            .states
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+
+        let source_prefix = match value {
+            Expr::Variable(_)
+            | Expr::MemberAccess { .. }
+            | Expr::Index { .. }
+            | Expr::AddrOfExpr(_) => self.get_expr_path(value).map(|path| format!("{}.", path)),
+            _ => None,
+        };
+        let copied_fields: Vec<(String, VarState)> = match source_prefix {
+            Some(ref src) => self
+                .states
+                .iter()
+                .filter(|(key, _)| key.starts_with(src))
+                .map(|(key, state)| (format!("{}{}", prefix, &key[src.len()..]), state.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+
+        for key in &old_fields {
+            self.states.remove(key);
+        }
+        if Self::initializer_covers_struct_fields(value) {
+            for key in old_fields {
+                self.states.insert(key, VarState::Safe);
+            }
+        } else if !copied_fields.is_empty() {
+            for (key, state) in copied_fields {
+                self.states.insert(key, state);
+            }
+        } else {
+            for key in old_fields {
+                self.states.insert(
+                    key,
+                    VarState::Uninitialized {
+                        declared_line: current_line,
+                        type_name: String::new(),
+                    },
+                );
             }
         }
     }
@@ -216,7 +330,17 @@ impl MemorySafetyAnalyzer {
                 self.check_expression_safety(base, line);
             }
             Expr::Index { expr: base, index } => {
-                self.check_expression_safety(base, line);
+                /* Writing `obj.field[0]` initializes that element; the base
+                 * field is an address, not a read of its old value. Pointer
+                 * bases still need their usual freed/null checks. */
+                match &**base {
+                    Expr::MemberAccess { .. } | Expr::Index { .. } => {
+                        self.check_lhs_safety(base, line);
+                    }
+                    _ => {
+                        self.check_expression_safety(base, line);
+                    }
+                }
                 self.check_expression_safety(index, line);
             }
             _ => {
@@ -310,6 +434,7 @@ impl MemorySafetyAnalyzer {
                                     &decl.data_type,
                                     structs,
                                     field_state,
+                                    0,
                                 );
                             }
                         }
@@ -333,6 +458,7 @@ impl MemorySafetyAnalyzer {
                                     declared_line: current_line,
                                     type_name: type_str.clone(),
                                 },
+                                0,
                             );
                         }
                     }
@@ -358,6 +484,7 @@ impl MemorySafetyAnalyzer {
                             } else {
                                 self.states.insert(path.clone(), VarState::Safe);
                             }
+                            self.update_assigned_fields(&path, value, current_line);
                         }
                     }
                 }
@@ -408,6 +535,7 @@ impl MemorySafetyAnalyzer {
                         errors: Vec::new(),
                         source_lines: self.source_lines.clone(),
                         base_line: self.base_line,
+                        typedefs: self.typedefs.clone(),
                     };
                     then_analyzer.analyze_statements(then_branch, structs);
                     self.errors.extend(then_analyzer.errors);
@@ -441,6 +569,7 @@ impl MemorySafetyAnalyzer {
                             errors: Vec::new(),
                             source_lines: self.source_lines.clone(),
                             base_line: self.base_line,
+                            typedefs: self.typedefs.clone(),
                         };
                         else_analyzer.analyze_statements(else_stmts, structs);
                         self.errors.extend(else_analyzer.errors);
@@ -621,6 +750,11 @@ impl MemorySafetyAnalyzer {
                             _ => {}
                         }
                     }
+                }
+            }
+            Expr::ArrayInit(items) => {
+                for item in items {
+                    self.check_expression_safety(item, line);
                 }
             }
             Expr::Binary { left, right, op: _ } => {

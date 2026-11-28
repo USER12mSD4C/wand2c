@@ -592,6 +592,11 @@ fn collect_escaped_expr(expr: &Expr, escaped: &mut HashSet<String>) {
             collect_addr_target_roots(inner, escaped);
             collect_escaped_expr(inner, escaped);
         }
+        Expr::ArrayInit(items) => {
+            for item in items {
+                collect_escaped_expr(item, escaped);
+            }
+        }
         _ => {}
     }
 }
@@ -626,6 +631,11 @@ fn collect_call_array_escaped(
             }
             Expr::MemberAccess { expr: base, .. } | Expr::AddrOfExpr(base) => {
                 walk_expr(base, array_roots, escaped);
+            }
+            Expr::ArrayInit(items) => {
+                for item in items {
+                    walk_expr(item, array_roots, escaped);
+                }
             }
             _ => {}
         }
@@ -858,6 +868,11 @@ fn collect_reads_expr(expr: &Expr, reads: &mut HashMap<String, usize>) {
         }
         Expr::AddrOfExpr(inner) => {
             collect_reads_expr(inner, reads);
+        }
+        Expr::ArrayInit(items) => {
+            for item in items {
+                collect_reads_expr(item, reads);
+            }
         }
         _ => {}
     }
@@ -1671,6 +1686,11 @@ fn collect_assigned_expr(expr: &Expr, assigned: &mut HashSet<String>) {
         }
         Expr::MemberAccess { expr: base, .. } => {
             collect_assigned_expr(base, assigned);
+        }
+        Expr::ArrayInit(items) => {
+            for item in items {
+                collect_assigned_expr(item, assigned);
+            }
         }
         _ => {}
     }

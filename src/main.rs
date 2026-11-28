@@ -524,6 +524,7 @@ fn main() {
     }
 
     let mut safety_analyzer = safety::MemorySafetyAnalyzer::new();
+    safety_analyzer.set_typedefs(&program.typedefs);
     let mut safety_errors = 0;
 
     for func in &program.functions {
