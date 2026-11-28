@@ -42,6 +42,7 @@ wand2c -il libw/llibw.86                    # install standard library
 | Dynamic modules and reflection | [SYNTAX 29-30](SYNTAX.md#29-jmpto-statement) |
 | Safety and optimizer | [SYNTAX 31-32](SYNTAX.md#31-memory-safety-analysis) |
 | Output formats and restrictions | [SYNTAX 33-34](SYNTAX.md#33-compiler-output-formats) |
+| Compact full reference for agents | [AGENT_REFERENCE.md](AGENT_REFERENCE.md) |
 
 ## Sharp edges
 

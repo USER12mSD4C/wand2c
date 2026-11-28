@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +39,10 @@ pub struct MemorySafetyAnalyzer {
     base_line: usize,
     typedefs: HashMap<String, DataType>,
     decl_types: HashMap<String, DataType>,
+    /* Aggregate bases whose `Safe` state came from a literal initializer.
+     * Only those bases recover collapsed element facts; a `Safe` produced by a
+     * dynamic element store must not resurrect stale literal leaves. */
+    literal_aggregate_bases: HashSet<String>,
 }
 
 impl MemorySafetyAnalyzer {
@@ -50,6 +54,7 @@ impl MemorySafetyAnalyzer {
             base_line: 0,
             typedefs: HashMap::new(),
             decl_types: HashMap::new(),
+            literal_aggregate_bases: HashSet::new(),
         }
     }
 
@@ -157,6 +162,62 @@ impl MemorySafetyAnalyzer {
         None
     }
 
+    /* Only literal aggregate initializers create trustworthy collapsed facts.
+     * Record the base and every registered nested array so a field such as
+     * `a.p` is covered independently of its parent `a`. */
+    fn mark_literal_aggregate_bases(&mut self, prefix: &str) {
+        if self.is_array_path(prefix) {
+            self.literal_aggregate_bases.insert(prefix.to_string());
+        }
+        let dot = format!("{}.", prefix);
+        let bracket = format!("{}[", prefix);
+        let nested: Vec<String> = self
+            .decl_types
+            .keys()
+            .filter(|key| key.starts_with(&dot) || key.starts_with(&bracket))
+            .cloned()
+            .collect();
+        for key in nested {
+            if self.is_array_path(&key) {
+                self.literal_aggregate_bases.insert(key);
+            }
+        }
+    }
+
+    /* A dynamic element write changes an unknown leaf. Drop the base, its
+     * ancestors, and its descendants so stale literal facts are no longer
+     * recovered for later dynamic reads. */
+    fn clear_literal_aggregate_bases(&mut self, path: &str) {
+        let related = |a: &str, b: &str| {
+            a == b
+                || a.starts_with(&format!("{}.", b))
+                || a.starts_with(&format!("{}[", b))
+                || b.starts_with(&format!("{}.", a))
+                || b.starts_with(&format!("{}[", a))
+        };
+        self.literal_aggregate_bases
+            .retain(|key| !related(key, path));
+    }
+
+    fn target_has_dynamic_index(expr: &Expr) -> bool {
+        match expr {
+            Expr::Index { expr: base, index } => {
+                Self::const_index_text(index).is_none() || Self::target_has_dynamic_index(base)
+            }
+            Expr::MemberAccess { expr: base, .. } => Self::target_has_dynamic_index(base),
+            Expr::AddrOfExpr(inner) => Self::target_has_dynamic_index(inner),
+            _ => false,
+        }
+    }
+
+    fn extend_errors(&mut self, errors: Vec<String>) {
+        for err in errors {
+            if !self.errors.contains(&err) {
+                self.errors.push(err);
+            }
+        }
+    }
+
     /* A dynamic index collapses to one path. Recover the strongest safe state
      * shared by all constant elements so a checked pointer array is not called
      * uninitialized, while any null or unchecked element is still reported. */
@@ -231,7 +292,9 @@ impl MemorySafetyAnalyzer {
          * aggregate bases (declared arrays and their fields) need recovery. */
         if matches!(state, VarState::Safe) {
             candidates.retain(|(base, suffix)| {
-                self.is_array_path(base) && self.collapsed_target_is_pointer(base, suffix)
+                self.literal_aggregate_bases.contains(*base)
+                    && self.is_array_path(base)
+                    && self.collapsed_target_is_pointer(base, suffix)
             });
         }
         for (base, suffix) in candidates {
@@ -527,6 +590,7 @@ impl MemorySafetyAnalyzer {
     ) -> Result<(), Vec<String>> {
         self.states.clear();
         self.decl_types.clear();
+        self.literal_aggregate_bases.clear();
         self.errors.clear();
         self.source_lines = Rc::new(
             source
@@ -776,6 +840,31 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    /* A dynamic index names one aggregate element, so its brace literal is
+     * applied to every constant element of the collapsed array. This keeps a
+     * null leaf visible under `arr[argc].p` after `arr[argc] = { null }`. */
+    fn apply_dynamic_literal_assignment_states(
+        &mut self,
+        prefix: &str,
+        dt: &DataType,
+        init: &Expr,
+        structs: &HashMap<String, StructDecl>,
+    ) {
+        if let DataType::Array(inner, count) = self.resolve_decl_type(dt) {
+            for idx in 0..count {
+                self.apply_literal_field_states(
+                    &format!("{}[{}]", prefix, idx),
+                    &inner,
+                    init,
+                    structs,
+                    0,
+                );
+            }
+            return;
+        }
+        self.apply_literal_field_states(prefix, dt, init, structs, 0);
+    }
+
     /* Whole-object assignment behaves like initialization for field states:
      * literal values initialize every field, aggregate values copy the source
      * field states, and anything else leaves indeterminate fields. */
@@ -985,6 +1074,7 @@ impl MemorySafetyAnalyzer {
                                         structs,
                                         0,
                                     );
+                                    self.mark_literal_aggregate_bases(&decl.name);
                                 }
                             }
                         }
@@ -1021,6 +1111,9 @@ impl MemorySafetyAnalyzer {
                         self.check_lhs_safety(target, current_line);
 
                         if let Some(path) = self.get_expr_path(target) {
+                            if Self::target_has_dynamic_index(target) {
+                                self.clear_literal_aggregate_bases(&path);
+                            }
                             if is_alloc {
                                 let type_str = "void*".to_string();
                                 self.states.insert(
@@ -1058,10 +1151,17 @@ impl MemorySafetyAnalyzer {
                             self.update_assigned_fields(&path, value, current_line);
                             if Self::initializer_covers_struct_fields(value) {
                                 if let Some(dt) = self.decl_types.get(&path).cloned() {
-                                    self.apply_literal_field_states(
-                                        &path, &dt, value, structs, 0,
-                                    );
+                                    if Self::target_has_dynamic_index(target) {
+                                        self.apply_dynamic_literal_assignment_states(
+                                            &path, &dt, value, structs,
+                                        );
+                                    } else {
+                                        self.apply_literal_field_states(
+                                            &path, &dt, value, structs, 0,
+                                        );
+                                    }
                                 }
+                                self.mark_literal_aggregate_bases(&path);
                             }
                         }
                     }
@@ -1130,9 +1230,10 @@ impl MemorySafetyAnalyzer {
                         base_line: self.base_line,
                         typedefs: self.typedefs.clone(),
                         decl_types: self.decl_types.clone(),
+                        literal_aggregate_bases: self.literal_aggregate_bases.clone(),
                     };
                     then_analyzer.analyze_statements(then_branch, structs);
-                    self.errors.extend(then_analyzer.errors);
+                    self.extend_errors(then_analyzer.errors);
 
                     let then_terminates = Self::branch_terminates(then_branch);
 
@@ -1174,20 +1275,30 @@ impl MemorySafetyAnalyzer {
                             source_lines: self.source_lines.clone(),
                             base_line: self.base_line,
                             typedefs: self.typedefs.clone(),
-                        decl_types: self.decl_types.clone(),
+                            decl_types: self.decl_types.clone(),
+                            literal_aggregate_bases: self.literal_aggregate_bases.clone(),
                         };
                         else_analyzer.analyze_statements(else_stmts, structs);
-                        self.errors.extend(else_analyzer.errors);
+                        self.extend_errors(else_analyzer.errors);
 
                         let else_terminates = Self::branch_terminates(else_stmts);
 
                         if then_terminates && else_terminates {
                         } else if then_terminates {
                             self.states = else_analyzer.states;
+                            self.literal_aggregate_bases =
+                                else_analyzer.literal_aggregate_bases;
                         } else if else_terminates {
                             self.states = then_analyzer.states;
+                            self.literal_aggregate_bases =
+                                then_analyzer.literal_aggregate_bases;
                         } else {
-                            self.merge_states(then_analyzer.states, else_analyzer.states);
+                            self.merge_states(
+                                then_analyzer.states,
+                                else_analyzer.states,
+                                then_analyzer.literal_aggregate_bases,
+                                else_analyzer.literal_aggregate_bases,
+                            );
                         }
                     } else {
                         if then_terminates {
@@ -1229,6 +1340,8 @@ impl MemorySafetyAnalyzer {
                             self.states = fallthrough_states;
                         } else {
                             self.states = then_analyzer.states;
+                            self.literal_aggregate_bases =
+                                then_analyzer.literal_aggregate_bases;
                         }
                     }
                 }
@@ -1443,7 +1556,7 @@ impl MemorySafetyAnalyzer {
             }
 
             if let Some(path) = self.get_expr_path(base) {
-                let unchecked = match self.states.get(&path) {
+                let unchecked = match self.effective_state(&path) {
                     Some(VarState::Allocated {
                         checked_not_null: false,
                         ..
@@ -1470,9 +1583,12 @@ impl MemorySafetyAnalyzer {
         &mut self,
         branch_a: HashMap<String, VarState>,
         branch_b: HashMap<String, VarState>,
+        literal_a: HashSet<String>,
+        literal_b: HashSet<String>,
     ) {
-        let all_keys: std::collections::HashSet<String> =
+        let all_keys: HashSet<String> =
             branch_a.keys().chain(branch_b.keys()).cloned().collect();
+        self.literal_aggregate_bases = literal_a.intersection(&literal_b).cloned().collect();
 
         for name in all_keys {
             match (branch_a.get(&name), branch_b.get(&name)) {

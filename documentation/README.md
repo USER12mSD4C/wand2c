@@ -14,6 +14,7 @@ Start with [LEARN.md](LEARN.md) for a technical introduction. Use [SYNTAX.md](SY
 | Understand compiler flags | [../README.md](../README.md) |
 | Read the binary interface | [standart-46.md](standart-46.md) |
 | Deep reference | [WANDCBIBLE.md](WANDCBIBLE.md) |
+| Compact agent handoff | [AGENT_REFERENCE.md](AGENT_REFERENCE.md) |
 
 ## Document roles
 
@@ -21,6 +22,7 @@ Start with [LEARN.md](LEARN.md) for a technical introduction. Use [SYNTAX.md](SY
 |---|---|
 | [LEARN.md](LEARN.md) | Tutorial. Explains concepts once and points to reference sections. |
 | [CHEATSHEET.md](CHEATSHEET.md) | Index of commands and syntax sections. Not a second specification. |
+| [AGENT_REFERENCE.md](AGENT_REFERENCE.md) | Small, dense full-syntax/tooling reference for AI agents. |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Errors, known limitations, and fixes. |
 | [SYNTAX.md](SYNTAX.md) | Authoritative language syntax. |
 | [STDLIB.md](STDLIB.md) | Standard library functions. |
