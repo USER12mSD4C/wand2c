@@ -1545,18 +1545,6 @@ static uint32_t type_size(Gen* g, WType* t) {
     }
 }
 
-/* Array initializers are lowered into the data image element by element.
- * Return the declared element width so u32/u64 arrays do not collapse into a
- * byte-per-entry layout.  Non-arrays fall back to one byte per initializer. */
-static uint32_t array_element_size(Gen* g, WType* t) {
-    WType* peeled = peel_typedefs(t);
-    if (!peeled || peeled->tag != 12) {
-        return 1;
-    }
-    uint32_t size = type_size(g, peeled->inner);
-    return size ? size : 1;
-}
-
 static int is_byte_array(WType* t) {
     WType* peeled = peel_typedefs(t);
     if (!peeled || peeled->tag != 12) {
@@ -6855,6 +6843,203 @@ static WStruct* find_struct_by_name(Gen* g, WStr name) {
     return NULL;
 }
 
+static WVar* global_var_by_key(Gen* g, WStr key) {
+    for (size_t i = 0; i < g->prog.section_count; i++) {
+        WSection* sect = &g->prog.sections[i];
+        for (size_t j = 0; j < sect->count; j++) {
+            if (wstr_eq(wstr_pair(sect->name, sect->vars[j].name), key)) {
+                return &sect->vars[j];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Resolve an address-valued initializer. A bare pointer global is followed to
+ * its own initializer, so `Holder h = { q }` and `u64* r = q` reuse the same
+ * constant address as `q = arr*adr` instead of storing null. */
+static int global_pointer_init_key_depth(Gen* g, WExpr* e, WStr* key,
+                                         uint32_t depth) {
+    if (!e || depth > 16) {
+        return 0;
+    }
+    if (e->tag == 2) {
+        collect_expr_literals(g, e, 1);
+        *key = wstr_prefix("str:", e->str);
+        return 1;
+    }
+    if (global_init_address_key(g, e, key)) {
+        return 1;
+    }
+    if (e->tag == 3) {
+        WStr var_key = find_global_key(g, e->str);
+        if (!var_key.ptr) {
+            return 0;
+        }
+        WVar* var = global_var_by_key(g, var_key);
+        if (!var || !var->has_init || !var->init) {
+            return 0;
+        }
+        return global_pointer_init_key_depth(g, var->init, key, depth + 1);
+    }
+    return 0;
+}
+
+static int global_pointer_init_key(Gen* g, WExpr* e, WStr* key) {
+    return global_pointer_init_key_depth(g, e, key, 0);
+}
+
+typedef struct {
+    size_t off; /* byte offset inside the variable */
+    WType* type;
+} InitLeaf;
+DEFINE_VEC(InitLeafVec, InitLeaf)
+
+/* Flatten an aggregate into scalar leaves in declaration order. Arrays use
+ * element order; structs use field order and the calculated field offsets. */
+static void collect_init_leaves(Gen* g, WType* t, size_t base,
+                                InitLeafVec* leaves, uint32_t depth) {
+    if (!t || depth > 16) {
+        return;
+    }
+    WType* peeled = peel_typedefs(t);
+    if (!peeled) {
+        return;
+    }
+    if (peeled->tag == 12) {
+        uint32_t elem_size = type_size(g, peeled->inner);
+        if (!elem_size) elem_size = 1;
+        for (uint32_t i = 0; i < peeled->count; i++) {
+            collect_init_leaves(g, peeled->inner, base + (size_t)i * elem_size,
+                                leaves, depth + 1);
+        }
+        return;
+    }
+    if (peeled->tag == 11) {
+        WStruct* st = find_struct_by_name(g, peeled->name);
+        uint64_t layout_idx = 0;
+        Layout* layout = map_get_str(&g->struct_layouts, peeled->name,
+                                     &layout_idx)
+                             ? &g->layouts.v[layout_idx]
+                             : NULL;
+        size_t field_count = st ? (st->is_union ? 1 : st->field_count) : 0;
+        for (size_t i = 0; i < field_count; i++) {
+            uint64_t off = 0;
+            if (layout) {
+                map_get_str(&layout->field_offsets, st->fields[i].name, &off);
+            }
+            collect_init_leaves(g, st->fields[i].type, base + off, leaves,
+                                depth + 1);
+        }
+        return;
+    }
+    InitLeaf leaf;
+    leaf.off = base;
+    leaf.type = peeled;
+    InitLeafVec_push(leaves, leaf);
+}
+
+static void emit_global_leaf(Gen* g, Buf* global, size_t var_start,
+                             uint32_t var_size, InitLeaf* leaf, WExpr* arg) {
+    if (leaf->off >= var_size) {
+        return;
+    }
+    WType* t = peel_typedefs(leaf->type);
+    uint32_t width = t ? type_size(g, t) : 8;
+    if (!width) width = 1;
+    if (width > var_size - leaf->off) {
+        width = (uint32_t)(var_size - leaf->off);
+    }
+    size_t pos = var_start + leaf->off;
+    if (t && t->tag == 10 && width == 8) {
+        WStr key = {0};
+        if (global_pointer_init_key(g, arg, &key)) {
+            GlobalPtrFixup fixup;
+            fixup.pos = pos;
+            fixup.key = key;
+            GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
+            return;
+        }
+    }
+    uint64_t value = eval_const(g, arg);
+    for (uint32_t byte = 0; byte < width; byte++) {
+        global->data[pos + byte] = byte < 8 ? (uint8_t)(value >> (byte * 8)) : 0;
+    }
+}
+
+/* Consume initializer arguments against the flattened leaf list. Braces map
+ * to their sub-aggregate; a flat list fills leaves in declaration order, which
+ * is what `Pair ps[2] = { 11, 22, 33, 44 }` requires. */
+static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
+                                    uint32_t var_size, WType* t, WExpr* init,
+                                    InitLeaf* leaves, size_t leaf_count,
+                                    size_t pos, uint32_t depth) {
+    if (!init || !leaves || pos >= leaf_count || depth > 16) {
+        return pos;
+    }
+    if (init->tag == 12) {
+        WType* peeled = peel_typedefs(t);
+        int has_brace_arg = 0;
+        for (size_t i = 0; i < init->arg_count; i++) {
+            if (init->args[i] && init->args[i]->tag == 12) {
+                has_brace_arg = 1;
+                break;
+            }
+        }
+        size_t sub_count = 0;
+        WStruct* st = NULL;
+        if (peeled && peeled->tag == 11) {
+            st = find_struct_by_name(g, peeled->name);
+            if (st) sub_count = st->is_union ? 1 : st->field_count;
+        } else if (peeled && peeled->tag == 12) {
+            sub_count = peeled->count;
+        }
+        /* `Pair ps[2] = { 11, 22, 33, 44 }` is a flat leaf list, not two
+         * element initializers. Use leaf order whenever the flat list is
+         * longer than the declared sub-aggregate list. */
+        if (!has_brace_arg && sub_count && init->arg_count > sub_count) {
+            for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
+                emit_global_leaf(g, global, var_start, var_size, &leaves[pos],
+                                 init->args[i]);
+                pos++;
+            }
+            return pos;
+        }
+        if (peeled && peeled->tag == 11) {
+            size_t count = 0;
+            if (st) {
+                count = st->is_union ? 1 : st->field_count;
+                if (count > init->arg_count) count = init->arg_count;
+                for (size_t i = 0; i < count; i++) {
+                    pos = emit_global_init_expr(g, global, var_start, var_size,
+                                                st->fields[i].type,
+                                                init->args[i], leaves,
+                                                leaf_count, pos, depth + 1);
+                }
+            }
+            return pos;
+        }
+        if (peeled && peeled->tag == 12) {
+            size_t count = peeled->count;
+            if (count > init->arg_count) count = init->arg_count;
+            for (size_t i = 0; i < count; i++) {
+                pos = emit_global_init_expr(g, global, var_start, var_size,
+                                            peeled->inner, init->args[i],
+                                            leaves, leaf_count, pos, depth + 1);
+            }
+            return pos;
+        }
+        if (init->arg_count) {
+            emit_global_leaf(g, global, var_start, var_size, &leaves[pos],
+                             init->args[0]);
+            pos++;
+        }
+        return pos;
+    }
+    emit_global_leaf(g, global, var_start, var_size, &leaves[pos], init);
+    return pos + 1;
+}
+
 static void setup_program(Gen* g, Buf* global) {
     g->next_offset = 8;
 
@@ -6980,12 +7165,7 @@ static void setup_program(Gen* g, Buf* global) {
             int var_is_pointer = var_type && var_type->tag == 10 &&
                                  type_size(g, var_type) == 8;
             if (var_is_pointer && var->has_init && var->init) {
-                if (var->init->tag == 2) {
-                    collect_expr_literals(g, var->init, 1);
-                    ptr_fixup_key = wstr_prefix("str:", var->init->str);
-                } else {
-                    global_init_address_key(g, var->init, &ptr_fixup_key);
-                }
+                global_pointer_init_key(g, var->init, &ptr_fixup_key);
             }
             if (ptr_fixup_key.ptr) {
                 /* The target offset is not known until all globals are laid
@@ -6998,116 +7178,32 @@ static void setup_program(Gen* g, Buf* global) {
                 fixup.pos = start_len;
                 fixup.key = ptr_fixup_key;
                 GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
-            } else if (var->has_init && var->init) {
-                if (var->init->tag == 12) {
-                    WType* peeled = peel_typedefs(var->type);
-                    WStruct* st = peeled && peeled->tag == 11
-                                      ? find_struct_by_name(g, peeled->name)
-                                      : NULL;
-                    if (st && st->field_count) {
-                        /* Struct braces name fields in declaration order, not
-                         * one-byte array elements. Start from zero bytes so
-                         * omitted fields and alignment padding stay zero. */
-                        for (uint32_t k = 0; k < var_size; k++) {
-                            buf_u8(global, 0);
-                        }
-                        uint64_t layout_idx = 0;
-                        Layout* layout = map_get_str(&g->struct_layouts,
-                                                     peeled->name, &layout_idx)
-                                             ? &g->layouts.v[layout_idx]
-                                             : NULL;
-                        size_t init_count = var->init->arg_count;
-                        if (st->is_union && init_count > 1) {
-                            init_count = 1;
-                        }
-                        if (init_count > st->field_count) {
-                            init_count = st->field_count;
-                        }
-                        for (size_t k = 0; k < init_count; k++) {
-                            WField* field = &st->fields[k];
-                            uint64_t off = 0;
-                            if (layout) {
-                                map_get_str(&layout->field_offsets, field->name, &off);
-                            }
-                            if (off >= var_size) {
-                                continue;
-                            }
-                            WType* field_type = peel_typedefs(field->type);
-                            WStr field_key = {0};
-                            if (field_type && field_type->tag == 10 &&
-                                type_size(g, field_type) == 8) {
-                                if (var->init->args[k] &&
-                                    var->init->args[k]->tag == 2) {
-                                    collect_expr_literals(g, var->init->args[k], 1);
-                                    field_key = wstr_prefix("str:",
-                                                            var->init->args[k]->str);
-                                } else {
-                                    global_init_address_key(g, var->init->args[k],
-                                                            &field_key);
-                                }
-                            }
-                            if (field_key.ptr) {
-                                GlobalPtrFixup fixup;
-                                fixup.pos = start_len + off;
-                                fixup.key = field_key;
-                                GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
-                                continue;
-                            }
-                            uint64_t value = eval_const(g, var->init->args[k]);
-                            uint32_t width = type_size(g, field->type);
-                            if (width > var_size - off) {
-                                width = (uint32_t)(var_size - off);
-                            }
-                            for (uint32_t byte = 0; byte < width; byte++) {
-                                uint8_t bits = byte < 8
-                                                   ? (uint8_t)(value >> (byte * 8))
-                                                   : 0;
-                                global->data[start_len + off + byte] = bits;
-                            }
-                        }
-                    } else {
-                        uint32_t elem_size = array_element_size(g, var->type);
-                        for (size_t k = 0; k < var->init->arg_count; k++) {
-                            size_t written = global->len - start_len;
-                            if (written >= var_size) {
-                                break;
-                            }
-                            uint64_t value = eval_const(g, var->init->args[k]);
-                            uint32_t width = elem_size;
-                            if (width > var_size - written) {
-                                width = (uint32_t)(var_size - written);
-                            }
-                            for (uint32_t byte = 0; byte < width; byte++) {
-                                buf_u8(global, (uint8_t)(value >> (byte * 8)));
-                            }
-                        }
-                    }
-                } else if (var->init->tag == 2 && is_byte_array(var->type)) {
-                    /* A string literal assigned to u8[N]/i8[N] is byte data,
-                     * not a pointer: copy its bytes plus a terminating NUL. */
-                    Buf bytes = {0};
-                    unescape_string(var->init->str, &bytes);
-                    size_t copy_len = bytes.len + 1;
-                    if (copy_len > var_size) {
-                        copy_len = var_size;
-                    }
-                    if (copy_len) {
-                        buf_bytes(global, bytes.data, copy_len - 1);
-                        buf_u8(global, 0);
-                    }
-                } else {
-                    uint64_t value = eval_const(g, var->init);
-                    for (uint32_t k = 0; k < var_size; k++) {
-                        buf_u8(global, k < 8 ? (uint8_t)(value >> (k * 8)) : 0);
-                    }
-                }
             } else {
                 for (uint32_t k = 0; k < var_size; k++) {
                     buf_u8(global, 0);
                 }
-            }
-            while (global->len - start_len < var_size) {
-                buf_u8(global, 0);
+                if (var->has_init && var->init) {
+                    if (var->init->tag == 2 && is_byte_array(var->type)) {
+                        /* A string literal assigned to u8[N]/i8[N] is byte
+                         * data, not a pointer: copy its bytes plus NUL. */
+                        Buf bytes = {0};
+                        unescape_string(var->init->str, &bytes);
+                        size_t copy_len = bytes.len + 1;
+                        if (copy_len > var_size) {
+                            copy_len = var_size;
+                        }
+                        if (copy_len) {
+                            memcpy(global->data + start_len, bytes.data, copy_len - 1);
+                            global->data[start_len + copy_len - 1] = 0;
+                        }
+                    } else {
+                        InitLeafVec leaves = {0};
+                        collect_init_leaves(g, var->type, 0, &leaves, 0);
+                        emit_global_init_expr(g, global, start_len, var_size,
+                                              var->type, var->init, leaves.v,
+                                              leaves.n, 0, 0);
+                    }
+                }
             }
         }
     }
