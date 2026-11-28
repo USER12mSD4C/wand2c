@@ -1332,6 +1332,17 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
     g->patch_generation++;
 }
 
+/* lea dst, [base + index * scale] with full 64-bit register extensions. */
+static void emit_lea_scaled(Buf* b, uint8_t dst, uint8_t base, uint8_t index,
+                            int scale_bits) {
+    uint8_t rex = (uint8_t)(0x48 | (dst >= 8 ? 4 : 0) |
+                            (index >= 8 ? 2 : 0) | (base >= 8 ? 1 : 0));
+    buf_u8(b, rex);
+    buf_u8(b, 0x8D);
+    buf_u8(b, (uint8_t)(0x04 | ((dst & 7) << 3)));
+    buf_u8(b, (uint8_t)((scale_bits << 6) | ((index & 7) << 3) | (base & 7)));
+}
+
 /* movsd xmm<N>, [rip+key] — loads a float constant in one instruction
  * instead of lea/movsd/movq through rax. */
 static void emit_function_epilogue(Gen* g) {
@@ -5097,14 +5108,6 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
              * an lvalue so pointer parameters and local pointer variables stay
              * pointers. compile_expr(..., deref_ptr=1) used to load the first
              * element here, turning a[j] into a[0][j]. */
-            int index_simple = rax_only_expr(g, e->b);
-            compile_address(g, e->a, 3);
-            if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
-            compile_expr(g, e->b, 0, 1);
-
-            /* lea rbx, [rbx + rax * scale] replaces shift plus add for the
-             * common element widths. SIB base=rbx (3), index=rax (0), and
-             * scale bits encode 1, 2, 4, or 8. */
             int scale_bits = -1;
             switch (elem_size) {
                 case 1: scale_bits = 0; break;
@@ -5113,6 +5116,32 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 case 8: scale_bits = 3; break;
                 default: break;
             }
+
+            /* If both the base pointer and the index are already in loop
+             * registers, fold the address into one lea. This removes three
+             * moves per array access in tight kernels. */
+            uint8_t base_reg = 0, index_reg = 0;
+            uint64_t base_access = 3, index_access = 3;
+            if (scale_bits >= 0 && e->a && e->a->tag == 3 && e->b &&
+                e->b->tag == 3 &&
+                reg_local_lookup(g, e->a->str, &base_reg) &&
+                reg_local_lookup(g, e->b->str, &index_reg) &&
+                map_get_str(&g->local_access, e->a->str, &base_access) &&
+                map_get_str(&g->local_access, e->b->str, &index_access) &&
+                base_access == 3 && index_access == 3) {
+                emit_lea_scaled(b, internal_reg == 0 ? 0 : internal_reg,
+                                base_reg, index_reg, scale_bits);
+                break;
+            }
+
+            int index_simple = rax_only_expr(g, e->b);
+            compile_address(g, e->a, 3);
+            if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
+            compile_expr(g, e->b, 0, 1);
+
+            /* lea rbx, [rbx + rax * scale] replaces shift plus add for the
+             * common element widths. SIB base=rbx (3), index=rax (0), and
+             * scale bits encode 1, 2, 4, or 8. */
             if (scale_bits >= 0) {
                 if (!index_simple) buf_u8(b, 0x5B); /* pop rbx */
                 buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x1C);
