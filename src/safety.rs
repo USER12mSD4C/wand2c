@@ -189,6 +189,75 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    fn report_pointer_state(&mut self, path: &str, line: usize) {
+        match self.states.get(path).cloned() {
+            Some(VarState::Freed { freed_line }) => {
+                self.push_error(
+                    "error",
+                    &format!("use-after-free violation on pointer '{}'", path),
+                    line,
+                    &format!(
+                        "pointer '{}' was freed on line {}, remove this access or re-allocate before use",
+                        path, freed_line
+                    ),
+                );
+            }
+            Some(VarState::NullPointer { .. })
+            | Some(VarState::Allocated {
+                checked_not_null: false,
+                ..
+            }) => {
+                self.push_error(
+                    "error",
+                    &format!("potential null pointer dereference of '{}'", path),
+                    line,
+                    &format!("wrap in null check: if ({} != null) {{ ... }}", path),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /* Walk the dereference chain of an indexed base without treating field
+     * addresses as reads. `p->arr[0]`, `h.p[0]`, and `p[0]` all dereference a
+     * pointer before the final element access. */
+    fn check_pointer_chain_safety(&mut self, expr: &Expr, line: usize) {
+        match expr {
+            Expr::Variable(_) => {
+                self.check_expression_safety(expr, line);
+                if let Some(path) = self.get_expr_path(expr) {
+                    if let Some(VarState::NullPointer { .. })
+                    | Some(VarState::Allocated {
+                        checked_not_null: false,
+                        ..
+                    }) = self.states.get(&path)
+                    {
+                        self.push_error(
+                            "error",
+                            &format!("potential null pointer dereference of '{}'", path),
+                            line,
+                            &format!("wrap in null check: if ({} != null) {{ ... }}", path),
+                        );
+                    }
+                }
+            }
+            Expr::MemberAccess { expr: base, .. } => {
+                self.check_pointer_chain_safety(base, line);
+                if let Some(path) = self.get_expr_path(expr) {
+                    self.report_pointer_state(&path, line);
+                }
+            }
+            Expr::Index { expr: base, index } => {
+                self.check_pointer_chain_safety(base, line);
+                self.check_expression_safety(index, line);
+                if let Some(path) = self.get_expr_path(base) {
+                    self.report_pointer_state(&path, line);
+                }
+            }
+            _ => self.check_expression_safety(expr, line),
+        }
+    }
+
     /* An indexed access dereferences its base pointer even when the indexed
      * path itself has separate field state. Check the base for freed, null,
      * or unchecked-allocation state so `p[0]` behaves like `p->field`. */
@@ -203,34 +272,7 @@ impl MemorySafetyAnalyzer {
             return;
         }
 
-        if let Some(path) = self.get_expr_path(base) {
-            match self.states.get(&path).cloned() {
-                Some(VarState::Freed { freed_line }) => {
-                    self.push_error(
-                        "error",
-                        &format!("use-after-free violation on pointer '{}'", path),
-                        line,
-                        &format!(
-                            "pointer '{}' was freed on line {}, remove this access or re-allocate before use",
-                            path, freed_line
-                        ),
-                    );
-                }
-                Some(VarState::NullPointer { .. })
-                | Some(VarState::Allocated {
-                    checked_not_null: false,
-                    ..
-                }) => {
-                    self.push_error(
-                        "error",
-                        &format!("potential null pointer dereference of '{}'", path),
-                        line,
-                        &format!("wrap in null check: if ({} != null) {{ ... }}", path),
-                    );
-                }
-                _ => {}
-            }
-        }
+        self.check_pointer_chain_safety(base, line);
     }
 
     pub fn analyze_function(
@@ -476,16 +518,9 @@ impl MemorySafetyAnalyzer {
             }
             Expr::Index { expr: base, index } => {
                 /* Writing `obj.field[0]` initializes that element; the base
-                 * field is an address, not a read of its old value. Pointer
-                 * bases still need their usual freed/null checks. */
-                match &**base {
-                    Expr::MemberAccess { .. } | Expr::Index { .. } => {
-                        self.check_lhs_safety(base, line);
-                    }
-                    _ => {
-                        self.check_expression_safety(base, line);
-                    }
-                }
+                 * field is an address, not a read of its old value. The pointer
+                 * chain leading to that address still needs null/UAF checks. */
+                self.check_index_base_safety(base, line);
                 self.check_expression_safety(index, line);
             }
             _ => {
