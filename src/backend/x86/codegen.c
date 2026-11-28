@@ -5461,6 +5461,15 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
 
             int index_simple = rax_only_expr(g, e->b);
             compile_address(g, e->a, 3);
+            /* Some address expressions leave the address of a slot that holds
+             * a pointer: state:p, s.ptr, and a[i] when the element is a
+             * pointer. Load that slot before indexing. Plain variables already
+             * load their pointer value in the Variable branch, and AddrOf
+             * expressions must keep the address they name. */
+            if (address_expr_needs_deref(e->a) && base_type &&
+                base_type->tag == 10) {
+                buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B);
+            }
             if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
             compile_expr(g, e->b, 0, 1);
 
@@ -6837,6 +6846,15 @@ static int global_init_address_key(Gen* g, WExpr* e, WStr* key) {
     return 0;
 }
 
+static WStruct* find_struct_by_name(Gen* g, WStr name) {
+    for (size_t i = 0; i < g->prog.struct_count; i++) {
+        if (wstr_eq(g->prog.structs[i].name, name)) {
+            return &g->prog.structs[i];
+        }
+    }
+    return NULL;
+}
+
 static void setup_program(Gen* g, Buf* global) {
     g->next_offset = 8;
 
@@ -6982,19 +7000,86 @@ static void setup_program(Gen* g, Buf* global) {
                 GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
             } else if (var->has_init && var->init) {
                 if (var->init->tag == 12) {
-                    uint32_t elem_size = array_element_size(g, var->type);
-                    for (size_t k = 0; k < var->init->arg_count; k++) {
-                        size_t written = global->len - start_len;
-                        if (written >= var_size) {
-                            break;
+                    WType* peeled = peel_typedefs(var->type);
+                    WStruct* st = peeled && peeled->tag == 11
+                                      ? find_struct_by_name(g, peeled->name)
+                                      : NULL;
+                    if (st && st->field_count) {
+                        /* Struct braces name fields in declaration order, not
+                         * one-byte array elements. Start from zero bytes so
+                         * omitted fields and alignment padding stay zero. */
+                        for (uint32_t k = 0; k < var_size; k++) {
+                            buf_u8(global, 0);
                         }
-                        uint64_t value = eval_const(g, var->init->args[k]);
-                        uint32_t width = elem_size;
-                        if (width > var_size - written) {
-                            width = (uint32_t)(var_size - written);
+                        uint64_t layout_idx = 0;
+                        Layout* layout = map_get_str(&g->struct_layouts,
+                                                     peeled->name, &layout_idx)
+                                             ? &g->layouts.v[layout_idx]
+                                             : NULL;
+                        size_t init_count = var->init->arg_count;
+                        if (st->is_union && init_count > 1) {
+                            init_count = 1;
                         }
-                        for (uint32_t byte = 0; byte < width; byte++) {
-                            buf_u8(global, (uint8_t)(value >> (byte * 8)));
+                        if (init_count > st->field_count) {
+                            init_count = st->field_count;
+                        }
+                        for (size_t k = 0; k < init_count; k++) {
+                            WField* field = &st->fields[k];
+                            uint64_t off = 0;
+                            if (layout) {
+                                map_get_str(&layout->field_offsets, field->name, &off);
+                            }
+                            if (off >= var_size) {
+                                continue;
+                            }
+                            WType* field_type = peel_typedefs(field->type);
+                            WStr field_key = {0};
+                            if (field_type && field_type->tag == 10 &&
+                                type_size(g, field_type) == 8) {
+                                if (var->init->args[k] &&
+                                    var->init->args[k]->tag == 2) {
+                                    collect_expr_literals(g, var->init->args[k], 1);
+                                    field_key = wstr_prefix("str:",
+                                                            var->init->args[k]->str);
+                                } else {
+                                    global_init_address_key(g, var->init->args[k],
+                                                            &field_key);
+                                }
+                            }
+                            if (field_key.ptr) {
+                                GlobalPtrFixup fixup;
+                                fixup.pos = start_len + off;
+                                fixup.key = field_key;
+                                GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
+                                continue;
+                            }
+                            uint64_t value = eval_const(g, var->init->args[k]);
+                            uint32_t width = type_size(g, field->type);
+                            if (width > var_size - off) {
+                                width = (uint32_t)(var_size - off);
+                            }
+                            for (uint32_t byte = 0; byte < width; byte++) {
+                                uint8_t bits = byte < 8
+                                                   ? (uint8_t)(value >> (byte * 8))
+                                                   : 0;
+                                global->data[start_len + off + byte] = bits;
+                            }
+                        }
+                    } else {
+                        uint32_t elem_size = array_element_size(g, var->type);
+                        for (size_t k = 0; k < var->init->arg_count; k++) {
+                            size_t written = global->len - start_len;
+                            if (written >= var_size) {
+                                break;
+                            }
+                            uint64_t value = eval_const(g, var->init->args[k]);
+                            uint32_t width = elem_size;
+                            if (width > var_size - written) {
+                                width = (uint32_t)(var_size - written);
+                            }
+                            for (uint32_t byte = 0; byte < width; byte++) {
+                                buf_u8(global, (uint8_t)(value >> (byte * 8)));
+                            }
                         }
                     }
                 } else if (var->init->tag == 2 && is_byte_array(var->type)) {
