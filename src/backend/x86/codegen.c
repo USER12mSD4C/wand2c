@@ -2729,7 +2729,7 @@ static int is_signed_expr(Gen* g, WExpr* e) {
         case 9: {
             WFunc* f = func_by_name(g, e->str);
             if (f && f->return_count) {
-                WType* t = peel_typedefs(f->returns[0]);
+                WType* t = resolve_named_type(g, f->returns[0]);
                 return t && t->tag >= 4 && t->tag <= 7;
             }
             return 0;
@@ -3021,11 +3021,12 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     }
                 } else {
                     /* Array parameters hold a pointer in the stack slot. */
+                    WType* local_type = resolve_named_type(g, var_type);
                     uint32_t load_size =
-                        (var_type && var_type->tag == 12) ? 8 : var_size;
-                    int local_signed = var_type && (var_type->tag == 4 ||
-                                                    var_type->tag == 5 ||
-                                                    var_type->tag == 6);
+                        (local_type && local_type->tag == 12) ? 8 : var_size;
+                    int local_signed = local_type && (local_type->tag == 4 ||
+                                                      local_type->tag == 5 ||
+                                                      local_type->tag == 6);
                     emit_mem_load(b, reg, (uint32_t)off, load_size,
                                   local_signed);
                 }
@@ -3106,7 +3107,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
         }
         case 6: /* MemberAccess */
         case 10: { /* Index */
-            WType* t = resolve_expr_type(g, e);
+            WType* t = resolve_named_type(g, resolve_expr_type(g, e));
             uint8_t sib_base = 0, sib_index = 0;
             int sib_scale = -1;
             int sib_ready = e->tag == 10 && !(t && t->tag == 12) &&
@@ -3122,7 +3123,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 }
             } else {
                 uint32_t size = expr_size(g, e);
-                WType* scalar = peel_typedefs(t);
+                WType* scalar = resolve_named_type(g, t);
                 int is_signed = scalar && scalar->tag >= 4 && scalar->tag <= 7;
                 if (sib_ready) {
                     emit_gpr_sib_load(b, reg, sib_base, sib_index, sib_scale,
@@ -4033,7 +4034,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                  * rbx. Scalar loads already used rbx as the load base and
                  * wrote the value straight into reg, so only the array case
                  * needs the extra move. */
-                WType* t = peel_typedefs(resolve_expr_type(g, e));
+                WType* t = resolve_named_type(g, resolve_expr_type(g, e));
                 if (t && t->tag == 12 && reg != 3) {
                     buf_u8(b, reg >= 8 ? 0x49 : 0x48);
                     buf_u8(b, 0x89);
@@ -5357,7 +5358,7 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 }
                 uint64_t is_param = 0;
                 map_get_str(&g->local_is_param, e->str, &is_param);
-                WType* pointer_check = peel_typedefs(type);
+                WType* pointer_check = resolve_named_type(g, type);
                 int is_pointer = pointer_check && pointer_check->tag == 10;
                 uint8_t bound_reg = 0;
                 if (is_pointer && reg_local_lookup(g, e->str, &bound_reg)) {
@@ -5366,11 +5367,11 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 }
                 /* An array-typed parameter is really a pointer passed by the
                  * caller, so its stack slot holds the address, not the array. */
-                int is_array = type && type->tag == 12 && !is_param;
+                int is_array = pointer_check && pointer_check->tag == 12 && !is_param;
                 if (is_array) {
                     emit_mem_op(b, 0x8D, internal_reg, (uint32_t)off);
                 } else if (access == 0 || access == 1 || access == 2 || is_pointer ||
-                           is_param || (type && type->tag == 12)) {
+                           is_param || (pointer_check && pointer_check->tag == 12)) {
                     /* Parameters store their incoming value/pointer in the
                      * stack slot; use it as the base of an index instead of
                      * the address of the slot itself. */
@@ -7016,6 +7017,20 @@ static size_t emit_global_leaf(Gen* g, Buf* global, size_t var_start,
     return pos + 1;
 }
 
+/* Return the element count when t is a byte array, including named typedefs.
+ * Zero means the type is not a byte array. */
+static uint32_t byte_array_count(Gen* g, WType* t) {
+    WType* peeled = resolve_named_type(g, t);
+    if (!peeled || peeled->tag != 12 || !peeled->count) {
+        return 0;
+    }
+    WType* elem = resolve_named_type(g, peeled->inner);
+    if (!elem || (elem->tag != 0 && elem->tag != 4)) {
+        return 0;
+    }
+    return (uint32_t)peeled->count;
+}
+
 /* Consume initializer arguments against the flattened leaf list. Braces map
  * to their sub-aggregate; a flat list fills leaves in declaration order, which
  * is what `Pair ps[2] = { 11, 22, 33, 44 }` requires. */
@@ -7025,6 +7040,13 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
                                     size_t pos, uint32_t depth) {
     if (!init || !leaves || pos >= leaf_count || depth > 16) {
         return pos;
+    }
+    if (init->tag == 2) {
+        uint32_t byte_count = byte_array_count(g, t);
+        if (byte_count) {
+            return emit_global_leaf(g, global, var_start, var_size, leaves,
+                                    leaf_count, pos, init, byte_count);
+        }
     }
     if (init->tag == 12) {
         WType* peeled = resolve_named_type(g, t);
@@ -7042,6 +7064,17 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
             if (st) sub_count = st->is_union ? 1 : st->field_count;
         } else if (peeled && peeled->tag == 12) {
             sub_count = peeled->count;
+        }
+        /* `u8 a[4] = { "abc" }` fills the whole array with bytes, not just the
+         * first leaf. The same applies to a typedef'd array field. */
+        if (peeled && peeled->tag == 12 && init->arg_count &&
+            init->args[0] && init->args[0]->tag == 2) {
+            uint32_t byte_count = byte_array_count(g, t);
+            if (byte_count) {
+                pos = emit_global_leaf(g, global, var_start, var_size, leaves,
+                                       leaf_count, pos, init->args[0], byte_count);
+                return pos;
+            }
         }
         /* `Pair ps[2] = { 11, 22, 33, 44 }` is a flat leaf list, not two
          * element initializers. Use leaf order whenever the flat list is
@@ -7083,14 +7116,8 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
         }
         return pos;
     }
-    WType* declared = resolve_named_type(g, t);
-    size_t limit = 1;
-    if (declared && declared->tag == 12 && declared->count) {
-        WType* elem = resolve_named_type(g, declared->inner);
-        if (elem && (elem->tag == 0 || elem->tag == 4)) {
-            limit = declared->count;
-        }
-    }
+    uint32_t byte_count = byte_array_count(g, t);
+    size_t limit = byte_count ? byte_count : 1;
     return emit_global_leaf(g, global, var_start, var_size, leaves, leaf_count,
                             pos, init, limit);
 }
