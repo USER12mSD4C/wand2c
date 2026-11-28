@@ -5489,14 +5489,20 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                 base_type->tag == 10) {
                 buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B);
             }
-            if (!index_simple) buf_u8(b, 0x53); /* push rbx if index may clobber it */
+            if (!index_simple) {
+                buf_u8(b, 0x53); /* push rbx if index may clobber it */
+                g->stack_depth += 8;
+            }
             compile_expr(g, e->b, 0, 1);
 
             /* lea rbx, [rbx + rax * scale] replaces shift plus add for the
              * common element widths. SIB base=rbx (3), index=rax (0), and
              * scale bits encode 1, 2, 4, or 8. */
             if (scale_bits >= 0) {
-                if (!index_simple) buf_u8(b, 0x5B); /* pop rbx */
+                if (!index_simple) {
+                    g->stack_depth -= 8;
+                    buf_u8(b, 0x5B); /* pop rbx */
+                }
                 buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x1C);
                 buf_u8(b, (uint8_t)((scale_bits << 6) | 0x03));
             } else {
@@ -5505,7 +5511,10 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                  * instruction stream for struct arrays. */
                 buf_u8(b, 0x48); buf_u8(b, 0x69); buf_u8(b, 0xC0);
                 buf_u32(b, elem_size);
-                if (!index_simple) buf_u8(b, 0x5B); /* pop rbx */
+                if (!index_simple) {
+                    g->stack_depth -= 8;
+                    buf_u8(b, 0x5B); /* pop rbx */
+                }
                 buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xC3);
             }
             if (internal_reg == 0) {
@@ -5558,13 +5567,17 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
             if (wstr_eq_c(e->str, "OpAdd") || wstr_eq_c(e->str, "+")) {
                 compile_expr(g, e->a, 3, 1);
                 buf_u8(b, 0x53);
+                g->stack_depth += 8;
                 compile_expr(g, e->b, 0, 1);
+                g->stack_depth -= 8;
                 buf_u8(b, 0x5B);
                 buf_u8(b, 0x48); buf_u8(b, 0x01); buf_u8(b, 0xC3);
             } else if (wstr_eq_c(e->str, "OpSub") || wstr_eq_c(e->str, "-")) {
                 compile_expr(g, e->a, 3, 1);
                 buf_u8(b, 0x53);
+                g->stack_depth += 8;
                 compile_expr(g, e->b, 0, 1);
+                g->stack_depth -= 8;
                 buf_u8(b, 0x5B);
                 buf_u8(b, 0x48); buf_u8(b, 0x29); buf_u8(b, 0xC3);
             } else {
@@ -5956,7 +5969,9 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
              value->tag == 10)) {
             compile_address(g, target, 3);
             buf_u8(b, 0x53); /* push destination address */
+            g->stack_depth += 8;
             compile_address(g, value, 3);
+            g->stack_depth -= 8;
             buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
             buf_u8(b, 0x5F); /* pop %rdi */
             emit_mov_imm64(b, 1, total);
@@ -6015,7 +6030,9 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
         type_size(g, value_type->inner) == elem_size) {
         compile_address(g, target, 3);
         buf_u8(b, 0x53); /* push destination address */
+        g->stack_depth += 8;
         compile_address(g, value, 3);
+        g->stack_depth -= 8;
         buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
         buf_u8(b, 0x5F); /* pop %rdi */
         emit_mov_imm64(b, 1, value_type->count < resolved->count
@@ -7169,6 +7186,60 @@ static size_t leaf_count_for_type(Gen* g, WType* t) {
     return tmp.n;
 }
 
+/* Find the first byte array reachable through brace elision inside an
+ * aggregate type. A string initializer for an aggregate selects that byte
+ * array; *prefix is the number of leaves before it and *count is its declared
+ * byte count. Zero means the aggregate has no byte-array leaf. */
+static int first_byte_array_span(Gen* g, WType* t, size_t* prefix,
+                                 uint32_t* count, uint32_t depth) {
+    if (!g || !t || !prefix || !count || depth > 16) {
+        return 0;
+    }
+    WType* peeled = resolve_named_type(g, t);
+    if (!peeled) {
+        return 0;
+    }
+    uint32_t byte_count = byte_array_count(g, peeled);
+    if (byte_count) {
+        *prefix = 0;
+        *count = byte_count;
+        return 1;
+    }
+    if (peeled->tag == 11) {
+        WStruct* st = find_struct_by_name(g, peeled->name);
+        size_t fields = st ? (st->is_union ? 1 : st->field_count) : 0;
+        size_t before = 0;
+        for (size_t i = 0; i < fields; i++) {
+            size_t sub_prefix = 0;
+            uint32_t sub_count = 0;
+            if (first_byte_array_span(g, st->fields[i].type, &sub_prefix,
+                                      &sub_count, depth + 1)) {
+                *prefix = before + sub_prefix;
+                *count = sub_count;
+                return 1;
+            }
+            before += leaf_count_for_type(g, st->fields[i].type);
+        }
+        return 0;
+    }
+    if (peeled->tag == 12 && peeled->count) {
+        size_t elem_leaves = leaf_count_for_type(g, peeled->inner);
+        size_t before = 0;
+        for (uint32_t i = 0; i < peeled->count; i++) {
+            size_t sub_prefix = 0;
+            uint32_t sub_count = 0;
+            if (first_byte_array_span(g, peeled->inner, &sub_prefix,
+                                      &sub_count, depth + 1)) {
+                *prefix = before + sub_prefix;
+                *count = sub_count;
+                return 1;
+            }
+            before += elem_leaves;
+        }
+    }
+    return 0;
+}
+
 /* `Struct arr[1] = { {field0}, field1, ... }` puts one struct element's field
  * initializers at the top level when the first field is itself an aggregate
  * and the first argument is a brace or string. A scalar first field must stay
@@ -7413,6 +7484,18 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
             return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, pos,
                                               init, byte_count);
         }
+        /* Brace elision: a string assigned to an aggregate initializes the
+         * first byte array inside it, not the aggregate's address. */
+        size_t prefix = 0;
+        uint32_t first_count = 0;
+        if (first_byte_array_span(g, t, &prefix, &first_count, 0)) {
+            size_t start = pos + prefix;
+            if (start >= leaf_count) {
+                return pos;
+            }
+            return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, start,
+                                              init, first_count);
+        }
     }
     if (init->tag == 12) {
         size_t sub_count = 0;
@@ -7614,6 +7697,16 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
         if (byte_count) {
             return emit_global_leaf(g, global, var_start, var_size, leaves,
                                     leaf_count, pos, init, byte_count);
+        }
+        size_t prefix = 0;
+        uint32_t first_count = 0;
+        if (first_byte_array_span(g, t, &prefix, &first_count, 0)) {
+            size_t start = pos + prefix;
+            if (start >= leaf_count) {
+                return pos;
+            }
+            return emit_global_leaf(g, global, var_start, var_size, leaves,
+                                    leaf_count, start, init, first_count);
         }
     }
     if (init->tag == 12) {
