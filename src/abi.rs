@@ -382,11 +382,16 @@ pub fn generate_elf64_binary(
         };
 
         let abs_addr = 0x400078u64 + (local_offset as u64);
-        let mut param_types = Vec::new();
-
-        for _ in &func.params {
-            param_types.push(4u32);
-        }
+        let return_type = func
+            .return_types
+            .first()
+            .map(|dt| type_id(dt, program))
+            .unwrap_or(0);
+        let param_types: Vec<u32> = func
+            .params
+            .iter()
+            .map(|(dt, _, _)| type_id(dt, program))
+            .collect();
 
         builder.add_export(
             &func.name,
@@ -394,9 +399,9 @@ pub fn generate_elf64_binary(
             1,
             P46_EXPORT_KIND_FUNCTION,
             abs_addr,
-            4,
+            return_type,
             &param_types,
-            4,
+            return_type,
         );
     }
 

@@ -1779,6 +1779,62 @@ static uint64_t eval_const(Gen* g, WExpr* e) {
     return eval_const_depth(g, e, 0);
 }
 
+static uint64_t const_double_bits(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static double const_f64_value(uint64_t bits) {
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* Match the runtime cvtsi2sd path. Unsigned 64-bit values are converted as
+ * unsigned integers; cvtsi2sd has no unsigned form, so the code generator
+ * splits the value and doubles the result. Host C conversion gives the same
+ * IEEE-754 result here. */
+static uint64_t const_int_to_f64_bits(uint64_t bits, int src_signed) {
+    double value = src_signed ? (double)(int64_t)bits : (double)bits;
+    return const_double_bits(value);
+}
+
+/* Match cvttsd2si: truncate toward zero and return the indefinite value for
+ * NaN, infinity, or an out-of-range operand. */
+static uint64_t const_f64_to_int_bits(uint64_t bits) {
+    double value = const_f64_value(bits);
+    if (!isfinite(value) || value >= 9223372036854775808.0 ||
+        value < -9223372036854775808.0) {
+        return (uint64_t)INT64_MIN;
+    }
+    return (uint64_t)(int64_t)value;
+}
+
+static int const_is_cast_op(WStr op) {
+    return wstr_eq_c(op, "OpCastF64") || wstr_eq_c(op, "OpCastInt") ||
+           wstr_eq_c(op, "OpCast") || wstr_eq_c(op, "OpCastU8") ||
+           wstr_eq_c(op, "OpCastU16") || wstr_eq_c(op, "OpCastU32") ||
+           wstr_eq_c(op, "OpCastU64") || wstr_eq_c(op, "OpCastI8") ||
+           wstr_eq_c(op, "OpCastI16") || wstr_eq_c(op, "OpCastI32") ||
+           wstr_eq_c(op, "OpCastI64");
+}
+
+/* Convert the source of a compile-time cast the same way compile_expr does.
+ * Static initializers used to store the source bits unchanged, so (f64)3 and
+ * (u64)3.5 both kept the integer/float representation of their operand. */
+static uint64_t const_cast_operand(Gen* g, WExpr* operand, WStr op,
+                                   uint32_t depth) {
+    uint64_t bits = eval_const_depth(g, operand, depth + 1);
+    int from_float = is_float_expr(g, operand);
+    if (wstr_eq_c(op, "OpCastF64")) {
+        return from_float ? bits
+                          : const_int_to_f64_bits(bits, is_signed_expr(g, operand));
+    }
+    if (wstr_eq_c(op, "OpCast")) return bits;
+    return from_float ? const_f64_to_int_bits(bits) : bits;
+}
+
 static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth) {
     if (!e || depth > MAX_CONST_DEPTH) {
         return 0;
@@ -1816,28 +1872,18 @@ static uint64_t eval_const_depth(Gen* g, WExpr* e, uint32_t depth) {
             return 0;
         }
         case 8: {
-            if (wstr_eq_c(e->str, "OpCastF64") || wstr_eq_c(e->str, "OpCastInt") ||
-                wstr_eq_c(e->str, "OpCast") || wstr_eq_c(e->str, "OpCastU64") ||
-                wstr_eq_c(e->str, "OpCastI64")) {
-                return eval_const_depth(g, e->a, depth + 1);
-            }
-            if (wstr_eq_c(e->str, "OpCastU8")) {
-                return eval_const_depth(g, e->a, depth + 1) & 0xFFu;
-            }
-            if (wstr_eq_c(e->str, "OpCastU16")) {
-                return eval_const_depth(g, e->a, depth + 1) & 0xFFFFu;
-            }
-            if (wstr_eq_c(e->str, "OpCastU32")) {
-                return eval_const_depth(g, e->a, depth + 1) & 0xFFFFFFFFu;
-            }
-            if (wstr_eq_c(e->str, "OpCastI8")) {
-                return (uint64_t)(int64_t)(int8_t)eval_const_depth(g, e->a, depth + 1);
-            }
-            if (wstr_eq_c(e->str, "OpCastI16")) {
-                return (uint64_t)(int64_t)(int16_t)eval_const_depth(g, e->a, depth + 1);
-            }
-            if (wstr_eq_c(e->str, "OpCastI32")) {
-                return (uint64_t)(int64_t)(int32_t)eval_const_depth(g, e->a, depth + 1);
+            if (const_is_cast_op(e->str)) {
+                uint64_t bits = const_cast_operand(g, e->a, e->str, depth);
+                if (wstr_eq_c(e->str, "OpCastU8")) return bits & 0xFFu;
+                if (wstr_eq_c(e->str, "OpCastU16")) return bits & 0xFFFFu;
+                if (wstr_eq_c(e->str, "OpCastU32")) return bits & 0xFFFFFFFFu;
+                if (wstr_eq_c(e->str, "OpCastI8"))
+                    return (uint64_t)(int64_t)(int8_t)bits;
+                if (wstr_eq_c(e->str, "OpCastI16"))
+                    return (uint64_t)(int64_t)(int16_t)bits;
+                if (wstr_eq_c(e->str, "OpCastI32"))
+                    return (uint64_t)(int64_t)(int32_t)bits;
+                return bits;
             }
             if (wstr_eq_c(e->str, "OpBitNot")) {
                 return ~eval_const_depth(g, e->a, depth + 1);
@@ -7498,33 +7544,6 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     elf_sym_push(&symbols, 0, 0, 0, 0, 0, 0);
     elf_sym_push(&symbols, text_name, 3, 0, 1, 0, 0);
 
-    for (size_t si = 0; si < sects_n; si++) {
-        ElfSectRange* range = &sects[si];
-        WSection* sect = &p->sections[si];
-        uint16_t shndx = (uint16_t)(2u + si);
-        for (size_t vi = 0; vi < sect->count; vi++) {
-            WVar* var = &sect->vars[vi];
-            WStr key = elf_fmt_wstr("%.*s:%.*s", (int)range->name.len,
-                                    ELF_STR(range->name), (int)var->name.len,
-                                    ELF_STR(var->name));
-            uint64_t global_off = 0;
-            uint32_t local_off = map_get_str(&g->global_offsets, key, &global_off)
-                                     ? (uint32_t)global_off
-                                     : 0u;
-            local_off -= range->start; /* u32 wrapping matches Rust release mode */
-
-            WStr sym_name = elf_fmt_wstr("%.*s.%.*s", (int)range->name.len,
-                                         ELF_STR(range->name), (int)var->name.len,
-                                         ELF_STR(var->name));
-            uint32_t name_off = elf_strtab_insert(&strtab, &str_cache, sym_name);
-            uint32_t idx = ELF_SYM_COUNT(symbols);
-            uint32_t var_size = type_size(g, var->type);
-            elf_sym_push(&symbols, name_off, 18, 0, shndx, (uint64_t)local_off,
-                         (uint64_t)var_size);
-            map_put_str(&data_sym, key, (uint64_t)idx);
-        }
-    }
-
     uint16_t rodata_shndx = (uint16_t)(2u + p->section_count);
 
     /* Keys come from g->global_keys (insertion order); Rust iterated a
@@ -7606,8 +7625,41 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     uint32_t first_global = 0; /* sh_info: index of first non-local symbol */
     for (int global_pass = 0; global_pass < 2; global_pass++) {
         if (global_pass == 1) {
-            /* Rust captures first_global right after the local pass. */
+            /* sh_info is the index of the first global symbol. Section
+             * variables are global objects, so they must come after every
+             * local symbol and before first_global is recorded. Emitting them
+             * earlier made linkers treat them as locals despite their GLOBAL
+             * binding. */
             first_global = ELF_SYM_COUNT(symbols);
+            for (size_t si = 0; si < sects_n; si++) {
+                ElfSectRange* range = &sects[si];
+                WSection* sect = &p->sections[si];
+                uint16_t shndx = (uint16_t)(2u + si);
+                for (size_t vi = 0; vi < sect->count; vi++) {
+                    WVar* var = &sect->vars[vi];
+                    WStr key = elf_fmt_wstr("%.*s:%.*s", (int)range->name.len,
+                                            ELF_STR(range->name), (int)var->name.len,
+                                            ELF_STR(var->name));
+                    uint64_t global_off = 0;
+                    uint32_t local_off =
+                        map_get_str(&g->global_offsets, key, &global_off)
+                            ? (uint32_t)global_off
+                            : 0u;
+                    local_off -= range->start; /* u32 wrapping matches Rust */
+
+                    WStr sym_name = elf_fmt_wstr("%.*s.%.*s", (int)range->name.len,
+                                                 ELF_STR(range->name),
+                                                 (int)var->name.len,
+                                                 ELF_STR(var->name));
+                    uint32_t name_off = elf_strtab_insert(&strtab, &str_cache, sym_name);
+                    uint32_t idx = ELF_SYM_COUNT(symbols);
+                    uint32_t var_size = type_size(g, var->type);
+                    /* GLOBAL | OBJECT: section variables are data, not code. */
+                    elf_sym_push(&symbols, name_off, 17, 0, shndx,
+                                 (uint64_t)local_off, (uint64_t)var_size);
+                    map_put_str(&data_sym, key, (uint64_t)idx);
+                }
+            }
         }
         for (size_t i = 0; i < p->func_count; i++) {
             WFunc* f = &p->funcs[i];
