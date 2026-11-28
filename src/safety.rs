@@ -163,6 +163,31 @@ impl MemorySafetyAnalyzer {
         self.errors.push(err);
     }
 
+    fn push_uninitialized_error(&mut self, path: &str, type_name: &str, line: usize) {
+        if path.contains('.') {
+            let parts: Vec<&str> = path.split('.').collect();
+            self.push_error(
+                "error",
+                &format!(
+                    "use of uninitialized field '{}' of struct '{}'",
+                    parts[1], parts[0]
+                ),
+                line,
+                &format!(
+                    "initialize the field before use: {}.{} = ...;",
+                    parts[0], parts[1]
+                ),
+            );
+        } else {
+            self.push_error(
+                "error",
+                &format!("use of potentially uninitialized variable '{}'", path),
+                line,
+                &format!("initialize it: '{} {} = null;'", type_name, path),
+            );
+        }
+    }
+
     fn is_allocation_call(&self, expr: &Expr) -> bool {
         if let Expr::Call { name, .. } = expr {
             name == "mloc"
@@ -191,6 +216,12 @@ impl MemorySafetyAnalyzer {
 
     fn report_pointer_state(&mut self, path: &str, line: usize) {
         match self.states.get(path).cloned() {
+            /* An uninitialized pointer field is dereferenced when used as an
+             * index base. Uninitialized arrays are storage, not pointers, so
+             * their `type_name` does not end in `*`. */
+            Some(VarState::Uninitialized { type_name, .. }) if type_name.ends_with('*') => {
+                self.push_uninitialized_error(path, &type_name, line);
+            }
             Some(VarState::Freed { freed_line }) => {
                 self.push_error(
                     "error",
@@ -957,38 +988,13 @@ impl MemorySafetyAnalyzer {
         match expr {
             Expr::Variable(_) | Expr::MemberAccess { .. } | Expr::Index { .. } => {
                 if let Some(path) = self.get_expr_path(expr) {
-                    if let Some(state) = self.states.get(&path) {
-                        match state {
+                    if let Some(state) = self.states.get(&path).cloned() {
+                        match &state {
                             VarState::Uninitialized {
                                 declared_line: _,
                                 type_name,
                             } => {
-                                let is_field = path.contains('.');
-                                if is_field {
-                                    let parts: Vec<&str> = path.split('.').collect();
-                                    self.push_error(
-                                        "error",
-                                        &format!(
-                                            "use of uninitialized field '{}' of struct '{}'",
-                                            parts[1], parts[0]
-                                        ),
-                                        line,
-                                        &format!(
-                                            "initialize the field before use: {}.{} = ...;",
-                                            parts[0], parts[1]
-                                        ),
-                                    );
-                                } else {
-                                    self.push_error(
-                                        "error",
-                                        &format!(
-                                            "use of potentially uninitialized variable '{}'",
-                                            path
-                                        ),
-                                        line,
-                                        &format!("initialize it: '{} {} = null;'", type_name, path),
-                                    );
-                                }
+                                self.push_uninitialized_error(&path, type_name, line);
                             }
                             VarState::Freed { freed_line } => {
                                 self.push_error(
