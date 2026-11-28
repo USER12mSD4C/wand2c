@@ -1,5 +1,6 @@
 sc.true
 #import <syscall>
+#import <syscall_structs>
 #import <string>
 #import <keyboard>
 #import <signal>
@@ -20,6 +21,7 @@ const TUI_EVT_MOUSE_WHEEL = 5;
 const TUI_EVT_RESIZE = 6;
 const TUI_EVT_FOCUS_IN = 7;
 const TUI_EVT_FOCUS_OUT = 8;
+const TUI_EVT_PASTE = 9;
 
 const TUI_ATTR_BOLD = 1;
 const TUI_ATTR_DIM = 2;
@@ -58,6 +60,12 @@ const TUI_CLR_BRIGHT_BLUE = 12;
 const TUI_CLR_BRIGHT_MAGENTA = 13;
 const TUI_CLR_BRIGHT_CYAN = 14;
 const TUI_CLR_BRIGHT_WHITE = 15;
+
+// Bounds for the cell buffers. A pty reports u16 dimensions, so an extreme
+// resize could otherwise ask for a 16 GB allocation. Anything beyond these
+// limits is still drawn clear after every repaint, but never allocated.
+const TUI_MAX_COLS = 512;
+const TUI_MAX_ROWS = 200;
 
 struct TuiCell {
     u8 ch;
@@ -132,8 +140,27 @@ struct TextViewData {
     u64 lines;
     u64 line_count;
     u64 line_capacity;
+    // Original (unwrapped) records. Stored so a resize can rewrap the log at
+    // the new width instead of clipping old lines.
+    u64 sources;
+    u64 source_count;
+    u64 source_capacity;
     i64 scroll_row;
     i64 scroll_col;
+}
+
+// One source record: [TuiSource][tag bytes][0][ascii text][0].
+// kind 0 = plain wrapped text, kind 1 = tagged block (accent tag on its own
+// line, indented body). Rewrap uses the stored styles.
+struct TuiSource {
+    u8 kind;
+    u8 fg;
+    u8 bg;
+    u8 attr;
+    u8 tag_fg;
+    u8 tag_attr;
+    u8 tag_len;
+    u8 reserved;
 }
 
 struct ButtonData {
@@ -165,24 +192,47 @@ struct TuiState {
     u64 mouse_enabled;
     u64 raw_term_set;
     u8 termios_backup[60];
+    // Set by tui_handle_resize and consumed by tui_poll_event. render_frame
+    // may apply a resize first; the flag keeps one event for the application.
     u64 resize_pending;
     u64 widget_id_counter;
+    // Bracketed paste: we never enable mouse capture, but we do enable paste
+    // so a multi-line paste pasted from another app is not split into commands.
+    u8 paste_buf[16384];
+    u64 paste_len;
 }
 
 sect.tui_g
     u64 state_ptr = 0;
 EOS
 
+// The stdlib arena allocator relocates itself when it grows (mem_grow moves
+// the arena), which would invalidate every widget pointer mid-session. TUI
+// allocations therefore use their own private page mappings: each block is
+// independent and stable for the whole session.
 fn tui_malloc(u64 size) -> u64 {
-    u8* p = mloc(0, size);
-    return(u64 p);
+    if (size == 0) { size = 16; }
+    u64 payload = size;
+    u64 rem = payload % 16;
+    if (rem != 0) { payload = payload + 16 - rem; }
+    u64 total = payload + 16;
+    u64 pages = total / 4096;
+    if (total % 4096 != 0) { pages = pages + 1; }
+    u64 map_len = pages * 4096;
+    u64 base = sys_mmap(0, map_len, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (syscall_error(base) == 1) { return(0); }
+    u64* header = base;
+    header[0] = size;
+    header[1] = map_len;
+    return(base + 16);
 }
 
 fn tui_free(u64 ptr) {
-    if (ptr != 0) {
-        u8* p = ptr;
-        mfree(p);
-    }
+    if (ptr == 0) { return; }
+    u64 base = ptr - 16;
+    u64* header = base;
+    sys_munmap(base, header[1]);
 }
 
 fn tui_realloc(u64 old_ptr, u64 old_size, u64 new_size) -> u64 {
@@ -190,14 +240,16 @@ fn tui_realloc(u64 old_ptr, u64 old_size, u64 new_size) -> u64 {
     if (new_ptr == 0) {
         return(0);
     }
-    if (old_ptr != 0 && old_size > 0) {
-        u8* src = old_ptr;
-        u8* dst = new_ptr;
-        u64 copy_size = old_size;
-        if (copy_size > new_size) {
-            copy_size = new_size;
+    if (old_ptr != 0) {
+        if (old_size > 0) {
+            u8* src = old_ptr;
+            u8* dst = new_ptr;
+            u64 copy_size = old_size;
+            if (copy_size > new_size) {
+                copy_size = new_size;
+            }
+            memcpy(dst, src, copy_size);
         }
-        memcpy(dst, src, copy_size);
         tui_free(old_ptr);
     }
     return(new_ptr);
@@ -296,13 +348,23 @@ fn tui_out_flush(TuiState* s) {
 
 fn tui_get_terminal_size(i64* out_rows*o, i64* out_cols*o) {
     u8 ws_buf[8];
+    ws_buf[0] = 0;
+    ws_buf[1] = 0;
+    ws_buf[2] = 0;
+    ws_buf[3] = 0;
     sys_ioctl(1, 21523, ws_buf*adr);
     u16* p_row*i = ws_buf*adr;
     u16 r = p_row;
     u16* p_col*i = (ws_buf*adr) + 2;
     u16 c = p_col;
-    out_rows = (i64)r;
-    out_cols = (i64)c;
+    i64 rows = (i64)r;
+    i64 cols = (i64)c;
+    if (rows < 1) { rows = 1; }
+    if (cols < 1) { cols = 1; }
+    if (rows > TUI_MAX_ROWS) { rows = TUI_MAX_ROWS; }
+    if (cols > TUI_MAX_COLS) { cols = TUI_MAX_COLS; }
+    out_rows = rows;
+    out_cols = cols;
 }
 
 fn tui_cell_pack(u8 ch, u8 fg, u8 bg, u8 attr) -> u32 {
@@ -330,6 +392,8 @@ fn tui_cell_attr(u32 cell) -> u8 {
 }
 
 fn tui_alloc_buf(i64 cols, i64 rows) -> u64 {
+    if (cols < 1 || rows < 1) { return(0); }
+    if (cols > TUI_MAX_COLS || rows > TUI_MAX_ROWS) { return(0); }
     u64 total = (u64)(cols * rows) * 4;
     u64 buf = tui_malloc(total);
     if (buf == 0) {
@@ -398,18 +462,30 @@ fn tui_buf_draw_char(u64 buf, i64 cols, i64 x, i64 y, u8 ch, u8 fg, u8 bg, u8 at
 // The cell buffer stores one byte per cell, so raw UTF-8 bytes would occupy
 // several cells while the terminal renders one glyph. Decode to one ASCII
 // cell per codepoint instead; this keeps columns aligned on UTF-8 terminals.
-fn tui_utf8_seq_len(u8 c) -> u64 {
+// A malformed sequence is consumed one byte at a time, never past the NUL.
+fn tui_utf8_seq_len(u8* p) -> u64 {
+    u8 c = p[0];
     if (c < 128) { return(1); }
+    u64 n = 1;
     if (c >= 248) { return(1); }
-    if (c >= 240) { return(3); }
-    if (c >= 224) { return(3); }
-    if (c >= 192) { return(2); }
-    return(1);
+    if (c >= 240) { n = 4; }
+    else if (c >= 224) { n = 3; }
+    else if (c >= 192) { n = 2; }
+    u64 k = 1;
+    while (k < n) {
+        if ((p[k] & 192) != 128) { return(1); }
+        k = k + 1;
+    }
+    return(n);
 }
 
 fn tui_utf8_ascii(u8* p, u64 n) -> u8 {
     u64 cp = 0;
-    if (n == 1) { return(p[0]); }
+    if (n == 1) {
+        if (p[0] >= 32 && p[0] < 127) { return(p[0]); }
+        if (p[0] == 9) { return(32); }
+        return(46);
+    }
     if (n == 2) {
         cp = ((u64)(p[0] & 31) << 6) | (u64)(p[1] & 63);
     } else if (n == 3) {
@@ -418,7 +494,7 @@ fn tui_utf8_ascii(u8* p, u64 n) -> u8 {
         cp = ((u64)(p[0] & 7) << 18) | ((u64)(p[1] & 63) << 12) |
              ((u64)(p[2] & 63) << 6) | (u64)(p[3] & 63);
     }
-    if (cp == 0x2500 || cp == 0x2501) { return(45); }
+    if (cp == 0x2500 || cp == 0x2501 || cp == 0x2013 || cp == 0x2014) { return(45); }
     if (cp == 0x2502 || cp == 0x2503) { return(124); }
     if (cp >= 0x250c && cp <= 0x254b) { return(43); }
     if (cp == 0x276f || cp == 0x25b8 || cp == 0x2192) { return(62); }
@@ -426,9 +502,37 @@ fn tui_utf8_ascii(u8* p, u64 n) -> u8 {
     if (cp == 0x2191) { return(94); }
     if (cp == 0x2193) { return(118); }
     if (cp == 0x25c6 || cp == 0x2022 || cp == 0x25cf || cp == 0x2605) { return(42); }
+    if (cp == 0x2713 || cp == 0x2714) { return(118); }
+    if (cp == 0x2717 || cp == 0x2718) { return(120); }
+    if (cp == 0x2018 || cp == 0x2019) { return(39); }
+    if (cp == 0x201c || cp == 0x201d) { return(34); }
     if (cp == 0x2139) { return(105); }
     if (cp == 0x00b7 || cp == 0x2026) { return(46); }
     return(46);
+}
+
+// Convert a UTF-8 string to exactly one byte per displayed cell. Newlines
+// survive so the wrapper can split logical lines afterwards.
+fn tui_ascii_copy(u8* dst, u8* src, u64 max) -> u64 {
+    u64 n = 0;
+    while (src[0] != 0 && n + 1 < max) {
+        if (src[0] == 10 || src[0] == 13) {
+            dst[n] = 10;
+            n = n + 1;
+            src = src + 1;
+            continue;
+        }
+        u64 len = tui_utf8_seq_len(src);
+        dst[n] = tui_utf8_ascii(src, len);
+        n = n + 1;
+        u64 k = 0;
+        while (k < len) {
+            src = src + 1;
+            k = k + 1;
+        }
+    }
+    dst[n] = 0;
+    return(n);
 }
 
 fn tui_buf_draw_span(u64 buf, i64 cols, i64 x, i64 y, u8* p, i64 max_cells, u8 fg, u8 bg, u8 attr) -> i64 {
@@ -436,7 +540,7 @@ fn tui_buf_draw_span(u64 buf, i64 cols, i64 x, i64 y, u8* p, i64 max_cells, u8 f
     while (cx < max_cells) {
         u8 c = p[0];
         if (c == 0) { return(cx); }
-        u64 n = tui_utf8_seq_len(c);
+        u64 n = tui_utf8_seq_len(p);
         tui_buf_draw_char(buf, cols, x + cx, y, tui_utf8_ascii(p, n), fg, bg, attr);
         cx = cx + 1;
         u64 k = 0;
@@ -610,22 +714,9 @@ fn tui_clear_screen(TuiState* s) {
     tui_out_flush(s);
 }
 
-// Signals must not do any rendering: just set a flag that the event loop (or
-// tui_render_frame) applies at a safe point. No SA_RESTART, so a blocking
-// sys_read is interrupted and the pending resize is observed immediately.
-fn tui_on_sigwinch() {
-    TuiState* s = tui_get_state();
-    if (s != null) {
-        s->resize_pending = 1;
-    }
-}
-
-fn tui_install_sigwinch() {
-    SignalHandler handler;
-    signal_init_handler(handler*adr);
-    signal_set_handler(handler*adr, tui_on_sigwinch);
-    signal_install(handler*adr, 28);
-}
+// No SIGWINCH handler: a signal delivered while blocked in read() can corrupt
+// the interrupted syscall frame on this runtime. The event loop polls stdin
+// with a short timeout instead and notices terminal size changes there.
 
 fn tui_char_available() -> u64 {
     u32 count = 0;
@@ -646,6 +737,35 @@ fn tui_read_byte_timeout() -> i64 {
     u32 count = 0;
     sys_ioctl(0, 21531, count*adr);
     if (count == 0) {
+        return(-1);
+    }
+    return(tui_read_byte());
+}
+
+// Wait briefly for the next input byte. This keeps the event loop responsive
+// to terminal resizes without relying on an asynchronous signal handler.
+fn tui_read_byte_wait() -> i64 {
+    pollfd fds;
+    fds.fd = 0;
+    fds.events = 1;
+    fds.revents = 0;
+    i64 n = (i64)sys_poll(fds*adr, 1, 50);
+    if (n <= 0) {
+        return(-1);
+    }
+    return(tui_read_byte());
+}
+
+// Bracketed paste must not be split by a short input gap. Wait much longer
+// than tui_read_byte_wait(), but still give up if the terminal never sends the
+// closing marker.
+fn tui_read_byte_paste() -> i64 {
+    pollfd fds;
+    fds.fd = 0;
+    fds.events = 1;
+    fds.revents = 0;
+    i64 n = (i64)sys_poll(fds*adr, 1, 1000);
+    if (n <= 0) {
         return(-1);
     }
     return(tui_read_byte());
@@ -708,8 +828,51 @@ fn tui_parse_sgr_mouse(TuiState* s, i64* out_type*o, i64* out_btn*o, i64* out_x*
     return(0);
 }
 
+fn tui_paste_end_marker(u8* pat) -> u64 {
+    if (pat[0] != 27 || pat[1] != 91) { return(0); }
+    if (pat[2] != 50 || pat[3] != 48 || pat[4] != 49 || pat[5] != 126) { return(0); }
+    return(1);
+}
+
+// The opening ESC[200~ was already consumed. Collect until ESC[201~ (or EOF),
+// keeping only the pasted bytes. A paste never becomes keystrokes/commands.
+fn tui_read_paste(TuiState* s) -> u64 {
+    u8 pat[6];
+    u64 i = 0;
+    while (i < 6) {
+        pat[i] = 0;
+        i = i + 1;
+    }
+    s->paste_len = 0;
+    u64 filled = 0;
+    while (1) {
+        i64 b = tui_read_byte_paste();
+        if (b < 0) {
+            s->paste_buf[s->paste_len] = 0;
+            return(0);
+        }
+        i = 0;
+        while (i < 5) {
+            pat[i] = pat[i + 1];
+            i = i + 1;
+        }
+        pat[5] = (u8)b;
+        if (filled < 6) { filled = filled + 1; }
+        // Hold back the last five bytes: they might be the start of ESC[201~.
+        if (filled == 6 && tui_paste_end_marker(pat*adr) == 1) {
+            s->paste_buf[s->paste_len] = 0;
+            return(1);
+        }
+        if (filled == 6 && s->paste_len < 16383) {
+            s->paste_buf[s->paste_len] = pat[0];
+            s->paste_len = s->paste_len + 1;
+        }
+    }
+    return(0);
+}
+
 fn tui_parse_input(TuiState* s, u64* out_type*o, u64* out_a*o, u64* out_b*o, u64* out_c*o) -> u64 {
-    i64 b = tui_read_byte();
+    i64 b = tui_read_byte_wait();
     if (b < 0) {
         out_type = TUI_EVT_NONE;
         return(0);
@@ -727,6 +890,27 @@ fn tui_parse_input(TuiState* s, u64* out_type*o, u64* out_a*o, u64* out_b*o, u64
                 out_type = TUI_EVT_KEY;
                 out_a = 27;
                 return(1);
+            }
+            if (b3 == 50) {
+                // ESC[200~ : bracketed paste start.
+                i64 b4 = tui_read_byte_timeout();
+                if (b4 == 48) {
+                    i64 b5 = tui_read_byte_timeout();
+                    if (b5 == 48) {
+                        i64 b6 = tui_read_byte_timeout();
+                        if (b6 == 126) {
+                            if (tui_read_paste(s) == 1) {
+                                out_type = TUI_EVT_PASTE;
+                                out_a = s->paste_len;
+                                out_b = 0;
+                                out_c = 0;
+                                return(1);
+                            }
+                            out_type = TUI_EVT_NONE;
+                            return(0);
+                        }
+                    }
+                }
             }
             if (b3 == 60) {
                 i64 evt_type = 0;
@@ -1512,6 +1696,148 @@ fn tui_textview_add_line_styled(TextViewData* td, u8* text, u8 fg, u8 bg, u8 att
     td->line_count = td->line_count + 1;
 }
 
+// ---- source records -------------------------------------------------------
+// Log records are kept unwrapped so a resize can reflow them at the new
+// terminal width. Display lines are always derived from these records.
+
+fn tui_textview_clear_display(TextViewData* td) {
+    u64* arr = td->lines;
+    u64 i = 0;
+    while (i < td->line_count) {
+        if (arr[i] != 0) { tui_free(arr[i]); }
+        i = i + 1;
+    }
+    td->line_count = 0;
+    td->scroll_row = 0;
+    td->scroll_col = 0;
+}
+
+fn tui_textview_add_source(TextViewData* td, u8 kind, u8* tag, u8* text,
+                           u8 fg, u8 bg, u8 attr, u8 tag_fg, u8 tag_attr) -> u64 {
+    u64 tag_len = strlen(tag);
+    if (tag_len > 12) { tag_len = 12; }
+    u64 text_len = strlen(text);
+    if (td->source_count >= td->source_capacity) {
+        u64 new_cap = td->source_capacity * 2;
+        if (new_cap == 0) { new_cap = 32; }
+        u64 old_size = td->source_capacity * 8;
+        u64 new_size = new_cap * 8;
+        u64 new_arr = tui_realloc(td->sources, old_size, new_size);
+        if (new_arr == 0) { return(0); }
+        td->sources = new_arr;
+        td->source_capacity = new_cap;
+    }
+    u64 total = sizeof(TuiSource) + tag_len + 1 + text_len + 1;
+    u64 ptr = tui_malloc(total);
+    if (ptr == 0) { return(0); }
+    TuiSource* src = ptr;
+    memset(src, 0, sizeof(TuiSource));
+    src->kind = kind;
+    src->fg = fg;
+    src->bg = bg;
+    src->attr = attr;
+    src->tag_fg = tag_fg;
+    src->tag_attr = tag_attr;
+    src->tag_len = (u8)tag_len;
+    u8* base = ptr;
+    u8* dst = base + sizeof(TuiSource);
+    u64 i = 0;
+    while (i < tag_len) {
+        dst[i] = tag[i];
+        i = i + 1;
+    }
+    dst[tag_len] = 0;
+    dst = dst + tag_len + 1;
+    tui_ascii_copy(dst, text, text_len + 1);
+    u64* arr = td->sources;
+    arr[td->source_count] = ptr;
+    td->source_count = td->source_count + 1;
+    return(ptr);
+}
+
+fn tui_wrap_segment(TextViewData* td, u8* text, u64 start, u64 end,
+                    i64 limit, u8 fg, u8 bg, u8 attr, i64 indent) {
+    u8 line[600];
+    u64 i = 0;
+    while (i < (u64)indent && i < 20) {
+        line[i] = 32;
+        i = i + 1;
+    }
+    if (start == end) {
+        line[i] = 0;
+        tui_textview_add_line_styled(td, line, fg, bg, attr);
+        return;
+    }
+    u64 pos = start;
+    while (pos < end) {
+        u64 take = (u64)limit;
+        if (pos + take > end) { take = end - pos; }
+        if (pos + take < end && take > 1) {
+            u64 j = pos + take - 1;
+            while (j > pos && text[j] != 32) { j = j - 1; }
+            if (j > pos && text[j] == 32) { take = j - pos; }
+        }
+        if (take == 0) { take = 1; }
+        u64 k = 0;
+        while (k < take) {
+            line[i] = text[pos + k];
+            i = i + 1;
+            k = k + 1;
+        }
+        line[i] = 0;
+        tui_textview_add_line_styled(td, line, fg, bg, attr);
+        pos = pos + take;
+        while (pos < end && text[pos] == 32) { pos = pos + 1; }
+        i = (u64)indent;
+    }
+}
+
+fn tui_textview_wrap_source(TextViewData* td, u64 src_ptr, i64 width) {
+    if (src_ptr == 0) { return; }
+    TuiSource* src = src_ptr;
+    u8* base = src_ptr;
+    u8* text = base + sizeof(TuiSource) + (u64)src->tag_len + 1;
+    i64 indent = 0;
+    if (src->kind == 1 && src->tag_len > 0) {
+        u8 tag[16];
+        u64 i = 0;
+        while (i < (u64)src->tag_len && i < 15) {
+            tag[i] = base[sizeof(TuiSource) + i];
+            i = i + 1;
+        }
+        tag[i] = 0;
+        tui_textview_add_line_styled(td, tag, src->tag_fg, src->bg, src->tag_attr);
+        indent = (i64)src->tag_len + 1;
+        if (indent > 10) { indent = 10; }
+    }
+    i64 limit = width - indent - 1;
+    if (limit < 4) { limit = 4; }
+    if (limit > 512) { limit = 512; }
+    u64 start = 0;
+    u64 pos = 0;
+    while (1) {
+        u8 c = text[pos];
+        if (c == 0) {
+            if (pos > start) { tui_wrap_segment(td, text, start, pos, limit, src->fg, src->bg, src->attr, indent); }
+            return;
+        }
+        if (c == 10 || c == 13) {
+            tui_wrap_segment(td, text, start, pos, limit, src->fg, src->bg, src->attr, indent);
+            start = pos + 1;
+        }
+        pos = pos + 1;
+    }
+}
+
+fn tui_textview_rewrap_all(TextViewData* td, i64 width) {
+    u64* arr = td->sources;
+    u64 i = 0;
+    while (i < td->source_count) {
+        tui_textview_wrap_source(td, arr[i], width);
+        i = i + 1;
+    }
+}
+
 fn tui_textview_set_text(u64 widget, u8* text) {
     if (widget == 0) {
         return;
@@ -1521,50 +1847,16 @@ fn tui_textview_set_text(u64 widget, u8* text) {
         return;
     }
     TextViewData* td = w->data;
-    u64* arr = td->lines;
+    tui_textview_clear_display(td);
+    u64* sources = td->sources;
     u64 i = 0;
-    while (i < td->line_count) {
-        if (arr[i] != 0) {
-            tui_free(arr[i]);
-        }
+    while (i < td->source_count) {
+        if (sources[i] != 0) { tui_free(sources[i]); }
         i = i + 1;
     }
-    td->line_count = 0;
-    td->scroll_row = 0;
-    u8* p*i = text;
-    u64 line_start = 0;
-    u64 pos = 0;
-    u8 c = p;
-    while (c != 0) {
-        if (c == 10) {
-            u64 line_len = pos - line_start;
-            u64 line_buf = tui_malloc(line_len + 1);
-            if (line_buf != 0) {
-                u8* dst = line_buf;
-                u8* src = text + line_start;
-                u64 k = 0;
-                while (k < line_len) {
-                    dst[k] = src[k];
-                    k = k + 1;
-                }
-                dst[line_len] = 0;
-            }
-            u64* lines_arr = td->lines;
-            if (td->line_count < td->line_capacity) {
-                lines_arr[td->line_count] = line_buf;
-                td->line_count = td->line_count + 1;
-            } else {
-                tui_textview_add_line(td, text + line_start);
-            }
-            line_start = pos + 1;
-        }
-        pos = pos + 1;
-        p = p + 1;
-        c = p;
-    }
-    if (pos > line_start) {
-        tui_textview_add_line(td, text + line_start);
-    }
+    td->source_count = 0;
+    tui_textview_add_source(td, 0, "", text, w->fg, w->bg, w->attr, w->fg, w->attr);
+    tui_textview_rewrap_all(td, w->w);
     tui_widget_mark_dirty(widget);
 }
 
@@ -1577,7 +1869,11 @@ fn tui_textview_append_line(u64 widget, u8* line) {
         return;
     }
     TextViewData* td = w->data;
-    tui_textview_add_line(td, line);
+    // Keep append_line records in the source list too. Otherwise a resize
+    // rewrap would silently drop every line added through this API.
+    u64 src = tui_textview_add_source(td, 0, "", line, w->fg, w->bg, w->attr,
+                                      w->fg, w->attr);
+    tui_textview_wrap_source(td, src, w->w);
     tui_widget_mark_dirty(widget);
 }
 
@@ -1590,16 +1886,14 @@ fn tui_textview_clear(u64 widget) {
         return;
     }
     TextViewData* td = w->data;
-    u64* arr = td->lines;
+    tui_textview_clear_display(td);
+    u64* sources = td->sources;
     u64 i = 0;
-    while (i < td->line_count) {
-        if (arr[i] != 0) {
-            tui_free(arr[i]);
-        }
+    while (i < td->source_count) {
+        if (sources[i] != 0) { tui_free(sources[i]); }
         i = i + 1;
     }
-    td->line_count = 0;
-    td->scroll_row = 0;
+    td->source_count = 0;
     tui_widget_mark_dirty(widget);
 }
 
@@ -1730,6 +2024,17 @@ fn tui_widget_destroy(u64 widget) {
             }
             if (td->lines != 0) {
                 tui_free(td->lines);
+            }
+            u64* sources = td->sources;
+            k = 0;
+            while (k < td->source_count) {
+                if (sources[k] != 0) {
+                    tui_free(sources[k]);
+                }
+                k = k + 1;
+            }
+            if (td->sources != 0) {
+                tui_free(td->sources);
             }
         }
         if (w->widget_type == TUI_TYPE_BUTTON) {
@@ -1906,6 +2211,14 @@ fn tui_draw_list(u64 buf, i64 cols, TuiWidget* w) {
     }
 }
 
+fn tui_textview_line_len(u8* text) -> i64 {
+    if (text == null) { return(0); }
+    if (text[0] == TUI_LINE_STYLE) { text = text + 4; }
+    i64 n = 0;
+    while (text[n] != 0 && n < 4096) { n = n + 1; }
+    return(n);
+}
+
 fn tui_draw_textview(u64 buf, i64 cols, TuiWidget* w) {
     TextViewData* td = w->data;
     u8 fg = w->fg;
@@ -1914,11 +2227,30 @@ fn tui_draw_textview(u64 buf, i64 cols, TuiWidget* w) {
     u32 fill = tui_cell_pack(32, fg, bg, attr);
     tui_buf_fill(buf, cols, w->x, w->y, w->w, w->h, fill);
     i64 visible_rows = w->h;
+    if (visible_rows < 1) { return; }
+    if (td->scroll_row < 0) { td->scroll_row = 0; }
+    i64 max_row = (i64)td->line_count - 1;
+    if (max_row < 0) { max_row = 0; }
+    if (td->scroll_row > max_row) { td->scroll_row = max_row; }
+    // Clamp horizontal scrolling to the longest visible line. Without this,
+    // arrow-right could walk the pointer past the NUL of a short line.
+    i64 max_col = 0;
+    u64* lines = td->lines;
     i64 r = 0;
+    while (r < visible_rows) {
+        i64 idx = td->scroll_row + r;
+        if (idx >= 0 && idx < (i64)td->line_count) {
+            i64 len = tui_textview_line_len(lines[idx]);
+            if (len > max_col) { max_col = len; }
+        }
+        r = r + 1;
+    }
+    if (td->scroll_col < 0) { td->scroll_col = 0; }
+    if (td->scroll_col > max_col) { td->scroll_col = max_col; }
+    r = 0;
     while (r < visible_rows) {
         i64 line_idx = td->scroll_row + r;
         if (line_idx >= 0 && line_idx < (i64)td->line_count) {
-            u64* lines = td->lines;
             u64 line_ptr = lines[line_idx];
             u8* text = line_ptr;
             if (text != null) {
@@ -1932,7 +2264,10 @@ fn tui_draw_textview(u64 buf, i64 cols, TuiWidget* w) {
                     line_attr = text[3];
                     span = text + 4;
                 }
-                tui_buf_draw_span(buf, cols, w->x, w->y + r, span + td->scroll_col,
+                i64 skip = td->scroll_col;
+                i64 len = tui_textview_line_len(text);
+                if (skip > len) { skip = len; }
+                tui_buf_draw_span(buf, cols, w->x, w->y + r, span + skip,
                                   w->w, line_fg, line_bg, line_attr);
             }
         }
@@ -2298,6 +2633,12 @@ fn tui_find_prev_focus(u64 root, u64 current) -> u64 {
     return(last);
 }
 
+export fn tui_is_ready() -> u64 {
+    TuiState* s = tui_get_state();
+    if (s == null) { return(0); }
+    return(s->initialized);
+}
+
 fn tui_init() {
     u64 state = tui_malloc(sizeof(TuiState));
     if (state == 0) {
@@ -2328,13 +2669,18 @@ fn tui_init() {
     s->focused = 0;
     s->widget_id_counter = 0;
     tui_set_raw_mode(s);
-    // Use the alternate screen so the caller's scrollback survives the session.
+    // Disable autowrap so a write to the last cell of the last row can never
+    // scroll the screen during a diff repaint. Restored on shutdown.
+    tui_out_str(s, "\033[?7l");
+    // Keep the alternate screen (the caller's scrollback survives), but never
+    // capture the mouse: drag-selection must remain a terminal feature so the
+    // user can copy text out of the session normally.
     tui_out_str(s, "\033[?1049h");
+    // Multi-line paste must arrive as one event, not as a stream of Returns.
+    tui_out_str(s, "\033[?2004h");
     tui_out_flush(s);
-    tui_enable_mouse(s);
     tui_hide_cursor(s);
     tui_clear_screen(s);
-    tui_install_sigwinch();
 }
 
 fn tui_shutdown() {
@@ -2347,7 +2693,9 @@ fn tui_shutdown() {
     }
     tui_show_cursor(s);
     tui_disable_mouse(s);
+    tui_out_str(s, "\033[?2004l");
     tui_out_str(s, "\033[2J\033[H\033[?1049l");
+    tui_out_str(s, "\033[?7h");
     tui_restore_term(s);
     tui_out_flush(s);
     if (s->front_buf != 0) {
@@ -2373,25 +2721,27 @@ fn tui_handle_resize(TuiState* s) {
     i64 r = 24;
     i64 c = 80;
     tui_get_terminal_size(r*adr, c*adr);
-    if (r < 1) {
-        r = 24;
-    }
-    if (c < 1) {
-        c = 80;
-    }
     if (r == s->rows && c == s->cols) {
         return;
     }
+    // Allocate before freeing: an allocation failure must leave the old
+    // buffers and dimensions intact instead of drawing into a null buffer.
+    u64 new_front = tui_alloc_buf(c, r);
+    u64 new_back = tui_alloc_buf(c, r);
+    if (new_front == 0 || new_back == 0) {
+        if (new_front != 0) { tui_free_buf(new_front); }
+        if (new_back != 0) { tui_free_buf(new_back); }
+        return;
+    }
+    if (s->front_buf != 0) { tui_free_buf(s->front_buf); }
+    if (s->back_buf != 0) { tui_free_buf(s->back_buf); }
+    s->front_buf = new_front;
+    s->back_buf = new_back;
     s->cols = c;
     s->rows = r;
-    if (s->front_buf != 0) {
-        tui_free_buf(s->front_buf);
-    }
-    if (s->back_buf != 0) {
-        tui_free_buf(s->back_buf);
-    }
-    s->front_buf = tui_alloc_buf(c, r);
-    s->back_buf = tui_alloc_buf(c, r);
+    // render_frame may apply the resize before poll_event sees it. Keep an
+    // explicit pending flag so the application still receives one RESIZE event.
+    s->resize_pending = 1;
     tui_clear_screen(s);
     if (s->root != 0) {
         TuiWidget* root = s->root;
@@ -2405,9 +2755,9 @@ fn tui_poll_event(u64 out_type*o, u64 out_a*o, u64 out_b*o, u64 out_c*o) -> u64 
         out_type = TUI_EVT_NONE;
         return(0);
     }
+    tui_handle_resize(s);
     if (s->resize_pending != 0) {
         s->resize_pending = 0;
-        tui_handle_resize(s);
         out_type = TUI_EVT_RESIZE;
         out_a = (u64)s->cols;
         out_b = (u64)s->rows;
@@ -2589,40 +2939,15 @@ fn tui_run(u64 root) {
     }
 }
 
-// Append text to a textview, splitting newlines and wrapping long lines to the
-// widget width. Useful for log-style panes where callers append whole records.
-fn tui_emit_wrapped_segment(TextViewData* td, u8* text, u64 start, u64 end, i64 width, u8 fg, u8 bg, u8 attr) {
-    if (width < 4) { width = 40; }
-    i64 limit = width - 1;
-    u64 pos = start;
-    while (pos < end) {
-        u8 seg[512];
-        u64 n = 0;
-        while (pos < end && (i64)n < limit && n < 510) {
-            seg[n] = text[pos];
-            n = n + 1;
-            pos = pos + 1;
-        }
-        seg[n] = 0;
-        tui_textview_add_line_styled(td, seg, fg, bg, attr);
-    }
-}
-
+// Append a record to a textview, preserving every line and reflowing long
+// lines at the widget width. Blank lines are kept; nothing is truncated.
 fn tui_append_wrapped_impl(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr) {
     if (widget == 0 || text == null) { return; }
     TuiWidget* w = widget;
     if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
     TextViewData* td = w->data;
-    u64 i = 0;
-    u64 start = 0;
-    while (text[i] != 0) {
-        if (text[i] == 10 || text[i] == 13) {
-            tui_emit_wrapped_segment(td, text, start, i, width, fg, bg, attr);
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    if (start < i) { tui_emit_wrapped_segment(td, text, start, i, width, fg, bg, attr); }
+    u64 src = tui_textview_add_source(td, 0, "", text, fg, bg, attr, fg, attr);
+    tui_textview_wrap_source(td, src, width);
     tui_widget_mark_dirty(widget);
 }
 
@@ -2634,6 +2959,67 @@ export fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width) {
 
 export fn tui_textview_append_wrapped_styled(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr) {
     tui_append_wrapped_impl(widget, text, width, fg, bg, attr);
+}
+
+// A tagged block: the tag gets its own accent line, the body is indented under
+// it. Used for user / assistant / tool message groups.
+export fn tui_textview_append_block(u64 widget, u8* tag, u8* text, i64 width,
+                                    u8 tag_fg, u8 body_fg, u8 bg,
+                                    u8 tag_attr, u8 body_attr) {
+    if (widget == 0 || text == null) { return; }
+    TuiWidget* w = widget;
+    if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
+    TextViewData* td = w->data;
+    u64 src = tui_textview_add_source(td, 1, tag, text, body_fg, bg, body_attr,
+                                      tag_fg, tag_attr);
+    tui_textview_wrap_source(td, src, width);
+    tui_widget_mark_dirty(widget);
+}
+
+// Reflow every stored record after a terminal resize.
+export fn tui_textview_rewrap(u64 widget, i64 width) {
+    if (widget == 0) { return; }
+    TuiWidget* w = widget;
+    if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
+    TextViewData* td = w->data;
+    tui_textview_clear_display(td);
+    if (width < 8) { width = 20; }
+    tui_textview_rewrap_all(td, width);
+    tui_widget_mark_dirty(widget);
+}
+
+// Write the original (unwrapped) transcript to stdout after the terminal has
+// been restored, so the whole session is available in normal scrollback for
+// copy/paste. No ANSI styling is emitted here.
+export fn tui_textview_dump(u64 widget) {
+    if (widget == 0) { return; }
+    TuiWidget* w = widget;
+    if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
+    TextViewData* td = w->data;
+    u64* arr = td->sources;
+    u64 i = 0;
+    while (i < td->source_count) {
+        u8* base = arr[i];
+        TuiSource* src = arr[i];
+        u8* text = base + sizeof(TuiSource) + (u64)src->tag_len + 1;
+        if (src->kind == 1 && src->tag_len > 0) {
+            sys_write(1, base + sizeof(TuiSource), src->tag_len);
+            u8 colon[2];
+            colon[0] = 58;
+            colon[1] = 32;
+            sys_write(1, colon*adr, 2);
+        }
+        sys_write(1, text, strlen(text));
+        u8 nl = 10;
+        sys_write(1, nl*adr, 1);
+        i = i + 1;
+    }
+}
+
+export fn tui_get_paste_text() -> u8* {
+    TuiState* s = tui_get_state();
+    if (s == null) { return(null); }
+    return(s->paste_buf);
 }
 
 export fn tui_textview_scroll_bottom(u64 widget) {
@@ -2678,9 +3064,6 @@ export fn tui_render_frame() {
     if (s->initialized == 0) {
         return;
     }
-    if (s->resize_pending != 0) {
-        s->resize_pending = 0;
-        tui_handle_resize(s);
-    }
+    tui_handle_resize(s);
     tui_render(s);
 }

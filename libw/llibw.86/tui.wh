@@ -1,6 +1,9 @@
 sc.true
 
+const TUI_EVT_PASTE = 9;
+
 extern fn tui_init();
+extern fn tui_is_ready() -> u64;
 extern fn tui_shutdown();
 extern fn tui_run(u64 root);
 extern fn tui_request_exit();
@@ -59,7 +62,13 @@ extern fn tui_textview_clear(u64 widget);
 extern fn tui_textview_get_line_count(u64 widget) -> i64;
 extern fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width);
 extern fn tui_textview_append_wrapped_styled(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr);
+extern fn tui_textview_append_block(u64 widget, u8* tag, u8* text, i64 width,
+                                    u8 tag_fg, u8 body_fg, u8 bg,
+                                    u8 tag_attr, u8 body_attr);
+extern fn tui_textview_rewrap(u64 widget, i64 width);
 extern fn tui_textview_scroll_bottom(u64 widget);
+extern fn tui_textview_dump(u64 widget);
+extern fn tui_get_paste_text() -> u8*;
 
 extern fn tui_button_set_text(u64 widget, u8* text);
 
