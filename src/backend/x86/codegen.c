@@ -2965,6 +2965,17 @@ static int expr_deref_flag(Gen* g, WExpr* e, int deref_ptr) {
     return deref_ptr;
 }
 
+/* A cast uses its operand's stored representation: pointer/array sources keep
+ * the address regardless of the surrounding value context. Other sources keep
+ * the ordinary modifier-aware read. */
+static int cast_operand_deref_flag(Gen* g, WExpr* operand, int deref_ptr) {
+    WType* t = resolve_named_type(g, resolve_expr_type(g, operand));
+    if (t && (t->tag == 10 || t->tag == 12)) {
+        return 0;
+    }
+    return expr_deref_flag(g, operand, deref_ptr);
+}
+
 /* Float value context always reads through input/input-output variables,
  * including *i locals used as byte walkers. The generic helper keeps those
  * locals raw for pointer arithmetic and comparisons, which is not appropriate
@@ -3383,7 +3394,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             }
             if (wstr_eq_c(op, "OpCastF64")) {
                 int src_is_float = is_float_expr(g, e->a);
-                compile_expr(g, e->a, 0, deref_ptr);
+                compile_expr(g, e->a, 0, cast_operand_deref_flag(g, e->a, deref_ptr));
                 if (!src_is_float) {
                     emit_int_bits_to_f64_bits(g, 0, is_signed_expr(g, e->a));
                 }
@@ -3391,7 +3402,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCastInt")) {
-                compile_expr(g, e->a, 0, deref_ptr);
+                compile_expr(g, e->a, 0, cast_operand_deref_flag(g, e->a, deref_ptr));
                 if (is_float_expr(g, e->a)) {
                     emit_cvttsd2si_rax(b);
                 }
@@ -3406,7 +3417,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 wstr_eq_c(op, "OpCastU32") || wstr_eq_c(op, "OpCastI8") ||
                 wstr_eq_c(op, "OpCastI16") || wstr_eq_c(op, "OpCastI32")) {
                 int from_float = is_float_expr(g, e->a);
-                compile_expr(g, e->a, 0, deref_ptr);
+                compile_expr(g, e->a, 0, cast_operand_deref_flag(g, e->a, deref_ptr));
                 if (from_float) {
                     emit_cvttsd2si_rax(b);
                 }
@@ -3427,7 +3438,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCastU64") || wstr_eq_c(op, "OpCastI64")) {
-                compile_expr(g, e->a, 0, deref_ptr);
+                compile_expr(g, e->a, 0, cast_operand_deref_flag(g, e->a, deref_ptr));
                 if (is_float_expr(g, e->a)) {
                     emit_cvttsd2si_rax(b);
                 }
@@ -3435,7 +3446,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpCast")) {
-                compile_expr(g, e->a, reg, deref_ptr);
+                compile_expr(g, e->a, reg, cast_operand_deref_flag(g, e->a, deref_ptr));
                 return;
             }
             if (wstr_eq_c(op, "OpBitNot")) {
