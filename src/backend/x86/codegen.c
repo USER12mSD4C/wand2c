@@ -2708,9 +2708,18 @@ static int is_float_expr(Gen* g, WExpr* e) {
                 return 0;
             }
             return is_float_expr(g, e->a) || is_float_expr(g, e->b);
-        case 9:
+        case 9: {
+            /* A call returning f64 is a float value, including ordinary Wand
+             * functions (not just the built-in float intrinsics). Otherwise
+             * f() + 1.0 converts the returned bit pattern as an integer. */
+            WFunc* f = func_by_name(g, e->str);
+            if (f && f->return_count) {
+                WType* rt = resolve_named_type(g, f->returns[0]);
+                if (is_float_type_named(g, rt)) return 1;
+            }
             return wstr_eq_c(e->str, "sin") || wstr_eq_c(e->str, "cos") ||
                    wstr_eq_c(e->str, "tan") || wstr_eq_c(e->str, "sqrt");
+        }
         default:
             return 0;
     }
@@ -3466,8 +3475,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             }
             if (float_op && e->a && e->b && e->a->tag == 3 && e->b->tag == 3 &&
                 wstr_eq(e->a->str, e->b->str) && emit_float_op_xmm1(NULL, op)) {
-                /* x op x: load once, copy to rbx; avoids a second stack load. */
-                compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
+                /* x op x: load once, copy to rbx; avoids a second stack load.
+                 * Float value context must read through input/input-output
+                 * slots even when the same variable is also a pointer walker. */
+                compile_expr(g, e->a, 0,
+                             float_value_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
                 emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
@@ -4622,7 +4634,7 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
          * round trip that the generic rax-based cast emits. A full-width
          * unsigned source can have its high bit set, which cvtsi2sd would
          * read as negative; use the halving path for that case. */
-        compile_expr(g, e->a, 0, float_value_deref_flag(g, e->a, 1));
+        compile_expr(g, e->a, 0, cast_operand_deref_flag(g, e->a, 1));
         if (is_signed_expr(g, e->a) || expr_size(g, e->a) < 8) {
             buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
         } else {
@@ -6905,6 +6917,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
                         default: buf_u8(b, 0x58); break; /* pop r8 */
                     }
                 }
+            }
+            /* Wand f64 returns travel in rax. Callers of known Wand callees
+             * copy xmm0 to rax after the call, so mirror the value into xmm0
+             * here as well to cover internal functions, multi-value returns,
+             * and C/extern-style f64 consumers. */
+            if (s->return_count && g->current_function &&
+                g->current_function->return_count) {
+                WType* rt = resolve_named_type(g, g->current_function->returns[0]);
+                if (rt && rt->tag == 8) emit_movq_rax_to_xmm0(b);
             }
             buf_u8(b, 0x48); buf_u8(b, 0x8D); buf_u8(b, 0x65);
             buf_u8(b, g->current_is_irq ? 0xF8 : 0xF0);
