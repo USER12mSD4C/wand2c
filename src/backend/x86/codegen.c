@@ -7169,11 +7169,14 @@ static size_t leaf_count_for_type(Gen* g, WType* t) {
     return tmp.n;
 }
 
-/* `Struct arr[1] = { field0, field1, ... }` puts one struct element's field
- * initializers at the top level. There is only one element, so any argument
- * list matching the field count is unambiguous. */
+/* `Struct arr[1] = { {field0}, field1, ... }` puts one struct element's field
+ * initializers at the top level when the first field is itself an aggregate
+ * and the first argument is a brace or string. A scalar first field must stay
+ * flat: `Pair p[1] = {{1,2},{3,4}}` initializes p[0] from the first brace and
+ * ignores the excess second brace, rather than treating both braces as fields.
+ * Likewise `{ 1, 2 }` fills leaves in declaration order. */
 static int is_single_struct_field_list(Gen* g, WType* t, WExpr* init) {
-    if (!t || !init || init->tag != 12) {
+    if (!t || !init || init->tag != 12 || !init->arg_count) {
         return 0;
     }
     WType* peeled = resolve_named_type(g, t);
@@ -7185,8 +7188,15 @@ static int is_single_struct_field_list(Gen* g, WType* t, WExpr* init) {
         return 0;
     }
     WStruct* st = find_struct_by_name(g, inner->name);
-    size_t fields = st ? (st->is_union ? 1 : st->field_count) : 0;
-    return fields && init->arg_count == fields;
+    if (!st || !st->field_count) {
+        return 0;
+    }
+    WType* first_field = resolve_named_type(g, st->fields[0].type);
+    if (!first_field || (first_field->tag != 11 && first_field->tag != 12)) {
+        return 0;
+    }
+    WExpr* first = init->args[0];
+    return first && (first->tag == 12 || first->tag == 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -7227,9 +7237,12 @@ static void emit_runtime_leaf_store(Gen* g, RuntimeInitCtx* ctx, InitLeaf* leaf,
         return;
     }
     if (ctx->use_rbx) {
-        /* Leaf expression codegen may use rbx as scratch. */
+        /* Leaf expression codegen may use rbx as scratch. Track the extra
+         * push so calls inside the initializer still see 16-byte alignment. */
         buf_u8(b, 0x53); /* push rbx */
+        g->stack_depth += 8;
         compile_expr(g, arg, 0, 1);
+        g->stack_depth -= 8;
         buf_u8(b, 0x5B); /* pop rbx */
         emit_rbx_mem_store(b, leaf->off, width);
     } else {
@@ -7318,7 +7331,9 @@ static size_t emit_runtime_aggregate_copy(Gen* g, RuntimeInitCtx* ctx, WType* t,
     Buf* b = &g->code;
     if (ctx->use_rbx) {
         buf_u8(b, 0x53); /* push destination base */
+        g->stack_depth += 8;
         compile_address(g, arg, 3);
+        g->stack_depth -= 8;
         buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
         buf_u8(b, 0x5F); /* pop %rdi */
         if (at) {
