@@ -7493,6 +7493,9 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
             if (start >= leaf_count) {
                 return pos;
             }
+            /* The final tail fill only covers bytes at or above ctx->used,
+             * so clear any fields/padding before the selected byte array. */
+            zero_runtime_range(g, ctx, (uint32_t)leaves[start].off);
             return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, start,
                                               init, first_count);
         }
