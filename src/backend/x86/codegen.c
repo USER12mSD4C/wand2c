@@ -4078,6 +4078,27 @@ static void emit_cmp_rax_imm(Buf* b, int64_t imm) {
     }
 }
 
+/* cmp rhs,lhs with full 64-bit register extensions. Flags describe lhs-rhs,
+ * matching the old cmp %rbx,%rax sequence. */
+static void emit_cmp_two_regs(Buf* b, uint8_t lhs, uint8_t rhs) {
+    emit_rex(b, (uint8_t)(0x48 | (rhs >= 8 ? 4 : 0) | (lhs >= 8 ? 1 : 0)));
+    buf_u8(b, 0x39);
+    buf_u8(b, (uint8_t)(0xC0 | ((rhs & 7) << 3) | (lhs & 7)));
+}
+
+/* cmp imm,lhs for the int32 range that emit_cmp_rax_imm already accepts.
+ * Callers fall back to the rax path for wider constants. */
+static void emit_cmp_reg_imm(Buf* b, uint8_t lhs, int64_t imm) {
+    emit_rex(b, (uint8_t)(0x48 | (lhs >= 8 ? 1 : 0)));
+    if (imm >= -128 && imm <= 127) {
+        buf_u8(b, 0x83); buf_u8(b, (uint8_t)(0xF8 | (lhs & 7)));
+        buf_u8(b, (uint8_t)imm);
+    } else {
+        buf_u8(b, 0x81); buf_u8(b, (uint8_t)(0xF8 | (lhs & 7)));
+        buf_u32(b, (uint32_t)imm);
+    }
+}
+
 static int is_float_comparison(Gen* g, WExpr* e) {
     return e && e->tag == 8 && (is_float_expr(g, e->a) || is_float_expr(g, e->b));
 }
@@ -4168,6 +4189,27 @@ static int comparison_setcc(Gen* g, WExpr* e, uint8_t* setcc) {
 /* Emit operands and cmp for a comparison expression, leaving flags set. */
 static void emit_cmp_operands(Gen* g, WExpr* e) {
     Buf* b = &g->code;
+    uint8_t lhs_reg = 0;
+    int lhs_bound = e && e->a && e->a->tag == 3 &&
+                    reg_local_lookup(g, e->a->str, &lhs_reg) &&
+                    !is_float_expr(g, e->a);
+    if (lhs_bound && e->b && (e->b->tag == 0 || e->b->tag == 1)) {
+        int64_t sv = (int64_t)e->b->num;
+        if (sv >= INT32_MIN && sv <= INT32_MAX) {
+            emit_cmp_reg_imm(b, lhs_reg, sv);
+            return;
+        }
+    }
+    if (lhs_bound && e->b && e->b->tag == 3) {
+        uint8_t rhs_reg = 0;
+        if (reg_local_lookup(g, e->b->str, &rhs_reg)) {
+            emit_cmp_two_regs(b, lhs_reg, rhs_reg);
+        } else {
+            compile_expr(g, e->b, 3, 1);
+            emit_cmp_two_regs(b, lhs_reg, 3);
+        }
+        return;
+    }
     if (e->b && (e->b->tag == 0 || e->b->tag == 1) &&
         !is_float_expr(g, e->a)) {
         int64_t sv = (int64_t)e->b->num;
