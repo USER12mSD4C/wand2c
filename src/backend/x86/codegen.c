@@ -6318,7 +6318,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     WType* vt = resolve_named_type(g, resolve_expr_type(g, s->e1));
                     aggregate_value = vt && (vt->tag == 11 || vt->tag == 12);
                 }
-                if (declared && declared->tag == 12 && s->access == 3 &&
+                if (declared && declared->tag == 12 &&
                     (s->e1->tag == 12 || s->e1->tag == 2 || aggregate_value)) {
                     emit_runtime_init_local(g, s->e1, s->type, off, var_size);
                     aggregate_init = 1;
@@ -7152,6 +7152,43 @@ static uint32_t byte_array_count(Gen* g, WType* t) {
     return (uint32_t)peeled->count;
 }
 
+/* Number of characters a string literal contributes as an initializer leaf.
+ * The terminal NUL is supplied by whole-array/zero-fill handling, not here. */
+static uint32_t string_char_count(WExpr* e) {
+    if (!e || e->tag != 2) {
+        return 0;
+    }
+    Buf bytes = {0};
+    unescape_string(e->str, &bytes);
+    return bytes.len ? (uint32_t)bytes.len : 1;
+}
+
+static size_t leaf_count_for_type(Gen* g, WType* t) {
+    InitLeafVec tmp = {0};
+    collect_init_leaves(g, t, 0, &tmp, 0);
+    return tmp.n;
+}
+
+/* `Struct arr[1] = { field0, field1, ... }` puts one struct element's field
+ * initializers at the top level. There is only one element, so any argument
+ * list matching the field count is unambiguous. */
+static int is_single_struct_field_list(Gen* g, WType* t, WExpr* init) {
+    if (!t || !init || init->tag != 12) {
+        return 0;
+    }
+    WType* peeled = resolve_named_type(g, t);
+    if (!peeled || peeled->tag != 12 || peeled->count != 1) {
+        return 0;
+    }
+    WType* inner = resolve_named_type(g, peeled->inner);
+    if (!inner || inner->tag != 11) {
+        return 0;
+    }
+    WStruct* st = find_struct_by_name(g, inner->name);
+    size_t fields = st ? (st->is_union ? 1 : st->field_count) : 0;
+    return fields && init->arg_count == fields;
+}
+
 /* ------------------------------------------------------------------ */
 /* Runtime aggregate initialization                                   */
 /* ------------------------------------------------------------------ */
@@ -7162,6 +7199,8 @@ typedef struct {
     uint32_t size;   /* total declared object size */
     uint32_t used;   /* highest byte offset written so far */
 } RuntimeInitCtx;
+
+static void zero_runtime_range(Gen* g, RuntimeInitCtx* ctx, uint32_t end);
 
 static uint32_t runtime_leaf_width(Gen* g, WType* t) {
     WType* p = resolve_named_type(g, t);
@@ -7332,11 +7371,8 @@ static size_t emit_runtime_flat_args(Gen* g, RuntimeInitCtx* ctx,
              * tail zero-fill supplies the NUL. Only a string that initializes
              * the whole byte array gets its own NUL, and that case is handled
              * by byte_array_count before this flat path. */
-            Buf bytes = {0};
-            unescape_string(init->str, &bytes);
-            uint32_t count = bytes.len ? (uint32_t)bytes.len : 1;
             return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, pos,
-                                              init, count);
+                                              init, string_char_count(init));
         }
     }
     emit_runtime_leaf_store(g, ctx, &leaves[pos], init);
@@ -7387,22 +7423,7 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
              * two field initializers were written as sibling braces. Treat
              * the whole brace as the element initializer instead of flattening
              * it into the parent array's leaves. */
-            int element_fields = 0;
-            if (peeled->count == 1 && inner && inner->tag == 11) {
-                WStruct* ist = find_struct_by_name(g, inner->name);
-                size_t fields = ist ? (ist->is_union ? 1 : ist->field_count) : 0;
-                if (fields && init->arg_count == fields) {
-                    element_fields = 1;
-                    for (size_t i = 0; i < init->arg_count; i++) {
-                        if (!init->args[i] || (init->args[i]->tag != 12 &&
-                                               init->args[i]->tag != 2)) {
-                            element_fields = 0;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (element_fields) {
+            if (is_single_struct_field_list(g, t, init)) {
                 return emit_runtime_init_expr(g, ctx, inner, init, leaves,
                                               leaf_count, pos, depth + 1);
             }
@@ -7416,20 +7437,46 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
         }
         if (peeled && peeled->tag == 11 && st) {
             size_t count = st->is_union ? 1 : st->field_count;
-            if (count > init->arg_count) count = init->arg_count;
             for (size_t i = 0; i < count && pos < leaf_count; i++) {
-                pos = emit_runtime_init_expr(g, ctx, st->fields[i].type,
-                                             init->args[i], leaves, leaf_count,
-                                             pos, depth + 1);
+                WType* field_type = st->fields[i].type;
+                size_t before = pos;
+                size_t span = leaf_count_for_type(g, field_type);
+                if (i < init->arg_count && init->args[i]) {
+                    pos = emit_runtime_init_expr(g, ctx, field_type,
+                                                 init->args[i], leaves,
+                                                 leaf_count, pos, depth + 1);
+                }
+                /* Skipped or partially initialized leaves still occupy their
+                 * declared offsets. Zero them now so the next field starts at
+                 * its own leaf instead of the skipped one. */
+                uint32_t start = (uint32_t)leaves[before].off;
+                uint64_t field_bytes = type_size(g, field_type);
+                uint64_t end = (uint64_t)start + field_bytes;
+                zero_runtime_range(g, ctx, (uint32_t)end);
+                size_t expected = before + span;
+                if (expected > leaf_count) expected = leaf_count;
+                if (pos < expected) pos = expected;
             }
             return pos;
         }
         if (peeled && peeled->tag == 12) {
             size_t count = peeled->count;
-            if (count > init->arg_count) count = init->arg_count;
             for (size_t i = 0; i < count && pos < leaf_count; i++) {
-                pos = emit_runtime_init_expr(g, ctx, peeled->inner, init->args[i],
-                                             leaves, leaf_count, pos, depth + 1);
+                WType* elem_type = peeled->inner;
+                size_t before = pos;
+                size_t span = leaf_count_for_type(g, elem_type);
+                if (i < init->arg_count && init->args[i]) {
+                    pos = emit_runtime_init_expr(g, ctx, elem_type, init->args[i],
+                                                 leaves, leaf_count, pos,
+                                                 depth + 1);
+                }
+                uint32_t start = (uint32_t)leaves[before].off;
+                uint64_t elem_bytes = type_size(g, elem_type);
+                uint64_t end = (uint64_t)start + elem_bytes;
+                zero_runtime_range(g, ctx, (uint32_t)end);
+                size_t expected = before + span;
+                if (expected > leaf_count) expected = leaf_count;
+                if (pos < expected) pos = expected;
             }
             return pos;
         }
@@ -7443,9 +7490,15 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
     return pos + 1;
 }
 
-static uint32_t finish_runtime_init(Gen* g, RuntimeInitCtx* ctx) {
+/* Zero bytes that no supplied initializer leaf reached. This is needed before
+ * advancing over omitted sub-aggregate leaves, otherwise a later field lands
+ * on a skipped leaf instead of its own offset. */
+static void zero_runtime_range(Gen* g, RuntimeInitCtx* ctx, uint32_t end) {
     Buf* b = &g->code;
-    while (ctx->used < ctx->size) {
+    if (end > ctx->size) {
+        end = ctx->size;
+    }
+    while (ctx->used < end) {
         emit_mov_imm64(b, 0, 0);
         if (ctx->use_rbx) {
             emit_rbx_mem_store(b, ctx->used, 1);
@@ -7457,6 +7510,10 @@ static uint32_t finish_runtime_init(Gen* g, RuntimeInitCtx* ctx) {
         }
         ctx->used++;
     }
+}
+
+static uint32_t finish_runtime_init(Gen* g, RuntimeInitCtx* ctx) {
+    zero_runtime_range(g, ctx, ctx->size);
     return ctx->used;
 }
 
@@ -7498,6 +7555,35 @@ static uint32_t emit_runtime_init_local(Gen* g, WExpr* init, WType* type,
     return finish_runtime_init(g, &ctx);
 }
 
+/* Flat global brace lists fill leaves in declaration order. Nested strings
+ * contribute only their characters; the global data buffer is pre-zeroed, so
+ * the terminal NUL and any skipped leaves stay zero. */
+static size_t emit_global_flat_args(Gen* g, Buf* global, size_t var_start,
+                                    uint32_t var_size, InitLeaf* leaves,
+                                    size_t leaf_count, size_t pos, WExpr* init,
+                                    uint32_t depth) {
+    if (!init || pos >= leaf_count || depth > 16) {
+        return pos;
+    }
+    if (init->tag == 12) {
+        for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
+            pos = emit_global_flat_args(g, global, var_start, var_size, leaves,
+                                        leaf_count, pos, init->args[i],
+                                        depth + 1);
+        }
+        return pos;
+    }
+    uint32_t max_leaves = 1;
+    if (init->tag == 2) {
+        WType* lt = resolve_named_type(g, leaves[pos].type);
+        if (lt && (lt->tag == 0 || lt->tag == 4)) {
+            max_leaves = string_char_count(init);
+        }
+    }
+    return emit_global_leaf(g, global, var_start, var_size, leaves,
+                            leaf_count, pos, init, max_leaves);
+}
+
 /* Consume initializer arguments against the flattened leaf list. Braces map
  * to their sub-aggregate; a flat list fills leaves in declaration order, which
  * is what `Pair ps[2] = { 11, 22, 33, 44 }` requires. */
@@ -7517,20 +7603,15 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
     }
     if (init->tag == 12) {
         WType* peeled = resolve_named_type(g, t);
-        int has_brace_arg = 0;
-        for (size_t i = 0; i < init->arg_count; i++) {
-            if (init->args[i] && init->args[i]->tag == 12) {
-                has_brace_arg = 1;
-                break;
-            }
-        }
         size_t sub_count = 0;
         WStruct* st = NULL;
+        WType* inner = NULL;
         if (peeled && peeled->tag == 11) {
             st = find_struct_by_name(g, peeled->name);
             if (st) sub_count = st->is_union ? 1 : st->field_count;
         } else if (peeled && peeled->tag == 12) {
             sub_count = peeled->count;
+            inner = resolve_named_type(g, peeled->inner);
         }
         /* `u8 a[4] = { "abc" }` fills the whole array with bytes, not just the
          * first leaf. The same applies to a typedef'd array field. */
@@ -7543,37 +7624,56 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
                 return pos;
             }
         }
-        /* `Pair ps[2] = { 11, 22, 33, 44 }` is a flat leaf list, not two
-         * element initializers. Use leaf order whenever the flat list is
-         * longer than the declared sub-aggregate list. */
-        if (!has_brace_arg && sub_count && init->arg_count > sub_count) {
-            for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
-                pos = emit_global_leaf(g, global, var_start, var_size, leaves,
-                                       leaf_count, pos, init->args[i], 1);
-            }
-            return pos;
+        /* `Bytes g[1] = { "ABCD", "XYZ" }` is one element's field list. */
+        if (is_single_struct_field_list(g, t, init)) {
+            return emit_global_init_expr(g, global, var_start, var_size,
+                                         peeled->inner, init, leaves,
+                                         leaf_count, pos, depth + 1);
         }
-        if (peeled && peeled->tag == 11) {
-            size_t count = 0;
-            if (st) {
-                count = st->is_union ? 1 : st->field_count;
-                if (count > init->arg_count) count = init->arg_count;
-                for (size_t i = 0; i < count; i++) {
+        /* A scalar element type always flattens; an aggregate array flattens
+         * when the list is longer than the declared element count. This also
+         * covers `Outer a[1] = {{{1,2},{3,4}}, 55}` with nested braces. */
+        int scalar_elem = inner && inner->tag != 11 && inner->tag != 12;
+        if (scalar_elem || (sub_count && init->arg_count > sub_count)) {
+            return emit_global_flat_args(g, global, var_start, var_size,
+                                         leaves, leaf_count, pos, init,
+                                         depth + 1);
+        }
+        if (peeled && peeled->tag == 11 && st) {
+            size_t count = st->is_union ? 1 : st->field_count;
+            for (size_t i = 0; i < count; i++) {
+                WType* field_type = st->fields[i].type;
+                size_t before = pos;
+                size_t span = leaf_count_for_type(g, field_type);
+                if (i < init->arg_count && init->args[i]) {
                     pos = emit_global_init_expr(g, global, var_start, var_size,
-                                                st->fields[i].type,
-                                                init->args[i], leaves,
-                                                leaf_count, pos, depth + 1);
+                                                field_type, init->args[i],
+                                                leaves, leaf_count, pos,
+                                                depth + 1);
                 }
+                /* The global buffer is pre-zeroed; only the leaf position
+                 * needs to skip fields that had no initializer. */
+                size_t expected = before + span;
+                if (expected > leaf_count) expected = leaf_count;
+                if (pos < expected) pos = expected;
             }
             return pos;
         }
         if (peeled && peeled->tag == 12) {
             size_t count = peeled->count;
-            if (count > init->arg_count) count = init->arg_count;
             for (size_t i = 0; i < count; i++) {
-                pos = emit_global_init_expr(g, global, var_start, var_size,
-                                            peeled->inner, init->args[i],
-                                            leaves, leaf_count, pos, depth + 1);
+                WType* elem_type = peeled->inner;
+                size_t before = pos;
+                size_t span = leaf_count_for_type(g, elem_type);
+                if (i < init->arg_count && init->args[i]) {
+                    pos = emit_global_init_expr(g, global, var_start, var_size,
+                                                elem_type, init->args[i],
+                                                leaves, leaf_count, pos,
+                                                depth + 1);
+                }
+                size_t expected = before + span;
+                if (expected > leaf_count) expected = leaf_count;
+                if (pos < expected) pos = expected;
             }
             return pos;
         }
