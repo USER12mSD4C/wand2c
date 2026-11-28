@@ -1545,15 +1545,6 @@ static uint32_t type_size(Gen* g, WType* t) {
     }
 }
 
-static int is_byte_array(WType* t) {
-    WType* peeled = peel_typedefs(t);
-    if (!peeled || peeled->tag != 12) {
-        return 0;
-    }
-    WType* elem = peel_typedefs(peeled->inner);
-    return elem && (elem->tag == 0 || elem->tag == 4);
-}
-
 static uint32_t type_alignment_of(Gen* g, WType* t) {
     if (!t) {
         return 1;
@@ -1636,7 +1627,7 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
             return map_get_str(&g->section_types, key, &v) ? AS_PTR(WType, v) : NULL;
         }
         case 6: { /* MemberAccess */
-            WType* base = peel_typedefs(resolve_expr_type(g, e->a));
+            WType* base = resolve_named_type(g, resolve_expr_type(g, e->a));
             if (!base) {
                 return NULL;
             }
@@ -1644,7 +1635,7 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
             if (base->tag == 11) {
                 struct_name = base->name;
             } else if (base->tag == 10) {
-                WType* inner = peel_typedefs(base->inner);
+                WType* inner = resolve_named_type(g, base->inner);
                 if (!inner || inner->tag != 11) {
                     return NULL;
                 }
@@ -1662,7 +1653,7 @@ static WType* resolve_expr_type(Gen* g, WExpr* e) {
                                                                    : NULL;
         }
         case 10: { /* Index */
-            WType* base = peel_typedefs(resolve_expr_type(g, e->a));
+            WType* base = resolve_named_type(g, resolve_expr_type(g, e->a));
             if (base && (base->tag == 12 || base->tag == 10)) {
                 return base->inner;
             }
@@ -3187,10 +3178,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             WType* var_type = map_get_str(&g->section_types, key, &type_ptr)
                                   ? AS_PTR(WType, type_ptr)
                                   : NULL;
-            WType* scalar_type = var_type;
-            while (scalar_type && scalar_type->tag == 13) {
-                scalar_type = scalar_type->inner;
-            }
+            /* Named typedefs are tag 11 and must resolve through g->typedefs;
+             * peeling only inline tag 13 nodes loads a u32 typedef as u64. */
+            WType* scalar_type = resolve_named_type(g, var_type);
             if (scalar_type && scalar_type->tag == 12) {
                 emit_rip_relative_lea(g, reg, key);
             } else {
@@ -5321,7 +5311,7 @@ static int index_sib_ready(Gen* g, WExpr* e, uint8_t* base, uint8_t* index,
                            int* scale_bits) {
     if (!e || e->tag != 10 || !e->a || !e->b) return 0;
     if (e->a->tag != 3 || e->b->tag != 3) return 0;
-    WType* bt = peel_typedefs(resolve_expr_type(g, e->a));
+    WType* bt = resolve_named_type(g, resolve_expr_type(g, e->a));
     uint32_t elem = 8;
     if (bt && (bt->tag == 12 || bt->tag == 10)) elem = type_size(g, bt->inner);
     int scale = -1;
@@ -5402,7 +5392,7 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                      * section slot. When the variable is used as the base of
                      * an index or member access, load that address instead of
                      * using the slot itself. Arrays keep the slot address. */
-                    WType* base_type = peel_typedefs(resolve_expr_type(g, e));
+                    WType* base_type = resolve_named_type(g, resolve_expr_type(g, e));
                     if (base_type && base_type->tag == 10) {
                         buf_u8(b, 0x48); buf_u8(b, 0x8B);
                         buf_u8(b, internal_reg == 0 ? 0x00 : 0x1B);
@@ -5412,7 +5402,7 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
             break;
         }
         case 10: { /* Index */
-            WType* base_type = peel_typedefs(resolve_expr_type(g, e->a));
+            WType* base_type = resolve_named_type(g, resolve_expr_type(g, e->a));
             uint32_t elem_size = 8;
             if (base_type && (base_type->tag == 12 || base_type->tag == 10)) {
                 elem_size = type_size(g, base_type->inner);
@@ -5491,12 +5481,12 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                     buf_u8(b, 0x48); buf_u8(b, 0x8B); buf_u8(b, 0x1B);
                 }
             }
-            WType* base = peel_typedefs(resolve_expr_type(g, e->a));
+            WType* base = resolve_named_type(g, resolve_expr_type(g, e->a));
             WStr struct_name = wstr_lit("");
             if (base && base->tag == 11) {
                 struct_name = base->name;
             } else if (base && base->tag == 10) {
-                WType* inner = peel_typedefs(base->inner);
+                WType* inner = resolve_named_type(g, base->inner);
                 if (inner && inner->tag == 11) {
                     struct_name = inner->name;
                 }
@@ -5597,7 +5587,7 @@ static int is_f64_store_target(Gen* g, WExpr* e) {
     if (e->tag != 6 && e->tag != 10) {
         return 0;
     }
-    WType* t = peel_typedefs(resolve_expr_type(g, e));
+    WType* t = resolve_named_type(g, resolve_expr_type(g, e));
     return t && t->tag == 8;
 }
 
@@ -5902,11 +5892,11 @@ static int try_compile_string_copy_to_u8_array(Gen* g, WExpr* target, WExpr* val
     if (!target || !value || value->tag != 2) {
         return 0;
     }
-    WType* resolved = peel_typedefs(resolve_expr_type(g, target));
+    WType* resolved = resolve_named_type(g, resolve_expr_type(g, target));
     if (!resolved || resolved->tag != 12 || resolved->count == 0) {
         return 0;
     }
-    WType* elem = peel_typedefs(resolved->inner);
+    WType* elem = resolve_named_type(g, resolved->inner);
     if (!elem || (elem->tag != 0 && elem->tag != 4)) {
         return 0;
     }
@@ -6855,9 +6845,28 @@ static WVar* global_var_by_key(Gen* g, WStr key) {
     return NULL;
 }
 
+/* Resolve a bare variable or section access to the key of the object itself.
+ * A byte array initialized by a string literal must name the array, not the
+ * separate string-table copy. */
+static int global_object_key(Gen* g, WExpr* e, WStr* key) {
+    WStr candidate = {0};
+    if (e->tag == 7 && e->str.ptr && e->str2.ptr) {
+        candidate = wstr_pair(e->str, e->str2);
+    } else if (e->tag == 3 && e->str.ptr) {
+        candidate = find_global_key(g, e->str);
+    }
+    if (!candidate.ptr || !global_var_by_key(g, candidate)) {
+        return 0;
+    }
+    *key = candidate;
+    return 1;
+}
+
 /* Resolve an address-valued initializer. A bare pointer global is followed to
  * its own initializer, so `Holder h = { q }` and `u64* r = q` reuse the same
- * constant address as `q = arr*adr` instead of storing null. */
+ * constant address as `q = arr*adr` instead of storing null. Any other object
+ * names its own address, so `u64* p = arr` and `u8* p = arr` point at the
+ * array rather than at a string-table copy. */
 static int global_pointer_init_key_depth(Gen* g, WExpr* e, WStr* key,
                                          uint32_t depth) {
     if (!e || depth > 16) {
@@ -6871,16 +6880,16 @@ static int global_pointer_init_key_depth(Gen* g, WExpr* e, WStr* key,
     if (global_init_address_key(g, e, key)) {
         return 1;
     }
-    if (e->tag == 3) {
-        WStr var_key = find_global_key(g, e->str);
-        if (!var_key.ptr) {
-            return 0;
+    WStr obj_key = {0};
+    if (global_object_key(g, e, &obj_key)) {
+        WVar* var = global_var_by_key(g, obj_key);
+        WType* vt = resolve_named_type(g, var->type);
+        if (vt && vt->tag == 10 && type_size(g, vt) == 8 &&
+            var->has_init && var->init) {
+            return global_pointer_init_key_depth(g, var->init, key, depth + 1);
         }
-        WVar* var = global_var_by_key(g, var_key);
-        if (!var || !var->has_init || !var->init) {
-            return 0;
-        }
-        return global_pointer_init_key_depth(g, var->init, key, depth + 1);
+        *key = obj_key;
+        return 1;
     }
     return 0;
 }
@@ -6902,7 +6911,7 @@ static void collect_init_leaves(Gen* g, WType* t, size_t base,
     if (!t || depth > 16) {
         return;
     }
-    WType* peeled = peel_typedefs(t);
+    WType* peeled = resolve_named_type(g, t);
     if (!peeled) {
         return;
     }
@@ -6939,32 +6948,66 @@ static void collect_init_leaves(Gen* g, WType* t, size_t base,
     InitLeafVec_push(leaves, leaf);
 }
 
-static void emit_global_leaf(Gen* g, Buf* global, size_t var_start,
-                             uint32_t var_size, InitLeaf* leaf, WExpr* arg) {
-    if (leaf->off >= var_size) {
-        return;
+static size_t emit_global_leaf(Gen* g, Buf* global, size_t var_start,
+                               uint32_t var_size, InitLeaf* leaves,
+                               size_t leaf_count, size_t pos, WExpr* arg) {
+    if (!arg) {
+        return pos;
     }
-    WType* t = peel_typedefs(leaf->type);
+    if (!leaves || pos >= leaf_count) {
+        return pos + 1;
+    }
+    InitLeaf* leaf = &leaves[pos];
+    if (leaf->off >= var_size) {
+        return pos + 1;
+    }
+    WType* t = resolve_named_type(g, leaf->type);
     uint32_t width = t ? type_size(g, t) : 8;
     if (!width) width = 1;
     if (width > var_size - leaf->off) {
         width = (uint32_t)(var_size - leaf->off);
     }
-    size_t pos = var_start + leaf->off;
+    size_t at = var_start + leaf->off;
+    /* A string literal assigned to a byte leaf fills consecutive byte leaves,
+     * including the NUL and any remaining array slots. This covers struct
+     * fields such as `Rec rec = { 3, "hi" }` as well as whole byte arrays. */
+    if (arg->tag == 2 && t && (t->tag == 0 || t->tag == 4)) {
+        Buf bytes = {0};
+        unescape_string(arg->str, &bytes);
+        size_t consumed = 0;
+        while (pos + consumed < leaf_count) {
+            InitLeaf* l = &leaves[pos + consumed];
+            WType* lt = resolve_named_type(g, l->type);
+            if (!lt || (lt->tag != 0 && lt->tag != 4) ||
+                l->off != leaf->off + consumed) {
+                break;
+            }
+            size_t dest = var_start + l->off;
+            uint8_t value = consumed < bytes.len
+                                ? (uint8_t)bytes.data[consumed]
+                                : 0;
+            if (dest < var_start + var_size) {
+                global->data[dest] = value;
+            }
+            consumed++;
+        }
+        return pos + (consumed ? consumed : 1);
+    }
     if (t && t->tag == 10 && width == 8) {
         WStr key = {0};
         if (global_pointer_init_key(g, arg, &key)) {
             GlobalPtrFixup fixup;
-            fixup.pos = pos;
+            fixup.pos = at;
             fixup.key = key;
             GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
-            return;
+            return pos + 1;
         }
     }
     uint64_t value = eval_const(g, arg);
     for (uint32_t byte = 0; byte < width; byte++) {
-        global->data[pos + byte] = byte < 8 ? (uint8_t)(value >> (byte * 8)) : 0;
+        global->data[at + byte] = byte < 8 ? (uint8_t)(value >> (byte * 8)) : 0;
     }
+    return pos + 1;
 }
 
 /* Consume initializer arguments against the flattened leaf list. Braces map
@@ -6978,7 +7021,7 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
         return pos;
     }
     if (init->tag == 12) {
-        WType* peeled = peel_typedefs(t);
+        WType* peeled = resolve_named_type(g, t);
         int has_brace_arg = 0;
         for (size_t i = 0; i < init->arg_count; i++) {
             if (init->args[i] && init->args[i]->tag == 12) {
@@ -6999,9 +7042,8 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
          * longer than the declared sub-aggregate list. */
         if (!has_brace_arg && sub_count && init->arg_count > sub_count) {
             for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
-                emit_global_leaf(g, global, var_start, var_size, &leaves[pos],
-                                 init->args[i]);
-                pos++;
+                pos = emit_global_leaf(g, global, var_start, var_size, leaves,
+                                       leaf_count, pos, init->args[i]);
             }
             return pos;
         }
@@ -7030,14 +7072,13 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
             return pos;
         }
         if (init->arg_count) {
-            emit_global_leaf(g, global, var_start, var_size, &leaves[pos],
-                             init->args[0]);
-            pos++;
+            pos = emit_global_leaf(g, global, var_start, var_size, leaves,
+                                   leaf_count, pos, init->args[0]);
         }
         return pos;
     }
-    emit_global_leaf(g, global, var_start, var_size, &leaves[pos], init);
-    return pos + 1;
+    return emit_global_leaf(g, global, var_start, var_size, leaves, leaf_count,
+                            pos, init);
 }
 
 static void setup_program(Gen* g, Buf* global) {
@@ -7160,50 +7201,15 @@ static void setup_program(Gen* g, Buf* global) {
             map_put_str(&g->section_var_sizes, key, var_size);
             map_put_str(&g->section_types, key, PTR(var->type));
             size_t start_len = global->len;
-            WStr ptr_fixup_key = {0};
-            WType* var_type = peel_typedefs(var->type);
-            int var_is_pointer = var_type && var_type->tag == 10 &&
-                                 type_size(g, var_type) == 8;
-            if (var_is_pointer && var->has_init && var->init) {
-                global_pointer_init_key(g, var->init, &ptr_fixup_key);
+            for (uint32_t k = 0; k < var_size; k++) {
+                buf_u8(global, 0);
             }
-            if (ptr_fixup_key.ptr) {
-                /* The target offset is not known until all globals are laid
-                 * out, so write a placeholder and patch it after the string
-                 * and section tables are complete. */
-                for (uint32_t k = 0; k < var_size; k++) {
-                    buf_u8(global, 0);
-                }
-                GlobalPtrFixup fixup;
-                fixup.pos = start_len;
-                fixup.key = ptr_fixup_key;
-                GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
-            } else {
-                for (uint32_t k = 0; k < var_size; k++) {
-                    buf_u8(global, 0);
-                }
-                if (var->has_init && var->init) {
-                    if (var->init->tag == 2 && is_byte_array(var->type)) {
-                        /* A string literal assigned to u8[N]/i8[N] is byte
-                         * data, not a pointer: copy its bytes plus NUL. */
-                        Buf bytes = {0};
-                        unescape_string(var->init->str, &bytes);
-                        size_t copy_len = bytes.len + 1;
-                        if (copy_len > var_size) {
-                            copy_len = var_size;
-                        }
-                        if (copy_len) {
-                            memcpy(global->data + start_len, bytes.data, copy_len - 1);
-                            global->data[start_len + copy_len - 1] = 0;
-                        }
-                    } else {
-                        InitLeafVec leaves = {0};
-                        collect_init_leaves(g, var->type, 0, &leaves, 0);
-                        emit_global_init_expr(g, global, start_len, var_size,
-                                              var->type, var->init, leaves.v,
-                                              leaves.n, 0, 0);
-                    }
-                }
+            if (var->has_init && var->init) {
+                InitLeafVec leaves = {0};
+                collect_init_leaves(g, var->type, 0, &leaves, 0);
+                emit_global_init_expr(g, global, start_len, var_size,
+                                      var->type, var->init, leaves.v,
+                                      leaves.n, 0, 0);
             }
         }
     }
