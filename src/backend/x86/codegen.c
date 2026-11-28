@@ -1503,6 +1503,9 @@ static uint32_t type_alignment_of(Gen* g, WType* t) {
             return type_alignment_of(g, t->inner);
         case 11: {
             uint64_t v;
+            if (map_get_str(&g->typedefs, t->name, &v)) {
+                return type_alignment_of(g, AS_PTR(WType, v));
+            }
             return map_get_str(&g->struct_alignments, t->name, &v) ? (uint32_t)v : 1;
         }
         default:
@@ -1995,6 +1998,58 @@ static void emit_movq_xmm0_to_rax(Buf* b) {
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x7E); buf_u8(b, 0xC0);
 }
 
+/* mov %reg,%rax for 64-bit GPRs. */
+static void emit_mov_gpr_to_rax(Buf* b, uint8_t reg) {
+    if (!reg) return;
+    buf_u8(b, reg >= 8 ? 0x49 : 0x48);
+    buf_u8(b, 0x89);
+    buf_u8(b, (uint8_t)(0xC0 | ((reg & 7) << 3)));
+}
+
+/* Convert an integer bit pattern in reg to an f64 bit pattern in reg. The
+ * unsigned path halves values with the high bit set so cvtsi2sd cannot read
+ * them as negative. rcx is a scratch register and is preserved when reg is
+ * rcx. */
+static void emit_int_bits_to_f64_bits(Gen* g, uint8_t reg, int src_signed) {
+    Buf* b = &g->code;
+    int saved_rcx = reg == 1;
+    if (saved_rcx) buf_u8(b, 0x51); /* push rcx */
+    emit_mov_gpr_to_rax(b, reg);
+    if (!src_signed) {
+        buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0); /* test rax,rax */
+        buf_u8(b, 0x0F); buf_u8(b, 0x89);
+        size_t pos_plain = b->len;
+        buf_u32(b, 0);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC1); /* mov rcx,rax */
+        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xE1); buf_u8(b, 0x01); /* and rcx,1 */
+        buf_u8(b, 0x48); buf_u8(b, 0xD1); buf_u8(b, 0xE8); /* shr rax,1 */
+        buf_u8(b, 0x48); buf_u8(b, 0x09); buf_u8(b, 0xC8); /* or rax,rcx */
+        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x58); buf_u8(b, 0xC0); /* addsd xmm0,xmm0 */
+        buf_u8(b, 0xE9);
+        size_t pos_end = b->len;
+        buf_u32(b, 0);
+        patch_address(g, pos_plain, (int32_t)(b->len - (pos_plain + 4)));
+        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        patch_address(g, pos_end, (int32_t)(b->len - (pos_end + 4)));
+    } else {
+        static const uint8_t seq[] = {0xF2, 0x48, 0x0F, 0x2A, 0xC0};
+        buf_bytes(b, seq, sizeof(seq));
+    }
+    emit_movq_xmm0_to_rax(b);
+    if (saved_rcx) buf_u8(b, 0x59); /* pop rcx */
+    if (reg) move_rax_to_reg(b, reg);
+}
+
+/* Compile e into reg, converting integer operands used by f64 arithmetic. */
+static void compile_float_operand_bits(Gen* g, WExpr* e, uint8_t reg,
+                                       int deref_ptr) {
+    compile_expr(g, e, reg, deref_ptr);
+    if (e && !is_float_expr(g, e)) {
+        emit_int_bits_to_f64_bits(g, reg, is_signed_expr(g, e));
+    }
+}
+
 /* movq %gpr,%xmm0 for 64-bit GPRs. */
 static void emit_movq_gpr_to_xmm0(Buf* b, uint8_t gpr) {
     buf_u8(b, 0x66);
@@ -2485,6 +2540,7 @@ static int is_float_expr(Gen* g, WExpr* e) {
             return 0;
         case 3:
         case 6:
+        case 7:
             return is_float_type_named(g, resolve_expr_type(g, e));
         case 10: { /* Index: classify by the element type of the base object. */
             WType* base = resolve_named_type(g, resolve_expr_type(g, e->a));
@@ -3020,33 +3076,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 int src_is_float = is_float_expr(g, e->a);
                 compile_expr(g, e->a, 0, deref_ptr);
                 if (!src_is_float) {
-                    int src_signed = is_signed_expr(g, e->a);
-                    if (!src_signed) {
-                        /* cvtsi2sd interprets its source as signed. For the
-                         * upper half of the u64 range, convert half the value
-                         * and double it so the low bit cannot flip the sign. */
-                        buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0); /* test rax,rax */
-                        buf_u8(b, 0x0F); buf_u8(b, 0x89);
-                        size_t pos_patch = b->len;
-                        buf_u32(b, 0);
-                        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC1); /* mov rcx,rax */
-                        buf_u8(b, 0x48); buf_u8(b, 0x83); buf_u8(b, 0xE1); buf_u8(b, 0x01); /* and rcx,1 */
-                        buf_u8(b, 0x48); buf_u8(b, 0xD1); buf_u8(b, 0xE8); /* shr rax,1 */
-                        buf_u8(b, 0x48); buf_u8(b, 0x09); buf_u8(b, 0xC8); /* or rax,rcx */
-                        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0); /* cvtsi2sd xmm0,rax */
-                        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x58); buf_u8(b, 0xC0); /* addsd xmm0,xmm0 */
-                        buf_u8(b, 0xE9);
-                        size_t end_patch = b->len;
-                        buf_u32(b, 0);
-                        patch_address(g, pos_patch, (int32_t)(b->len - (pos_patch + 4)));
-                        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0); /* cvtsi2sd xmm0,rax */
-                        patch_address(g, end_patch, (int32_t)(b->len - (end_patch + 4)));
-                    } else {
-                        static const uint8_t seq[] = {0xF2, 0x48, 0x0F, 0x2A, 0xC0};
-                        buf_bytes(b, seq, sizeof(seq));
-                    }
-                    static const uint8_t bits[] = {0x66, 0x48, 0x0F, 0x7E, 0xC0}; /* movq rax,xmm0 */
-                    buf_bytes(b, bits, sizeof(bits));
+                    emit_int_bits_to_f64_bits(g, 0, is_signed_expr(g, e->a));
                 }
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3155,9 +3185,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             }
             if (float_op && simple_left(g, e->a) && emit_float_op_xmm1(NULL, op)) {
                 /* Same shuffle removal as the integer path: evaluate the RHS
-                 * straight into rbx, then the simple LHS into rax. */
-                compile_expr(g, e->b, 3, 0);
-                compile_expr(g, e->a, 0, 0);
+                 * straight into rbx, then the simple LHS into rax. Integer
+                 * operands are converted to f64 before the xmm operation. */
+                compile_float_operand_bits(g, e->b, 3, 0);
+                compile_float_operand_bits(g, e->a, 0, 0);
                 emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3166,9 +3197,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 /* General case: stash LHS in xmm1, evaluate RHS into rax.
                  * Avoids push/pop and the rbx mov; safe because no call can
                  * clobber the stashed xmm1. */
-                compile_expr(g, e->a, 0, 0);
+                compile_float_operand_bits(g, e->a, 0, 0);
                 emit_float_op_stash_lhs(b);
-                compile_expr(g, e->b, 0, 0);
+                compile_float_operand_bits(g, e->b, 0, 0);
                 emit_float_op_after_rhs(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3293,9 +3324,15 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
-            compile_expr(g, e->a, 0, 0);
-            buf_u8(b, 0x50);
-            compile_expr(g, e->b, 0, 0);
+            if (float_op) {
+                compile_float_operand_bits(g, e->a, 0, 0);
+                buf_u8(b, 0x50);
+                compile_float_operand_bits(g, e->b, 0, 0);
+            } else {
+                compile_expr(g, e->a, 0, 0);
+                buf_u8(b, 0x50);
+                compile_expr(g, e->b, 0, 0);
+            }
             buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
             buf_u8(b, 0x58);
             if (float_op && emit_float_op_xmm1(b, op)) {
@@ -3919,11 +3956,11 @@ static void emit_float_compare_bool(Gen* g, WExpr* e) {
     int unordered_is_true = 0;
     int need_not_pf = 0;
 
-    compile_expr(g, e->a, 0, 1);
+    compile_float_operand_bits(g, e->a, 0, 1);
     size_t lhs_slot = g->stack_depth;
     emit_mov_to_stack(b, 0, lhs_slot);
     g->stack_depth += 8;
-    compile_expr(g, e->b, 0, 1);
+    compile_float_operand_bits(g, e->b, 0, 1);
     emit_mov_from_stack(b, 1, lhs_slot); /* rcx = lhs bits */
     g->stack_depth -= 8;
     buf_u8(b, 0x66); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x6E); buf_u8(b, 0xC1); /* movq xmm0, rcx */
@@ -4190,6 +4227,14 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         return;
     }
     if (compile_f64_index_to_xmm0(g, e)) {
+        return;
+    }
+    /* Integer operands of f64 arithmetic must become IEEE-754 values, not
+     * raw bit patterns. This covers mixed expressions such as `3.0 * 2`. */
+    if (e && !is_float_expr(g, e)) {
+        compile_expr(g, e, 0, 0);
+        emit_int_bits_to_f64_bits(g, 0, is_signed_expr(g, e));
+        emit_movq_rax_to_xmm0(b);
         return;
     }
     compile_expr(g, e, 0, 0);
@@ -6409,7 +6454,8 @@ static void calculate_and_insert_layout(Gen* g, WStruct* s) {
             if (size > max_size) {
                 max_size = size;
             }
-            uint32_t alignment = s->is_packed ? 1 : size;
+            uint32_t alignment = s->is_packed ? 1 : type_alignment_of(g, f->type);
+            if (!alignment) alignment = 1;
             if (alignment > 8) {
                 alignment = 8;
             }
@@ -6428,7 +6474,8 @@ static void calculate_and_insert_layout(Gen* g, WStruct* s) {
         for (size_t i = 0; i < s->field_count; i++) {
             WField* f = &s->fields[i];
             uint32_t size = type_size(g, f->type);
-            uint32_t alignment = s->is_packed ? 1 : size;
+            uint32_t alignment = s->is_packed ? 1 : type_alignment_of(g, f->type);
+            if (!alignment) alignment = 1;
             if (alignment > 8) {
                 alignment = 8;
             }

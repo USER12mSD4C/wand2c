@@ -151,6 +151,16 @@ static const char* import_module_for(const WandP46Module* m, const char* symbol)
     return m->import_count ? cstr(m, m->imports[0].module_off) : "libc.ko";
 }
 
+static uint32_t import_version_for(const WandP46Module* m, const char* symbol) {
+    for (size_t i = 0; i < m->import_count; i++) {
+        const char* n = cstr(m, m->imports[i].name_off);
+        if (n && strcmp(n, symbol) == 0) {
+            return m->imports[i].version;
+        }
+    }
+    return 1;
+}
+
 /* Host functions can live arbitrarily far from the mmap'd module, so a
  * PC32 import call is patched to a short trampoline inside the same mapping. */
 static WandP46Status make_trampoline(WandP46Module* m, const char* name,
@@ -304,7 +314,8 @@ static WandP46Status apply_relocs(WandP46Module* m) {
         if (!name) return WAND_P46_ERR_CORRUPT_STRTAB;
         if (r->offset > m->image_size) return WAND_P46_ERR_BAD_RELOCATION;
         uintptr_t target = 0;
-        WandP46Status status = resolve_symbol(m, name, 1, &target);
+        uint32_t version = import_version_for(m, name);
+        WandP46Status status = resolve_symbol(m, name, version, &target);
         if (status != WAND_P46_OK) return status;
 
         if (r->type == WEXP_RELOC_64) {

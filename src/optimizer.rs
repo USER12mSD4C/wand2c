@@ -1193,7 +1193,10 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_pure_expr(left, env) && is_same_expr(left, right) {
+            /* `x - x` is NaN for IEEE-754 floats. Fold only values whose
+             * integer sign is known here; f64 expressions report Unknown. */
+            if expr_sign(left, env) != ValueSign::Unknown &&
+                is_pure_expr(left, env) && is_same_expr(left, right) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
@@ -1207,17 +1210,25 @@ fn optimize_expr_recursive(
                 *expr = *left.clone();
                 return count + 1;
             }
-            if is_left_zero && is_pure_expr(right, env) {
+            /* IEEE-754 `inf * 0` is NaN, so only integer operands with a known
+             * sign may be folded to zero. */
+            if is_left_zero && expr_sign(right, env) != ValueSign::Unknown &&
+                is_pure_expr(right, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
-            if is_right_zero && is_pure_expr(left, env) {
+            if is_right_zero && expr_sign(left, env) != ValueSign::Unknown &&
+                is_pure_expr(left, env) {
                 *expr = Expr::Number(0);
                 return count + 1;
             }
 
+            /* Shifting is integer-only. A float literal such as `3.0` has an
+             * Unknown sign here, so it will not be mistaken for a power of
+             * two times an integer. */
             if let Expr::Number(val) = &**right {
-                if *val > 1 && is_power_of_two(*val) {
+                if *val > 1 && is_power_of_two(*val) &&
+                    expr_sign(left, env) != ValueSign::Unknown {
                     let shift = val.trailing_zeros() as u64;
                     *expr = Expr::Binary {
                         left: left.clone(),
@@ -1228,7 +1239,8 @@ fn optimize_expr_recursive(
                 }
             }
             if let Expr::Number(val) = &**left {
-                if *val > 1 && is_power_of_two(*val) {
+                if *val > 1 && is_power_of_two(*val) &&
+                    expr_sign(right, env) != ValueSign::Unknown {
                     let shift = val.trailing_zeros() as u64;
                     *expr = Expr::Binary {
                         left: right.clone(),

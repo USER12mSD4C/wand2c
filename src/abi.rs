@@ -416,8 +416,14 @@ pub fn generate_elf64_binary(
                 .to_string()
         })
         .unwrap_or_else(|| "libc.ko".to_string());
+    let import_versions: HashMap<&str, u32> = program
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f.version))
+        .collect();
     for name in &unresolved_calls {
-        builder.add_import(name, &module_name, 1, 0);
+        let version = import_versions.get(name.as_str()).copied().unwrap_or(1);
+        builder.add_import(name, &module_name, version, 0);
     }
 
     builder.patch_section_counts();
@@ -974,8 +980,14 @@ pub fn generate_wexp_image(
             unresolved_calls.push(target_name.clone());
         }
     }
+    let import_versions: HashMap<&str, u32> = program
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f.version))
+        .collect();
     for name in &unresolved_calls {
-        builder.add_import(name, &import_module(name, program), 1, 0);
+        let version = import_versions.get(name.as_str()).copied().unwrap_or(1);
+        builder.add_import(name, &import_module(name, program), version, 0);
     }
 
     let func_addr_patches = gen
