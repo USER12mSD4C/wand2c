@@ -1273,6 +1273,24 @@ static void emit_mem_store(Buf* b, uint8_t reg, uint32_t offset, uint32_t size) 
     }
 }
 
+/* Store rax to [rbx + disp]. Used when copying aggregate values into a
+ * computed destination address. */
+static void emit_rbx_mem_store(Buf* b, uint32_t disp, uint32_t size) {
+    uint8_t modrm = (uint8_t)(disp <= 127 ? 0x43 : 0x83);
+    switch (size) {
+        case 1:
+            buf_u8(b, 0x88); buf_u8(b, modrm); break;
+        case 2:
+            buf_u8(b, 0x66); buf_u8(b, 0x89); buf_u8(b, modrm); break;
+        case 4:
+            buf_u8(b, 0x89); buf_u8(b, modrm); break;
+        default:
+            buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, modrm); break;
+    }
+    if (disp <= 127) buf_u8(b, (uint8_t)disp);
+    else buf_u32(b, disp);
+}
+
 static void emit_store_xmm_param(Buf* b, uint8_t xmm, uint32_t offset) {
     int32_t neg = -(int32_t)offset;
     buf_u8(b, 0xF2);
@@ -4019,6 +4037,13 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             break;
         }
         case 12: /* ArrayInit */
+            /* In a discarded expression the leaves still have to run: an
+             * initializer element may be a call or another side-effecting
+             * expression. Local definitions route through
+             * emit_local_array_leaves, so this only covers expression use. */
+            for (size_t i = 0; i < e->arg_count; i++) {
+                compile_expr(g, e->args[i], 0, 1);
+            }
             emit_mov_imm64(b, reg, 0);
             break;
         default:
@@ -5889,8 +5914,8 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
     }
 }
 
-static int try_compile_string_copy_to_u8_array(Gen* g, WExpr* target, WExpr* value) {
-    if (!target || !value || value->tag != 2) {
+static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
+    if (!target || !value) {
         return 0;
     }
     WType* resolved = resolve_named_type(g, resolve_expr_type(g, target));
@@ -5898,27 +5923,80 @@ static int try_compile_string_copy_to_u8_array(Gen* g, WExpr* target, WExpr* val
         return 0;
     }
     WType* elem = resolve_named_type(g, resolved->inner);
-    if (!elem || (elem->tag != 0 && elem->tag != 4)) {
+    uint32_t elem_size = elem ? type_size(g, elem) : 0;
+    if (!elem_size || elem_size > 8) {
         return 0;
     }
-    compile_address(g, target, 3);
-    Buf bytes = {0};
-    unescape_string(value->str, &bytes);
-    uint64_t count = resolved->count;
-    uint64_t copy_len = bytes.len + 1 <= count ? bytes.len + 1 : count - 1;
+    uint64_t total = resolved->count * elem_size;
     Buf* b = &g->code;
-    buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDF);
-    if (copy_len > 0) {
-        WStr key = wstr_prefix("str:", value->str);
-        emit_rip_relative_lea(g, 6, key);
-        emit_mov_imm64(b, 1, copy_len);
+
+    if (value->tag == 2) {
+        /* Whole-array string copy, including the terminating NUL. */
+        if (elem->tag != 0 && elem->tag != 4) {
+            return 0;
+        }
+        compile_address(g, target, 3);
+        Buf bytes = {0};
+        unescape_string(value->str, &bytes);
+        uint64_t count = resolved->count;
+        uint64_t copy_len = bytes.len + 1 <= count ? bytes.len + 1 : count - 1;
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDF);
+        if (copy_len > 0) {
+            WStr key = wstr_prefix("str:", value->str);
+            emit_rip_relative_lea(g, 6, key);
+            emit_mov_imm64(b, 1, copy_len);
+            buf_u8(b, 0xFC);
+            buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+        }
+        if (bytes.len + 1 > count) {
+            buf_u8(b, 0xC6); buf_u8(b, 0x07); buf_u8(b, 0x00);
+        }
+        return 1;
+    }
+
+    if (value->tag == 12) {
+        /* Brace initializer: store each leaf into the destination and zero
+         * the remaining bytes. Preserve the destination across leaf codegen,
+         * which may use rbx as scratch. */
+        compile_address(g, target, 3);
+        uint64_t used = 0;
+        for (size_t i = 0; i < value->arg_count && used < total; i++) {
+            buf_u8(b, 0x53); /* push rbx */
+            compile_expr(g, value->args[i], 0, 1);
+            buf_u8(b, 0x5B); /* pop rbx */
+            uint32_t width = elem_size;
+            if (width > total - used) {
+                width = (uint32_t)(total - used);
+            }
+            emit_rbx_mem_store(b, (uint32_t)used, width);
+            used += width;
+        }
+        while (used < total) {
+            emit_mov_imm64(b, 0, 0);
+            emit_rbx_mem_store(b, (uint32_t)used, 1);
+            used++;
+        }
+        return 1;
+    }
+
+    /* An array-typed value is an lvalue in Wand: copy the elements rather
+     * than storing the address bytes into the destination. */
+    WType* value_type = resolve_named_type(g, resolve_expr_type(g, value));
+    if (value_type && value_type->tag == 12 && value_type->count &&
+        type_size(g, value_type->inner) == elem_size) {
+        compile_address(g, target, 3);
+        buf_u8(b, 0x53); /* push destination address */
+        compile_address(g, value, 3);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+        buf_u8(b, 0x5F); /* pop %rdi */
+        emit_mov_imm64(b, 1, value_type->count < resolved->count
+                                  ? value_type->count * elem_size
+                                  : total);
         buf_u8(b, 0xFC);
         buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+        return 1;
     }
-    if (bytes.len + 1 > count) {
-        buf_u8(b, 0xC6); buf_u8(b, 0x07); buf_u8(b, 0x00);
-    }
-    return 1;
+    return 0;
 }
 
 /* Initialize a local aggregate from brace/string leaves. Returns the number of
@@ -6291,7 +6369,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
         }
         case 1: { /* Assignment */
             if (s->expr_count == 1) {
-                int copied = try_compile_string_copy_to_u8_array(g, s->exprs[0], s->e1);
+                int copied = try_compile_array_assignment(g, s->exprs[0], s->e1);
                 uint8_t addsub_op = 0;
                 int64_t addsub_imm = 0;
                 int local_addsub = !copied &&

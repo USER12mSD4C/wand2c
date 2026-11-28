@@ -333,16 +333,7 @@ fn collect_assignment_counts_stmt(stmt: &Stmt, counts: &mut HashMap<String, usiz
         Stmt::Assignment { targets, .. } => {
             for target in targets {
                 if let Some(path) = get_expr_path(target) {
-                    let root = if let Some(idx) = path.find('.') {
-                        &path[..idx]
-                    } else if let Some(idx) = path.find('[') {
-                        &path[..idx]
-                    } else if let Some(idx) = path.find(':') {
-                        &path[idx + 1..]
-                    } else {
-                        path.as_str()
-                    };
-                    count_assignment(counts, root);
+                    count_assignment(counts, expr_path_root(&path));
                 }
             }
         }
@@ -872,6 +863,27 @@ fn collect_reads_expr(expr: &Expr, reads: &mut HashMap<String, usize>) {
     }
 }
 
+/* The root of a path is its leftmost identifier. Member/index paths can mix
+ * `.` and `[` (`p[0].x`), so taking either delimiter alone picks the wrong
+ * root and lets cached values survive writes that alias the array. Section
+ * variables are keyed by the part after `:`. */
+fn expr_path_root(path: &str) -> &str {
+    let base = if let Some(idx) = path.find(':') {
+        &path[idx + 1..]
+    } else {
+        path
+    };
+    let dot = base.find('.');
+    let bracket = base.find('[');
+    let idx = match (dot, bracket) {
+        (Some(d), Some(b)) => Some(d.min(b)),
+        (Some(d), None) => Some(d),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    idx.map(|i| &base[..i]).unwrap_or(base)
+}
+
 fn get_expr_path(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Variable(name) => Some(name.clone()),
@@ -928,6 +940,7 @@ fn has_side_effects(expr: &Expr) -> bool {
         | Expr::SectionAccess { .. } => true,
         Expr::Binary { left, right, .. } => has_side_effects(left) || has_side_effects(right),
         Expr::AddrOfExpr(inner) => has_side_effects(inner),
+        Expr::ArrayInit(elements) => elements.iter().any(has_side_effects),
         _ => false,
     }
 }
@@ -1114,13 +1127,7 @@ fn optimize_expr_recursive(
     }
 
     if let Some(path) = get_expr_path(expr) {
-        let root = if let Some(idx) = path.find('.') {
-            &path[..idx]
-        } else if let Some(idx) = path.find('[') {
-            &path[..idx]
-        } else {
-            path.as_str()
-        };
+        let root = expr_path_root(&path);
 
         if !escaped.contains(root) && !path.contains(':') {
             if let Some(const_val) = consts.get(&path) {
@@ -1500,14 +1507,7 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<String>) {
             for target in targets {
                 if let Some(path) = get_expr_path(target) {
                     assigned.insert(path.clone());
-                    let root = if let Some(idx) = path.find('.') {
-                        &path[..idx]
-                    } else if let Some(idx) = path.find('[') {
-                        &path[..idx]
-                    } else {
-                        path.as_str()
-                    };
-                    assigned.insert(root.to_string());
+                    assigned.insert(expr_path_root(&path).to_string());
                 }
                 /* A write through a computed index can alias any element,
                  * so treat the whole array as assigned. */
@@ -1728,13 +1728,7 @@ fn optimize_statements(
                 if targets.len() == 1 {
                     let target = &targets[0];
                     if let Some(target_path) = get_expr_path(target) {
-                        let root = if let Some(idx) = target_path.find('.') {
-                            &target_path[..idx]
-                        } else if let Some(idx) = target_path.find('[') {
-                            &target_path[..idx]
-                        } else {
-                            target_path.as_str()
-                        };
+                        let root = expr_path_root(&target_path);
 
                         if !escaped.contains(root)
                             && !target_path.contains(':')
@@ -1879,16 +1873,7 @@ fn optimize_statements(
                 collect_assigned(&body, &mut loop_assigned);
                 collect_assigned_expr(&cond, &mut loop_assigned);
 
-                consts.retain(|k, _| {
-                    let root = if let Some(idx) = k.find('.') {
-                        &k[..idx]
-                    } else if let Some(idx) = k.find('[') {
-                        &k[..idx]
-                    } else {
-                        k.as_str()
-                    };
-                    !loop_assigned.contains(root)
-                });
+                consts.retain(|k, _| !loop_assigned.contains(expr_path_root(k)));
 
                 *count += optimize_expr_recursive(&mut cond, consts, escaped, env);
                 if let Expr::Number(0) = cond {
@@ -1948,16 +1933,7 @@ fn optimize_statements(
                     None
                 };
 
-                consts.retain(|k, _| {
-                    let root = if let Some(idx) = k.find('.') {
-                        &k[..idx]
-                    } else if let Some(idx) = k.find('[') {
-                        &k[..idx]
-                    } else {
-                        k.as_str()
-                    };
-                    !loop_assigned.contains(root)
-                });
+                consts.retain(|k, _| !loop_assigned.contains(expr_path_root(k)));
 
                 *count += optimize_expr_recursive(&mut cond, consts, escaped, env);
 
