@@ -392,20 +392,65 @@ fn tui_buf_draw_char(u64 buf, i64 cols, i64 x, i64 y, u8 ch, u8 fg, u8 bg, u8 at
     }
 }
 
-fn tui_buf_draw_str(u64 buf, i64 cols, i64 x, i64 y, u8* str, u8 fg, u8 bg, u8 attr) {
-    u8* p*i = str;
-    i64 cx = x;
-    u8 c = p;
-    while (c != 0) {
-        tui_buf_draw_char(buf, cols, cx, y, c, fg, bg, attr);
-        cx = cx + 1;
-        p = p + 1;
-        c = p;
+// The cell buffer stores one byte per cell, so raw UTF-8 bytes would occupy
+// several cells while the terminal renders one glyph. Decode to one ASCII
+// cell per codepoint instead; this keeps columns aligned on UTF-8 terminals.
+fn tui_utf8_seq_len(u8 c) -> u64 {
+    if (c < 128) { return(1); }
+    if (c >= 248) { return(1); }
+    if (c >= 240) { return(3); }
+    if (c >= 224) { return(3); }
+    if (c >= 192) { return(2); }
+    return(1);
+}
+
+fn tui_utf8_ascii(u8* p, u64 n) -> u8 {
+    u64 cp = 0;
+    if (n == 1) { return(p[0]); }
+    if (n == 2) {
+        cp = ((u64)(p[0] & 31) << 6) | (u64)(p[1] & 63);
+    } else if (n == 3) {
+        cp = ((u64)(p[0] & 15) << 12) | ((u64)(p[1] & 63) << 6) | (u64)(p[2] & 63);
+    } else {
+        cp = ((u64)(p[0] & 7) << 18) | ((u64)(p[1] & 63) << 12) |
+             ((u64)(p[2] & 63) << 6) | (u64)(p[3] & 63);
     }
+    if (cp == 0x2500 || cp == 0x2501) { return(45); }
+    if (cp == 0x2502 || cp == 0x2503) { return(124); }
+    if (cp >= 0x250c && cp <= 0x254b) { return(43); }
+    if (cp == 0x276f || cp == 0x25b8 || cp == 0x2192) { return(62); }
+    if (cp == 0x2190) { return(60); }
+    if (cp == 0x2191) { return(94); }
+    if (cp == 0x2193) { return(118); }
+    if (cp == 0x25c6 || cp == 0x2022 || cp == 0x25cf || cp == 0x2605) { return(42); }
+    if (cp == 0x2139) { return(105); }
+    if (cp == 0x00b7 || cp == 0x2026) { return(46); }
+    return(46);
+}
+
+fn tui_buf_draw_span(u64 buf, i64 cols, i64 x, i64 y, u8* p, i64 max_cells, u8 fg, u8 bg, u8 attr) -> i64 {
+    i64 cx = 0;
+    while (cx < max_cells) {
+        u8 c = p[0];
+        if (c == 0) { return(cx); }
+        u64 n = tui_utf8_seq_len(c);
+        tui_buf_draw_char(buf, cols, x + cx, y, tui_utf8_ascii(p, n), fg, bg, attr);
+        cx = cx + 1;
+        u64 k = 0;
+        while (k < n) {
+            p = p + 1;
+            k = k + 1;
+        }
+    }
+    return(cx);
+}
+
+fn tui_buf_draw_str(u64 buf, i64 cols, i64 x, i64 y, u8* str, u8 fg, u8 bg, u8 attr) {
+    tui_buf_draw_span(buf, cols, x, y, str, 4096, fg, bg, attr);
 }
 
 fn tui_emit_cursor(TuiState* s, i64 row, i64 col) {
-    tui_out_str(s, "\x1b[");
+    tui_out_str(s, "\033[");
     tui_out_num(s, row + 1);
     tui_out_byte(s, 59);
     tui_out_num(s, col + 1);
@@ -413,7 +458,7 @@ fn tui_emit_cursor(TuiState* s, i64 row, i64 col) {
 }
 
 fn tui_emit_color(TuiState* s, u8 fg, u8 bg, u8 attr) {
-    tui_out_str(s, "\x1b[0");
+    tui_out_str(s, "\033[0");
     if ((attr & 1) != 0) {
         tui_out_str(s, ";1");
     }
@@ -503,24 +548,24 @@ fn tui_set_raw_mode(TuiState* s) {
     if (s->raw_term_set != 0) {
         return;
     }
-    sys_ioctl(0, 21523, s->termios_backup*adr);
+    sys_ioctl(0, 0x5401, s->termios_backup*adr);
     u8 tc_buf[60];
-    sys_ioctl(0, 21523, tc_buf*adr);
+    sys_ioctl(0, 0x5401, tc_buf*adr);
     u32* lflag_ptr = tc_buf*adr + 12;
     u32 lflag = lflag_ptr[0];
     lflag = lflag & 0xFFFFFFF0;
-    lflag = lflag & 0xFFFFFBFF;
+    lflag = lflag & 0xFFFF7FFF;
     lflag_ptr[0] = lflag;
-    u8* cc_ptr = tc_buf*adr + 20;
+    u8* cc_ptr = tc_buf*adr + 17;
     cc_ptr[6] = 1;
     cc_ptr[5] = 0;
-    sys_ioctl(0, 21524, tc_buf*adr);
+    sys_ioctl(0, 0x5402, tc_buf*adr);
     s->raw_term_set = 1;
 }
 
 fn tui_restore_term(TuiState* s) {
     if (s->raw_term_set != 0) {
-        sys_ioctl(0, 21524, s->termios_backup*adr);
+        sys_ioctl(0, 0x5402, s->termios_backup*adr);
         s->raw_term_set = 0;
     }
 }
@@ -529,9 +574,9 @@ fn tui_enable_mouse(TuiState* s) {
     if (s->mouse_enabled != 0) {
         return;
     }
-    tui_out_str(s, "\x1b[?1000h");
-    tui_out_str(s, "\x1b[?1002h");
-    tui_out_str(s, "\x1b[?1006h");
+    tui_out_str(s, "\033[?1000h");
+    tui_out_str(s, "\033[?1002h");
+    tui_out_str(s, "\033[?1006h");
     tui_out_flush(s);
     s->mouse_enabled = 1;
 }
@@ -540,25 +585,25 @@ fn tui_disable_mouse(TuiState* s) {
     if (s->mouse_enabled == 0) {
         return;
     }
-    tui_out_str(s, "\x1b[?1000l");
-    tui_out_str(s, "\x1b[?1002l");
-    tui_out_str(s, "\x1b[?1006l");
+    tui_out_str(s, "\033[?1000l");
+    tui_out_str(s, "\033[?1002l");
+    tui_out_str(s, "\033[?1006l");
     tui_out_flush(s);
     s->mouse_enabled = 0;
 }
 
 fn tui_hide_cursor(TuiState* s) {
-    tui_out_str(s, "\x1b[?25l");
+    tui_out_str(s, "\033[?25l");
     tui_out_flush(s);
 }
 
 fn tui_show_cursor(TuiState* s) {
-    tui_out_str(s, "\x1b[?25h");
+    tui_out_str(s, "\033[?25h");
     tui_out_flush(s);
 }
 
 fn tui_clear_screen(TuiState* s) {
-    tui_out_str(s, "\x1b[2J\x1b[H");
+    tui_out_str(s, "\033[2J\033[H");
     tui_out_flush(s);
 }
 
@@ -1657,23 +1702,19 @@ fn tui_widget_destroy(u64 widget) {
 }
 
 fn tui_get_border_chars(u8 style, u8* out*o) {
+    // ASCII borders keep one cell per byte on every terminal encoding.
     if (style == TUI_BORDER_DOUBLE) {
-        out[0] = 201; out[1] = 187; out[2] = 200; out[3] = 188;
-        out[4] = 205; out[5] = 205; out[6] = 186; out[7] = 186;
-        return;
-    }
-    if (style == TUI_BORDER_ROUNDED) {
-        out[0] = 218; out[1] = 191; out[2] = 192; out[3] = 217;
-        out[4] = 196; out[5] = 196; out[6] = 179; out[7] = 179;
+        out[0] = 43; out[1] = 43; out[2] = 43; out[3] = 43;
+        out[4] = 61; out[5] = 61; out[6] = 124; out[7] = 124;
         return;
     }
     if (style == TUI_BORDER_HEAVY) {
-        out[0] = 218; out[1] = 191; out[2] = 192; out[3] = 217;
-        out[4] = 196; out[5] = 196; out[6] = 179; out[7] = 179;
+        out[0] = 35; out[1] = 35; out[2] = 35; out[3] = 35;
+        out[4] = 35; out[5] = 35; out[6] = 35; out[7] = 35;
         return;
     }
-    out[0] = 218; out[1] = 191; out[2] = 192; out[3] = 217;
-    out[4] = 196; out[5] = 196; out[6] = 179; out[7] = 179;
+    out[0] = 43; out[1] = 43; out[2] = 43; out[3] = 43;
+    out[4] = 45; out[5] = 45; out[6] = 124; out[7] = 124;
 }
 
 fn tui_draw_panel(u64 buf, i64 cols, TuiWidget* w) {
@@ -1756,11 +1797,9 @@ fn tui_draw_textbox(u64 buf, i64 cols, TuiWidget* w) {
     u8* text = td->buf;
     u64 vis_w = (u64)w->w;
     u64 scroll = td->scroll_off;
-    u64 i = 0;
-    while (i < vis_w && (scroll + i) < td->buf_len) {
-        u8 ch = text[scroll + i];
-        tui_buf_draw_char(buf, cols, w->x + (i64)i, w->y, ch, fg, bg, attr);
-        i = i + 1;
+    if (td->buf_len > scroll) {
+        tui_buf_draw_span(buf, cols, w->x, w->y, text + scroll,
+                          (i64)vis_w, fg, bg, attr);
     }
     if (w->focused == 1) {
         i64 cursor_col = w->x + (i64)(td->cursor_pos - scroll);
@@ -1837,15 +1876,8 @@ fn tui_draw_textview(u64 buf, i64 cols, TuiWidget* w) {
             u64 line_ptr = lines[line_idx];
             u8* text = line_ptr;
             if (text != null) {
-                u8* p*i = text + td->scroll_col;
-                i64 c = 0;
-                u8 ch = p;
-                while (ch != 0 && c < w->w) {
-                    tui_buf_draw_char(buf, cols, w->x + c, w->y + r, ch, fg, bg, attr);
-                    c = c + 1;
-                    p = p + 1;
-                    ch = p;
-                }
+                tui_buf_draw_span(buf, cols, w->x, w->y + r, text + td->scroll_col,
+                                  w->w, fg, bg, attr);
             }
         }
         r = r + 1;
@@ -2240,6 +2272,9 @@ fn tui_init() {
     s->focused = 0;
     s->widget_id_counter = 0;
     tui_set_raw_mode(s);
+    // Use the alternate screen so the caller's scrollback survives the session.
+    tui_out_str(s, "\033[?1049h");
+    tui_out_flush(s);
     tui_enable_mouse(s);
     tui_hide_cursor(s);
     tui_clear_screen(s);
@@ -2256,8 +2291,8 @@ fn tui_shutdown() {
     }
     tui_show_cursor(s);
     tui_disable_mouse(s);
+    tui_out_str(s, "\033[2J\033[H\033[?1049l");
     tui_restore_term(s);
-    tui_out_str(s, "\x1b[2J\x1b[H");
     tui_out_flush(s);
     if (s->front_buf != 0) {
         tui_free_buf(s->front_buf);
@@ -2496,6 +2531,77 @@ fn tui_run(u64 root) {
             sys_nanosleep(null, null);
         }
     }
+}
+
+// Append text to a textview, splitting newlines and wrapping long lines to the
+// widget width. Useful for log-style panes where callers append whole records.
+fn tui_emit_wrapped_segment(TextViewData* td, u8* text, u64 start, u64 end, i64 width) {
+    if (width < 4) { width = 40; }
+    i64 limit = width - 1;
+    u64 pos = start;
+    while (pos < end) {
+        u8 seg[512];
+        u64 n = 0;
+        while (pos < end && (i64)n < limit && n < 510) {
+            seg[n] = text[pos];
+            n = n + 1;
+            pos = pos + 1;
+        }
+        seg[n] = 0;
+        tui_textview_add_line(td, seg);
+    }
+}
+
+export fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width) {
+    if (widget == 0 || text == null) { return; }
+    TuiWidget* w = widget;
+    if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
+    TextViewData* td = w->data;
+    u64 i = 0;
+    u64 start = 0;
+    while (text[i] != 0) {
+        if (text[i] == 10 || text[i] == 13) {
+            tui_emit_wrapped_segment(td, text, start, i, width);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start < i) { tui_emit_wrapped_segment(td, text, start, i, width); }
+    tui_widget_mark_dirty(widget);
+}
+
+export fn tui_textview_scroll_bottom(u64 widget) {
+    if (widget == 0) { return; }
+    TuiWidget* w = widget;
+    if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
+    TextViewData* td = w->data;
+    i64 top = (i64)td->line_count - w->h;
+    if (top < 0) { top = 0; }
+    td->scroll_row = top;
+    tui_widget_mark_dirty(widget);
+}
+
+// Allows a synchronous application to own the event loop instead of calling
+// tui_run(). Widgets still receive the exact same key events.
+export fn tui_set_root(u64 root) {
+    TuiState* s = tui_get_state();
+    if (s == null) { return; }
+    s->root = root;
+    if (root != 0) {
+        TuiWidget* rw = root;
+        rw->x = 0;
+        rw->y = 0;
+        rw->w = s->cols;
+        rw->h = s->rows;
+        tui_focus_widget(tui_find_next_focus(root, 0));
+    }
+    tui_layout(s);
+    tui_widget_mark_dirty(root);
+}
+
+export fn tui_send_key(u64 widget, u64 key) {
+    if (widget == 0) { return; }
+    tui_dispatch_key(widget, key);
 }
 
 export fn tui_render_frame() {
