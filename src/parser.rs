@@ -3,6 +3,99 @@ use crate::lexer::Lexer;
 use crate::token::Token;
 use std::collections::HashMap;
 
+fn is_parser_cast_op(op: &str) -> bool {
+    matches!(
+        op,
+        "OpCastF64"
+            | "OpCastInt"
+            | "OpCast"
+            | "OpCastU8"
+            | "OpCastU16"
+            | "OpCastU32"
+            | "OpCastU64"
+            | "OpCastI8"
+            | "OpCastI16"
+            | "OpCastI32"
+            | "OpCastI64"
+    )
+}
+
+fn parser_expr_is_float(expr: &Expr) -> bool {
+    match expr {
+        Expr::FloatLit(_) => true,
+        Expr::Binary { left, op, right } => {
+            if op == "OpCastF64" {
+                true
+            } else if is_parser_cast_op(op) {
+                false
+            } else {
+                parser_expr_is_float(left) || parser_expr_is_float(right)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn parser_expr_is_signed(expr: &Expr) -> bool {
+    match expr {
+        Expr::SignedNumber(_) => true,
+        Expr::Binary { left, op, right } => {
+            if is_parser_cast_op(op) {
+                matches!(op.as_str(),
+                    "OpCastInt" | "OpCastI8" | "OpCastI16" | "OpCastI32" | "OpCastI64")
+            } else {
+                parser_expr_is_signed(left) || parser_expr_is_signed(right)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn parser_int_to_f64_bits(bits: u64, signed: bool) -> u64 {
+    let value = if signed { (bits as i64) as f64 } else { bits as f64 };
+    value.to_bits()
+}
+
+/* Match cvttsd2si: truncate toward zero and return the indefinite value for
+ * NaN, infinity, or an out-of-range operand. */
+fn parser_f64_to_int_bits(bits: u64) -> u64 {
+    let value = f64::from_bits(bits);
+    if !value.is_finite()
+        || value >= 9223372036854775808.0_f64
+        || value < -9223372036854775808.0_f64
+    {
+        return i64::MIN as u64;
+    }
+    value.trunc() as i64 as u64
+}
+
+fn parser_apply_cast(source: &Expr, op: &str, raw: u64) -> u64 {
+    if op == "OpCastF64" {
+        return if parser_expr_is_float(source) {
+            raw
+        } else {
+            parser_int_to_f64_bits(raw, parser_expr_is_signed(source))
+        };
+    }
+    if op == "OpCast" {
+        return raw;
+    }
+    let bits = if parser_expr_is_float(source) {
+        parser_f64_to_int_bits(raw)
+    } else {
+        raw
+    };
+    match op {
+        "OpCastU8" => bits & 0xFF,
+        "OpCastU16" => bits & 0xFFFF,
+        "OpCastU32" => bits & 0xFFFF_FFFF,
+        "OpCastI8" => (bits as i8 as i64) as u64,
+        "OpCastI16" => (bits as i16 as i64) as u64,
+        "OpCastI32" => (bits as i32 as i64) as u64,
+        _ => bits,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
@@ -110,6 +203,10 @@ impl Parser {
         match expr {
             Expr::Number(n) => Ok(*n),
             Expr::SignedNumber(n) => Ok(*n as u64),
+            Expr::FloatLit(text) => text
+                .parse::<f64>()
+                .map(|value| value.to_bits())
+                .map_err(|_| format!("invalid float literal '{}'", text)),
             Expr::Null => Ok(0),
 
             Expr::Variable(name) => self
@@ -119,8 +216,9 @@ impl Parser {
                 .ok_or_else(|| format!("unknown constant '{}'", name)),
 
             Expr::Binary { left, op, right } => {
-                if op == "OpCastF64" || op == "OpCastInt" || op == "OpCast" {
-                    return self.eval_parser_const_expr_depth(left, depth + 1);
+                if is_parser_cast_op(op) {
+                    let raw = self.eval_parser_const_expr_depth(left, depth + 1)?;
+                    return Ok(parser_apply_cast(left, op, raw));
                 }
 
                 if op == "OpBitNot" {
