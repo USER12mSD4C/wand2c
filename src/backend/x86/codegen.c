@@ -2689,7 +2689,21 @@ static int is_float_expr(Gen* g, WExpr* e) {
         case 0:
         case 1:
             return 0;
-        case 3:
+        case 3: {
+            /* An input or input/output variable whose declared type is a
+             * pointer to f64 names the f64 object in value context. */
+            uint64_t access = 3;
+            map_get_str(&g->local_access, e->str, &access);
+            WType* t = resolve_expr_type(g, e);
+            if (access == 0 || access == 2) {
+                t = resolve_named_type(g, t);
+                if (t && (t->tag == 10 || t->tag == 12)) {
+                    t = resolve_named_type(g, t->inner);
+                }
+                return t && t->tag == 8;
+            }
+            return is_float_type_named(g, t);
+        }
         case 6:
         case 7:
             return is_float_type_named(g, resolve_expr_type(g, e));
@@ -2944,16 +2958,57 @@ static int expr_deref_flag(Gen* g, WExpr* e, int deref_ptr) {
     return deref_ptr;
 }
 
+/* Float value context always reads through input/input-output variables,
+ * including *i locals used as byte walkers. The generic helper keeps those
+ * locals raw for pointer arithmetic and comparisons, which is not appropriate
+ * when the value feeds f64 arithmetic. */
+static int float_value_deref_flag(Gen* g, WExpr* e, int deref_ptr) {
+    if (!deref_ptr || !e || e->tag != 3) {
+        return deref_ptr;
+    }
+    if (g->suppress_deref_var.ptr &&
+        wstr_eq(g->suppress_deref_var, e->str)) {
+        return 0;
+    }
+    uint64_t access = 3;
+    map_get_str(&g->local_access, e->str, &access);
+    return (access == 0 || access == 2) ? 1 : deref_ptr;
+}
+
+/* Pointer/array destinations preserve pointer identity: their source is
+ * compiled in address context. Scalar destinations keep value context. */
+static int value_deref_flag(Gen* g, WType* t) {
+    t = resolve_named_type(g, t);
+    return (t && (t->tag == 10 || t->tag == 12)) ? 0 : 1;
+}
+
+/* An assignment to an input or input/output variable writes the pointed
+ * object, so its logical type is the pointee rather than the declared
+ * pointer. A plain pointer destination still copies the address. */
+static int assignment_deref_flag(Gen* g, WExpr* target) {
+    WType* t = resolve_expr_type(g, target);
+    if (target && target->tag == 3) {
+        uint64_t access = 3;
+        map_get_str(&g->local_access, target->str, &access);
+        if (access == 0 || access == 2) {
+            t = resolve_named_type(g, t);
+            if (t && (t->tag == 10 || t->tag == 12)) {
+                t = resolve_named_type(g, t->inner);
+            }
+        }
+    }
+    return value_deref_flag(g, t);
+}
+
 /* A return slot with pointer/array type must preserve the pointer value even
  * when the source variable carries an input or input/output modifier. Scalar
  * slots keep the existing value-read context. */
 static int return_deref_flag(Gen* g, size_t i) {
     WFunc* f = g->current_function;
-    WType* t = NULL;
     if (f && i < f->return_count) {
-        t = resolve_named_type(g, f->returns[i]);
+        return value_deref_flag(g, f->returns[i]);
     }
-    return (t && (t->tag == 10 || t->tag == 12)) ? 0 : 1;
+    return 1;
 }
 
 /* Compile an assignment's value with the right pointer-read context. A
@@ -2968,7 +3023,7 @@ static void compile_assignment_value(Gen* g, WExpr* target, WExpr* value) {
             g->suppress_deref_var = target->str;
         }
     }
-    compile_expr(g, value, 0, 1);
+    compile_expr(g, value, 0, assignment_deref_flag(g, target));
     g->suppress_deref_var = saved;
 }
 
@@ -3435,9 +3490,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                  * straight into rbx, then the simple LHS into rax. Integer
                  * operands are converted to f64 before the xmm operation. */
                 compile_float_operand_bits(g, e->b, 3,
-                                           expr_deref_flag(g, e->b, deref_ptr));
+                                           float_value_deref_flag(g, e->b, deref_ptr));
                 compile_float_operand_bits(g, e->a, 0,
-                                           expr_deref_flag(g, e->a, deref_ptr));
+                                           float_value_deref_flag(g, e->a, deref_ptr));
                 emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3447,10 +3502,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                  * Avoids push/pop and the rbx mov; safe because no call can
                  * clobber the stashed xmm1. */
                 compile_float_operand_bits(g, e->a, 0,
-                                           expr_deref_flag(g, e->a, deref_ptr));
+                                           float_value_deref_flag(g, e->a, deref_ptr));
                 emit_float_op_stash_lhs(b);
                 compile_float_operand_bits(g, e->b, 0,
-                                           expr_deref_flag(g, e->b, deref_ptr));
+                                           float_value_deref_flag(g, e->b, deref_ptr));
                 emit_float_op_after_rhs(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3585,10 +3640,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             }
             if (float_op) {
                 compile_float_operand_bits(g, e->a, 0,
-                                           expr_deref_flag(g, e->a, deref_ptr));
+                                           float_value_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x50);
                 compile_float_operand_bits(g, e->b, 0,
-                                           expr_deref_flag(g, e->b, deref_ptr));
+                                           float_value_deref_flag(g, e->b, deref_ptr));
             } else {
                 compile_expr(g, e->a, 0,
                              expr_deref_flag(g, e->a, deref_ptr));
@@ -4544,7 +4599,7 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
          * round trip that the generic rax-based cast emits. A full-width
          * unsigned source can have its high bit set, which cvtsi2sd would
          * read as negative; use the halving path for that case. */
-        compile_expr(g, e->a, 0, 0);
+        compile_expr(g, e->a, 0, float_value_deref_flag(g, e->a, 1));
         if (is_signed_expr(g, e->a) || expr_size(g, e->a) < 8) {
             buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
         } else {
@@ -4559,12 +4614,12 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     /* Integer operands of f64 arithmetic must become IEEE-754 values, not
      * raw bit patterns. This covers mixed expressions such as `3.0 * 2`. */
     if (e && !is_float_expr(g, e)) {
-        compile_expr(g, e, 0, 0);
+        compile_expr(g, e, 0, float_value_deref_flag(g, e, 1));
         emit_int_bits_to_f64_bits(g, 0, is_signed_expr(g, e));
         emit_movq_rax_to_xmm0(b);
         return;
     }
-    compile_expr(g, e, 0, 0);
+    compile_expr(g, e, 0, float_value_deref_flag(g, e, 1));
     emit_movq_rax_to_xmm0(b);
 }
 
@@ -5389,7 +5444,7 @@ static void compile_bool_expr(Gen* g, WExpr* e) {
         }
     }
 
-    compile_expr(g, e, 0, 1);
+    compile_expr(g, e, 0, expr_deref_flag(g, e, 1));
     buf_u8(b, 0x48); buf_u8(b, 0x85); buf_u8(b, 0xC0);
     buf_u8(b, 0x0F); buf_u8(b, 0x95); buf_u8(b, 0xC0);
     buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0xB6); buf_u8(b, 0xC0);
@@ -6432,7 +6487,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
                     else buf_u32(b, (uint32_t)(-(int32_t)off));
                 } else if (!aggregate_init) {
-                    compile_expr(g, s->e1, 0, 1);
+                    compile_expr(g, s->e1, 0, value_deref_flag(g, s->type));
                     emit_mem_store(b, 0, off, var_size);
                 }
             }

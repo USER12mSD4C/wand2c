@@ -69,9 +69,10 @@ set(n*adr);
 ```
 
 In value context, `*i` and `*io` read the pointee. An `*i` **local** used as a
-pointer walker keeps its address in pointer arithmetic and comparisons, so
-`p = p + 1`, `p != end`, and `match (p) { case end ... }` advance/compare
-addresses rather than pointee bytes.
+pointer walker keeps its address in pointer arithmetic, comparisons, and bare
+truthiness, so `p = p + 1`, `p != end`, `if (p)`, and
+`match (p) { case end ... }` advance/compare/test addresses rather than pointee
+bytes. Copying a pointer into a plain pointer variable preserves the address.
 
 Do not combine `volatile` or `atomic` with `*i/*o/*io`.
 
@@ -118,6 +119,8 @@ u8* p2 = (u8*)addr;
 ```
 
 The language forbids implicit type conversions; use explicit casts at every narrowing or widening boundary. Do not rely on compiler tolerance for implicit narrowing.
+
+For `f64* x*i`, `x` names the `f64` object in arithmetic; `x + 1.0` reads the pointee, not the address.
 
 ## 6. Control flow
 
