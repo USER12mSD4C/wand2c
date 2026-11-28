@@ -170,6 +170,13 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    /* Only literal brace/string initializers are known to fill every leaf of
+     * a struct. A copy from a variable or a call may carry indeterminate or
+     * partially materialized fields, so those must stay uninitialized. */
+    fn initializer_covers_struct_fields(expr: &Expr) -> bool {
+        matches!(expr, Expr::ArrayInit(_) | Expr::StringLit(_))
+    }
+
     fn register_struct_fields(
         &mut self,
         prefix: &str,
@@ -288,14 +295,21 @@ impl MemorySafetyAnalyzer {
                             self.states.insert(decl.name.clone(), VarState::Safe);
 
                             if !is_pointer {
-                                /* A direct struct initializer (brace, string,
-                                 * or aggregate value) initializes every field,
-                                 * with omitted fields zero-filled. */
+                                let field_state = if Self::initializer_covers_struct_fields(
+                                    init_expr,
+                                ) {
+                                    VarState::Safe
+                                } else {
+                                    VarState::Uninitialized {
+                                        declared_line: current_line,
+                                        type_name: type_str.clone(),
+                                    }
+                                };
                                 self.register_struct_fields(
                                     &decl.name,
                                     &decl.data_type,
                                     structs,
-                                    VarState::Safe,
+                                    field_state,
                                 );
                             }
                         }
