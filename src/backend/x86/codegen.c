@@ -938,12 +938,18 @@ typedef struct {
     WStr key;
     uint8_t is_rip;
     uint8_t patch_end;
+    uint8_t is_global; /* pos is an offset inside global data, not code */
 } AddrPatch;
 
 typedef struct {
     size_t pos;
     WStr target;
 } CallPatch;
+
+typedef struct {
+    size_t pos; /* offset inside global data */
+    WStr key;
+} GlobalPtrFixup;
 
 typedef struct {
     size_t* cont;
@@ -965,6 +971,7 @@ typedef struct {
 } XmmLocal;
 
 DEFINE_VEC(AddrPatchVec, AddrPatch)
+DEFINE_VEC(GlobalPtrFixupVec, GlobalPtrFixup)
 DEFINE_VEC(CallPatchVec, CallPatch)
 DEFINE_VEC(LoopCtxVec, LoopCtx)
 DEFINE_VEC(RegLocalVec, RegLocal)
@@ -1015,6 +1022,7 @@ struct Gen {
     Map function_offsets;
 
     AddrPatchVec address_patches;
+    GlobalPtrFixupVec global_ptr_fixups;
     CallPatchVec call_patches;
     size_t patch_generation; /* incremented whenever a branch/call patch is recorded */
     size_t last_rax_store_pos; /* start of last rax-to-local store */
@@ -1027,6 +1035,7 @@ struct Gen {
     size_t stack_depth;
     size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
+    uint8_t r10_busy; /* an outer expression is keeping a live value in r10 */
 
     WandOutputFormat format;
     WStr entry_name;
@@ -1330,6 +1339,7 @@ static void emit_rip_relative_lea(Gen* g, uint8_t reg, WStr key) {
     p.key = key;
     p.is_rip = 1;
     p.patch_end = 0;
+    p.is_global = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -2254,6 +2264,7 @@ static void emit_float_op_xmm0_mem(Gen* g, WStr op, WStr lit) {
     p.key = key;
     p.is_rip = 1;
     p.patch_end = 0;
+    p.is_global = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -2270,6 +2281,7 @@ static void emit_load_float_lit_xmm0(Gen* g, WStr lit) {
     p.key = key;
     p.is_rip = 1;
     p.patch_end = 0;
+    p.is_global = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -2675,6 +2687,17 @@ static int is_float_expr(Gen* g, WExpr* e) {
             return 0;
         }
         case 8:
+            /* Casts set their result type. Treating (f64)x as non-float made
+             * arithmetic reconvert the already converted bit pattern. */
+            if (wstr_eq_c(e->str, "OpCastF64")) {
+                return 1;
+            }
+            if (wstr_eq_c(e->str, "OpCast")) {
+                return is_float_expr(g, e->a);
+            }
+            if (const_is_cast_op(e->str)) {
+                return 0;
+            }
             return is_float_expr(g, e->a) || is_float_expr(g, e->b);
         case 9:
             return wstr_eq_c(e->str, "sin") || wstr_eq_c(e->str, "cos") ||
@@ -3442,14 +3465,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
-            if (!float_op && has_binary_imm(op) &&
+            if (!float_op && has_binary_imm(op) && !g->r10_busy &&
                 !expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
                 /* Neither operand is simple. Keep the LHS in r10 across the
                  * RHS evaluation, avoiding a push/pop stack round trip. r10
                  * is caller-saved, so the LHS must not contain a call and
-                 * the RHS must not call while r10 is live. */
+                 * the RHS must not call or reuse r10 while the LHS is live. */
                 compile_expr(g, e->a, 10, 0);
+                g->r10_busy = 1;
                 compile_expr(g, e->b, 0, 0);
+                g->r10_busy = 0;
                 if (wstr_eq_c(op, "OpSub")) {
                     buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
                     buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
@@ -4224,11 +4249,13 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
         compile_expr(g, e->b, 3, 1);
         compile_expr(g, e->a, 0, 1);
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
-    } else if (!expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
+    } else if (!g->r10_busy && !expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
         /* Keep LHS in r10 instead of push/pop. No calls in either operand,
-         * so r10 survives the RHS evaluation. */
+         * and the RHS must not reuse r10 while the LHS is live. */
         compile_expr(g, e->a, 10, 1);
+        g->r10_busy = 1;
         compile_expr(g, e->b, 0, 1);
+        g->r10_busy = 0;
         buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
         buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
@@ -4405,9 +4432,16 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     if (e && e->tag == 8 && wstr_eq_c(e->str, "OpCastF64") && e->a &&
         !is_float_expr(g, e->a)) {
         /* Integer to f64: convert straight into xmm0, skipping the movq
-         * round trip that the generic rax-based cast emits. */
+         * round trip that the generic rax-based cast emits. A full-width
+         * unsigned source can have its high bit set, which cvtsi2sd would
+         * read as negative; use the halving path for that case. */
         compile_expr(g, e->a, 0, 0);
-        buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        if (is_signed_expr(g, e->a) || expr_size(g, e->a) < 8) {
+            buf_u8(b, 0xF2); buf_u8(b, 0x48); buf_u8(b, 0x0F); buf_u8(b, 0x2A); buf_u8(b, 0xC0);
+        } else {
+            emit_int_bits_to_f64_bits(g, 0, 0);
+            emit_movq_rax_to_xmm0(b);
+        }
         return;
     }
     if (compile_f64_index_to_xmm0(g, e)) {
@@ -5683,6 +5717,7 @@ static void emit_rip_relative_mem_rmw(Gen* g, WStr key, uint8_t op, int64_t imm)
     p.key = key;
     p.is_rip = 1;
     p.patch_end = (uint8_t)(op >= 2);
+    p.is_global = 0;
     AddrPatchVec_push(&g->address_patches, p);
     g->patch_generation++;
 }
@@ -6744,6 +6779,34 @@ static void calculate_and_insert_layout(Gen* g, WStruct* s) {
     map_put_str(&g->struct_alignments, s->name, layout.align);
 }
 
+/* Return the global-data key for an initializer that asks for an address.
+ * `*adr` of a section variable becomes AddrOf("section:name"); a parenthesized
+ * section access can become AddrOfExpr(SectionAccess). */
+static int global_init_address_key(Gen* g, WExpr* e, WStr* key) {
+    if (!e) {
+        return 0;
+    }
+    if (e->tag == 4 && e->str.ptr) {
+        for (uint32_t i = 0; i < e->str.len; i++) {
+            if (e->str.ptr[i] == ':') {
+                *key = e->str;
+                return 1;
+            }
+        }
+        WStr found = find_global_key(g, e->str);
+        if (found.ptr) {
+            *key = found;
+            return 1;
+        }
+        return 0;
+    }
+    if (e->tag == 5 && e->a && e->a->tag == 7) {
+        *key = wstr_pair(e->a->str, e->a->str2);
+        return 1;
+    }
+    return 0;
+}
+
 static void setup_program(Gen* g, Buf* global) {
     g->next_offset = 8;
 
@@ -6864,7 +6927,30 @@ static void setup_program(Gen* g, Buf* global) {
             map_put_str(&g->section_var_sizes, key, var_size);
             map_put_str(&g->section_types, key, PTR(var->type));
             size_t start_len = global->len;
-            if (var->has_init && var->init) {
+            WStr ptr_fixup_key = {0};
+            WType* var_type = peel_typedefs(var->type);
+            int var_is_pointer = var_type && var_type->tag == 10 &&
+                                 type_size(g, var_type) == 8;
+            if (var_is_pointer && var->has_init && var->init) {
+                if (var->init->tag == 2) {
+                    collect_expr_literals(g, var->init, 1);
+                    ptr_fixup_key = wstr_prefix("str:", var->init->str);
+                } else {
+                    global_init_address_key(g, var->init, &ptr_fixup_key);
+                }
+            }
+            if (ptr_fixup_key.ptr) {
+                /* The target offset is not known until all globals are laid
+                 * out, so write a placeholder and patch it after the string
+                 * and section tables are complete. */
+                for (uint32_t k = 0; k < var_size; k++) {
+                    buf_u8(global, 0);
+                }
+                GlobalPtrFixup fixup;
+                fixup.pos = start_len;
+                fixup.key = ptr_fixup_key;
+                GlobalPtrFixupVec_push(&g->global_ptr_fixups, fixup);
+            } else if (var->has_init && var->init) {
                 if (var->init->tag == 12) {
                     uint32_t elem_size = array_element_size(g, var->type);
                     for (size_t k = 0; k < var->init->arg_count; k++) {
@@ -6920,6 +7006,21 @@ static void setup_program(Gen* g, Buf* global) {
         buf_u8(global, 0);
         WStr full = wstr_prefix("str:", key);
         add_global_offset(g, full, off);
+    }
+
+    for (size_t i = 0; i < g->global_ptr_fixups.n; i++) {
+        GlobalPtrFixup* fixup = &g->global_ptr_fixups.v[i];
+        uint64_t off = 0;
+        if (!map_get_str(&g->global_offsets, fixup->key, &off)) {
+            continue;
+        }
+        AddrPatch p;
+        p.pos = fixup->pos;
+        p.key = fixup->key;
+        p.is_rip = 0;
+        p.patch_end = 0;
+        p.is_global = 1;
+        AddrPatchVec_push(&g->address_patches, p);
     }
 
     for (size_t i = 0; i < g->prog.func_count; i++) {
@@ -7141,6 +7242,12 @@ static void finalize_output(Gen* g, Buf* global, WandOutputFormat format,
 
     for (size_t i = 0; i < g->address_patches.n; i++) {
         AddrPatch p = g->address_patches.v[i];
+        if (p.is_global) {
+            /* Global fixups were recorded as offsets inside the global data
+             * buffer; the image places that buffer at global_start. */
+            p.pos += global_start;
+            g->address_patches.v[i].pos = p.pos;
+        }
         if (format == WAND_OUTPUT_WEXP && p.is_rip &&
             wstr_starts_with(p.key, "fn:")) {
             /* WEXP keeps function addresses as relocations. The loader fills
@@ -7517,6 +7624,11 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     Buf body = {0};
     Buf elf = {0};
     Buf symbols = {0};
+    Buf* sect_rela = NULL;        /* one relocation buffer per Wand section */
+    uint32_t* sect_rela_name = NULL;
+    uint64_t* sect_rela_off = NULL;
+    uint64_t* sect_rela_size = NULL;
+    size_t sect_rela_count = 0;
 
     Map str_cache = {0};
     Map data_sym = {0};
@@ -7546,6 +7658,16 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
         range->is_noinit = sect->is_noinit;
         range->name_off = name_off;
         range->off = 0;
+    }
+    if (sects_n) {
+        sect_rela = (Buf*)arena_alloc(g_arena, sects_n * sizeof(Buf));
+        sect_rela_name = (uint32_t*)arena_alloc(g_arena, sects_n * sizeof(uint32_t));
+        sect_rela_off = (uint64_t*)arena_alloc(g_arena, sects_n * sizeof(uint64_t));
+        sect_rela_size = (uint64_t*)arena_alloc(g_arena, sects_n * sizeof(uint64_t));
+        memset(sect_rela, 0, sects_n * sizeof(Buf));
+        memset(sect_rela_name, 0, sects_n * sizeof(uint32_t));
+        memset(sect_rela_off, 0, sects_n * sizeof(uint64_t));
+        memset(sect_rela_size, 0, sects_n * sizeof(uint64_t));
     }
     uint32_t n_rodata = (uint32_t)shstrtab.len;
     buf_bytes(&shstrtab, ".rodata", sizeof(".rodata"));
@@ -7759,6 +7881,9 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     }
     for (size_t i = 0; i < g->address_patches.n; i++) {
         AddrPatch* ap = &g->address_patches.v[i];
+        if (ap->is_global) {
+            continue; /* handled in the per-section relocation loop below */
+        }
         if (wstr_starts_with(ap->key, "fn:")) {
             WStr func_name = wstr_sub(ap->key, 3, ap->key.len - 3);
             uint64_t sym = 0;
@@ -7779,6 +7904,39 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
         elf_push_u64(&rela, (uint64_t)ap->pos);
         elf_push_u64(&rela, ((uint64_t)(uint32_t)sym << 32) | type);
         elf_push_i64(&rela, addend);
+    }
+
+    /* Pointer globals live in section data, so their R_X86_64_64 entries
+     * must be in a .rela section that targets that section, not .text. */
+    for (size_t i = 0; i < g->address_patches.n; i++) {
+        AddrPatch* ap = &g->address_patches.v[i];
+        if (!ap->is_global) {
+            continue;
+        }
+        size_t si = 0;
+        while (si < sects_n) {
+            ElfSectRange* range = &sects[si];
+            if (ap->pos >= range->start &&
+                ap->pos + 8 <= (size_t)range->start + range->size) {
+                break;
+            }
+            si++;
+        }
+        if (si == sects_n) {
+            continue;
+        }
+        if (!sect_rela_name[si]) {
+            sect_rela_name[si] = (uint32_t)shstrtab.len;
+            buf_printf(&shstrtab, ".rela.w.%.*s", (int)sects[si].name.len,
+                       ELF_STR(sects[si].name));
+            buf_u8(&shstrtab, 0);
+            sect_rela_count++;
+        }
+        uint64_t sym = 0;
+        map_get_str(&data_sym, ap->key, &sym);
+        elf_push_u64(&sect_rela[si], (uint64_t)(ap->pos - sects[si].start));
+        elf_push_u64(&sect_rela[si], ((uint64_t)(uint32_t)sym << 32) | 1u);
+        elf_push_i64(&sect_rela[si], 0);
     }
 
     /* ---------------------------------------------------------------- */
@@ -7844,6 +8002,17 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     while ((64u + body.len) % 8u != 0u) {
         buf_u8(&body, 0);
     }
+    for (size_t i = 0; i < sects_n; i++) {
+        if (!sect_rela[i].len) {
+            continue;
+        }
+        sect_rela_off[i] = (uint64_t)(64u + body.len);
+        sect_rela_size[i] = sect_rela[i].len;
+        buf_bytes(&body, sect_rela[i].data, sect_rela[i].len);
+        while ((64u + body.len) % 8u != 0u) {
+            buf_u8(&body, 0);
+        }
+    }
     size_t symtab_off = 64u + body.len;
     buf_bytes(&body, symtab.data, symtab.len);
     while ((64u + body.len) % 8u != 0u) {
@@ -7878,7 +8047,7 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     elf_push_u16(&elf, 0);                       /* e_phentsize */
     elf_push_u16(&elf, 0);                       /* e_phnum */
     elf_push_u16(&elf, 64);                      /* e_shentsize */
-    elf_push_u16(&elf, (uint16_t)(8u + p->section_count)); /* e_shnum */
+    elf_push_u16(&elf, (uint16_t)(8u + p->section_count + sect_rela_count)); /* e_shnum */
     elf_push_u16(&elf, (uint16_t)(6u + p->section_count)); /* e_shstrndx */
 
     buf_bytes(&elf, body.data, body.len);
@@ -7913,6 +8082,14 @@ static void build_relocatable_elf(Gen* g, Buf* global_data) {
     elf_push_shdr(&elf, n_shstrtab, 3, 0, 0, (uint64_t)shstrtab_off,
                   (uint64_t)shstrtab_size, 0, 0, 1, 0);
     elf_push_shdr(&elf, n_note, 1, 0, 0, 0, 0, 0, 0, 1, 0);
+
+    for (size_t i = 0; i < sects_n; i++) {
+        if (!sect_rela[i].len) {
+            continue;
+        }
+        elf_push_shdr(&elf, sect_rela_name[i], 4, 64, 0, sect_rela_off[i],
+                      sect_rela_size[i], symtab_shndx, (uint32_t)(2u + i), 8, 24);
+    }
 
     /* ---------------------------------------------------------------- */
     /* Hand back exactly the ELF bytes; caller resets g->code beforehand  */
