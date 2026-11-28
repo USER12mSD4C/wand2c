@@ -2725,6 +2725,27 @@ static int is_signed_expr(Gen* g, WExpr* e) {
             return t && t->tag >= 4 && t->tag <= 7;
         }
         case 8:
+            /* Casts take their signedness from the target type, not from the
+             * source. `(u64)i` is unsigned even when i is i64; propagating the
+             * source signedness made division, comparisons and f64 conversion
+             * choose signed operations for unsigned values. */
+            if (wstr_eq_c(e->str, "OpCastF64") ||
+                wstr_eq_c(e->str, "OpCastInt") ||
+                wstr_eq_c(e->str, "OpCastU8") ||
+                wstr_eq_c(e->str, "OpCastU16") ||
+                wstr_eq_c(e->str, "OpCastU32") ||
+                wstr_eq_c(e->str, "OpCastU64")) {
+                return 0;
+            }
+            if (wstr_eq_c(e->str, "OpCastI8") ||
+                wstr_eq_c(e->str, "OpCastI16") ||
+                wstr_eq_c(e->str, "OpCastI32") ||
+                wstr_eq_c(e->str, "OpCastI64")) {
+                return 1;
+            }
+            if (wstr_eq_c(e->str, "OpCast")) {
+                return is_signed_expr(g, e->a);
+            }
             return is_signed_expr(g, e->a) || is_signed_expr(g, e->b);
         case 9: {
             WFunc* f = func_by_name(g, e->str);
@@ -5389,6 +5410,15 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
                     sect.str = wstr_sub(key, 0, colon);
                     sect.str2 = wstr_sub(key, colon + 1, key.len - colon - 1);
                     compile_address(g, &sect, internal_reg);
+                    /* A global pointer variable stores the address in its
+                     * section slot. When the variable is used as the base of
+                     * an index or member access, load that address instead of
+                     * using the slot itself. Arrays keep the slot address. */
+                    WType* base_type = peel_typedefs(resolve_expr_type(g, e));
+                    if (base_type && base_type->tag == 10) {
+                        buf_u8(b, 0x48); buf_u8(b, 0x8B);
+                        buf_u8(b, internal_reg == 0 ? 0x00 : 0x1B);
+                    }
                 }
             }
             break;
