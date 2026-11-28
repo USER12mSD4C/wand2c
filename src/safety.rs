@@ -80,6 +80,28 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    /* A dynamic index collapses to the base object's field paths. Treat the
+     * collapsed field as initialized when every constant element with that
+     * field is initialized, so reading `a[i]` after initializing all elements
+     * does not report a false positive. */
+    fn all_indexed_fields_safe(&self, src: &str, suffix: &str) -> bool {
+        let elem_prefix = format!("{}[", src);
+        let mut found = false;
+        for (key, state) in &self.states {
+            if let Some(rest) = key.strip_prefix(&elem_prefix) {
+                if let Some(pos) = rest.find(']') {
+                    if rest[pos..].starts_with("].") && &rest[pos + 2..] == suffix {
+                        found = true;
+                        if !matches!(state, VarState::Safe) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
     fn get_expr_path(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Variable(name) => Some(name.clone()),
@@ -160,6 +182,9 @@ impl MemorySafetyAnalyzer {
         match expr {
             Expr::Variable(_) => true,
             Expr::MemberAccess { is_arrow: false, .. } => true,
+            /* A constant index names one pointer element. A dynamic index
+             * collapses to the base and must not poison sibling elements. */
+            Expr::Index { index, .. } => Self::const_index_text(index).is_some(),
             _ => false,
         }
     }
@@ -191,7 +216,11 @@ impl MemorySafetyAnalyzer {
                         ),
                     );
                 }
-                Some(VarState::NullPointer { .. }) => {
+                Some(VarState::NullPointer { .. })
+                | Some(VarState::Allocated {
+                    checked_not_null: false,
+                    ..
+                }) => {
                     self.push_error(
                         "error",
                         &format!("potential null pointer dereference of '{}'", path),
@@ -396,7 +425,14 @@ impl MemorySafetyAnalyzer {
                     .iter()
                     .filter_map(|(key, state)| {
                         if let Some(rest) = key.strip_prefix(&src_dot) {
-                            Some((format!("{}.{}", target_path, rest), state.clone()))
+                            let effective = if matches!(state, VarState::Uninitialized { .. })
+                                && self.all_indexed_fields_safe(src, rest)
+                            {
+                                VarState::Safe
+                            } else {
+                                state.clone()
+                            };
+                            Some((format!("{}.{}", target_path, rest), effective))
                         } else if let Some(rest) = key.strip_prefix(&src_index) {
                             Some((format!("{}[{}", target_path, rest), state.clone()))
                         } else {
@@ -627,12 +663,17 @@ impl MemorySafetyAnalyzer {
                     let mut check_is_not_null = true;
 
                     if let Expr::Binary { left, op, right } = cond {
-                        if let Some(path) = self.get_expr_path(left) {
-                            if **right == Expr::Null {
-                                checked_var = Some(path);
-                                if op == "OpEq" || op == "==" {
-                                    check_is_not_null = false;
-                                }
+                        let path = if **right == Expr::Null {
+                            self.get_expr_path(left)
+                        } else if **left == Expr::Null {
+                            self.get_expr_path(right)
+                        } else {
+                            None
+                        };
+                        if let Some(path) = path {
+                            checked_var = Some(path);
+                            if op == "OpEq" || op == "==" {
+                                check_is_not_null = false;
                             }
                         }
                     }
@@ -869,6 +910,13 @@ impl MemorySafetyAnalyzer {
 
         if let Expr::Index { expr: base, .. } = expr {
             self.check_index_base_safety(base, line);
+        }
+
+        /* A dot field access can sit on top of an arrow or index dereference,
+         * e.g. `p->in.n` or `p[0].n`. Check the base expression so those
+         * dereferences are not hidden by the outer field access. */
+        if let Expr::MemberAccess { expr: base, .. } = expr {
+            self.check_expression_safety(base, line);
         }
 
         match expr {
