@@ -2700,7 +2700,7 @@ static int is_signed_expr(Gen* g, WExpr* e) {
         case 6:
         case 7:
         case 10: {
-            WType* t = peel_typedefs(resolve_expr_type(g, e));
+            WType* t = resolve_named_type(g, resolve_expr_type(g, e));
             return t && t->tag >= 4 && t->tag <= 7;
         }
         case 8:
@@ -6950,7 +6950,8 @@ static void collect_init_leaves(Gen* g, WType* t, size_t base,
 
 static size_t emit_global_leaf(Gen* g, Buf* global, size_t var_start,
                                uint32_t var_size, InitLeaf* leaves,
-                               size_t leaf_count, size_t pos, WExpr* arg) {
+                               size_t leaf_count, size_t pos, WExpr* arg,
+                               size_t max_leaves) {
     if (!arg) {
         return pos;
     }
@@ -6969,13 +6970,18 @@ static size_t emit_global_leaf(Gen* g, Buf* global, size_t var_start,
     }
     size_t at = var_start + leaf->off;
     /* A string literal assigned to a byte leaf fills consecutive byte leaves,
-     * including the NUL and any remaining array slots. This covers struct
-     * fields such as `Rec rec = { 3, "hi" }` as well as whole byte arrays. */
+     * including the NUL and any remaining array slots. Stop at the declared
+     * array so the next struct field keeps its own initializer. This covers
+     * `Rec rec = { 3, "hi" }` and whole byte arrays. */
     if (arg->tag == 2 && t && (t->tag == 0 || t->tag == 4)) {
         Buf bytes = {0};
         unescape_string(arg->str, &bytes);
+        size_t limit = max_leaves ? max_leaves : leaf_count - pos;
+        if (limit > leaf_count - pos) {
+            limit = leaf_count - pos;
+        }
         size_t consumed = 0;
-        while (pos + consumed < leaf_count) {
+        while (consumed < limit) {
             InitLeaf* l = &leaves[pos + consumed];
             WType* lt = resolve_named_type(g, l->type);
             if (!lt || (lt->tag != 0 && lt->tag != 4) ||
@@ -7043,7 +7049,7 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
         if (!has_brace_arg && sub_count && init->arg_count > sub_count) {
             for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
                 pos = emit_global_leaf(g, global, var_start, var_size, leaves,
-                                       leaf_count, pos, init->args[i]);
+                                       leaf_count, pos, init->args[i], 1);
             }
             return pos;
         }
@@ -7073,12 +7079,20 @@ static size_t emit_global_init_expr(Gen* g, Buf* global, size_t var_start,
         }
         if (init->arg_count) {
             pos = emit_global_leaf(g, global, var_start, var_size, leaves,
-                                   leaf_count, pos, init->args[0]);
+                                   leaf_count, pos, init->args[0], 1);
         }
         return pos;
     }
+    WType* declared = resolve_named_type(g, t);
+    size_t limit = 1;
+    if (declared && declared->tag == 12 && declared->count) {
+        WType* elem = resolve_named_type(g, declared->inner);
+        if (elem && (elem->tag == 0 || elem->tag == 4)) {
+            limit = declared->count;
+        }
+    }
     return emit_global_leaf(g, global, var_start, var_size, leaves, leaf_count,
-                            pos, init);
+                            pos, init, limit);
 }
 
 static void setup_program(Gen* g, Buf* global) {
@@ -7330,7 +7344,10 @@ static void compile_function(Gen* g, WFunc* f) {
         }
         map_put_str(&g->local_types, p->name, PTR(actual));
 
-        WType* peeled = peel_typedefs(actual);
+        /* The caller classifies named typedef parameters through
+         * resolve_named_type(); the prologue must use the same resolution or
+         * a typedef'd f64 arrives in xmm0 but is stored from a GPR slot. */
+        WType* peeled = resolve_named_type(g, actual);
         int is_float = peeled && peeled->tag == 8;
         if (is_float && float_param_pos < 8) {
             emit_store_xmm_param(b, (uint8_t)float_param_pos, off);
