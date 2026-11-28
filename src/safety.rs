@@ -11,6 +11,12 @@ enum VarState {
         type_name: String,
     },
     Safe,
+    /* A pointer was explicitly set to null (or a non-pointer scalar). It is
+     * not an allocation, so it must not create a leak warning, but dereferencing
+     * it still requires an explicit null check. */
+    NullPointer {
+        type_name: String,
+    },
     Allocated {
         allocated_line: usize,
         checked_not_null: bool,
@@ -66,6 +72,14 @@ impl MemorySafetyAnalyzer {
         }
     }
 
+    fn const_index_text(index: &Expr) -> Option<String> {
+        match index {
+            Expr::Number(n) => Some(n.to_string()),
+            Expr::SignedNumber(n) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+
     fn get_expr_path(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Variable(name) => Some(name.clone()),
@@ -75,7 +89,17 @@ impl MemorySafetyAnalyzer {
                 let base_path = self.get_expr_path(base)?;
                 Some(format!("{}.{}", base_path, member))
             }
-            Expr::Index { expr: base, .. } => self.get_expr_path(base),
+            Expr::Index { expr: base, index } => {
+                let base_path = self.get_expr_path(base)?;
+                match Self::const_index_text(index) {
+                    /* Constant array elements are distinct objects. Dynamic
+                     * indices keep the collapsed base path so writes and
+                     * reads through the same variable still agree. */
+                    Some(idx) => Some(format!("{}[{}]", base_path, idx)),
+                    None => Some(base_path),
+                }
+            }
+            Expr::AddrOf(name) => Some(name.clone()),
             Expr::AddrOfExpr(inner) => self.get_expr_path(inner),
             _ => None,
         }
@@ -122,6 +146,61 @@ impl MemorySafetyAnalyzer {
             name == "mloc"
         } else {
             false
+        }
+    }
+
+    fn is_null_or_scalar(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Null | Expr::Number(_) | Expr::SignedNumber(_) | Expr::FloatLit(_)
+        )
+    }
+
+    fn is_direct_pointer_target(expr: &Expr) -> bool {
+        match expr {
+            Expr::Variable(_) => true,
+            Expr::MemberAccess { is_arrow: false, .. } => true,
+            _ => false,
+        }
+    }
+
+    /* An indexed access dereferences its base pointer even when the indexed
+     * path itself has separate field state. Check the base for freed, null,
+     * or unchecked-allocation state so `p[0]` behaves like `p->field`. */
+    fn check_index_base_safety(&mut self, base: &Expr, line: usize) {
+        if Self::is_null_or_scalar(base) {
+            self.push_error(
+                "error",
+                "potential null pointer dereference in indexed access",
+                line,
+                "check the pointer before indexing it",
+            );
+            return;
+        }
+
+        if let Some(path) = self.get_expr_path(base) {
+            match self.states.get(&path).cloned() {
+                Some(VarState::Freed { freed_line }) => {
+                    self.push_error(
+                        "error",
+                        &format!("use-after-free violation on pointer '{}'", path),
+                        line,
+                        &format!(
+                            "pointer '{}' was freed on line {}, remove this access or re-allocate before use",
+                            path, freed_line
+                        ),
+                    );
+                }
+                Some(VarState::NullPointer { .. }) => {
+                    self.push_error(
+                        "error",
+                        &format!("potential null pointer dereference of '{}'", path),
+                        line,
+                        &format!("wrap in null check: if ({} != null) {{ ... }}", path),
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -194,10 +273,10 @@ impl MemorySafetyAnalyzer {
         initial_state: VarState,
         depth: usize,
     ) {
-        /* `get_expr_path()` collapses indices, so array elements and typedef
-         * aliases share the base object's field paths. The parser keeps a
-         * typedef use as `Struct(alias)`, so resolve aliases through the
-         * program's typedef table before giving up on field tracking. */
+        /* Constant array elements get their own field paths; a collapsed base
+         * path is kept as a conservative fallback for dynamic indices. The
+         * parser keeps a typedef use as `Struct(alias)`, so resolve aliases
+         * through the program's typedef table before giving up on tracking. */
         if depth > 8 {
             return;
         }
@@ -217,7 +296,7 @@ impl MemorySafetyAnalyzer {
                     return;
                 }
             }
-            DataType::Typedef(_, inner) | DataType::Array(inner, _) => {
+            DataType::Typedef(_, inner) => {
                 return self.register_struct_fields(
                     prefix,
                     inner,
@@ -225,6 +304,26 @@ impl MemorySafetyAnalyzer {
                     initial_state,
                     depth + 1,
                 );
+            }
+            DataType::Array(inner, count) => {
+                self.register_struct_fields(
+                    prefix,
+                    inner,
+                    structs,
+                    initial_state.clone(),
+                    depth + 1,
+                );
+                for i in 0..*count {
+                    let element_prefix = format!("{}[{}]", prefix, i);
+                    self.register_struct_fields(
+                        &element_prefix,
+                        inner,
+                        structs,
+                        initial_state.clone(),
+                        depth + 1,
+                    );
+                }
+                return;
             }
             _ => return,
         };
@@ -267,35 +366,45 @@ impl MemorySafetyAnalyzer {
         /* Null and scalar stores do not copy aggregate state. Leaving the old
          * field facts alone avoids path-insensitive false positives when a
          * pointer is reset to null and re-checked before a later use. */
-        if matches!(
-            value,
-            Expr::Null | Expr::Number(_) | Expr::SignedNumber(_) | Expr::FloatLit(_)
-        ) {
+        if Self::is_null_or_scalar(value) {
             return;
         }
 
-        let prefix = format!("{}.", target_path);
+        /* A whole-object assignment must cover both collapsed struct-array
+         * paths (`arr.n`) and constant element paths (`arr[0].n`). */
+        let target_prefixes = [format!("{}.", target_path), format!("{}[", target_path)];
         let old_fields: Vec<String> = self
             .states
             .keys()
-            .filter(|key| key.starts_with(&prefix))
+            .filter(|key| target_prefixes.iter().any(|p| key.starts_with(p)))
             .cloned()
             .collect();
 
-        let source_prefix = match value {
+        let source_path = match value {
             Expr::Variable(_)
             | Expr::MemberAccess { .. }
             | Expr::Index { .. }
-            | Expr::AddrOfExpr(_) => self.get_expr_path(value).map(|path| format!("{}.", path)),
+            | Expr::AddrOf(_)
+            | Expr::AddrOfExpr(_) => self.get_expr_path(value),
             _ => None,
         };
-        let copied_fields: Vec<(String, VarState)> = match source_prefix {
-            Some(ref src) => self
-                .states
-                .iter()
-                .filter(|(key, _)| key.starts_with(src))
-                .map(|(key, state)| (format!("{}{}", prefix, &key[src.len()..]), state.clone()))
-                .collect(),
+        let copied_fields: Vec<(String, VarState)> = match source_path {
+            Some(ref src) => {
+                let src_dot = format!("{}.", src);
+                let src_index = format!("{}[", src);
+                self.states
+                    .iter()
+                    .filter_map(|(key, state)| {
+                        if let Some(rest) = key.strip_prefix(&src_dot) {
+                            Some((format!("{}.{}", target_path, rest), state.clone()))
+                        } else if let Some(rest) = key.strip_prefix(&src_index) {
+                            Some((format!("{}[{}", target_path, rest), state.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
             None => Vec::new(),
         };
 
@@ -415,6 +524,13 @@ impl MemorySafetyAnalyzer {
                                     type_name: type_str.clone(),
                                 },
                             );
+                        } else if is_pointer && Self::is_null_or_scalar(init_expr) {
+                            self.states.insert(
+                                decl.name.clone(),
+                                VarState::NullPointer {
+                                    type_name: type_str.clone(),
+                                },
+                            );
                         } else {
                             self.states.insert(decl.name.clone(), VarState::Safe);
 
@@ -481,6 +597,18 @@ impl MemorySafetyAnalyzer {
                                         type_name: type_str,
                                     },
                                 );
+                            } else if Self::is_null_or_scalar(value)
+                                && Self::is_direct_pointer_target(target)
+                            {
+                                /* `p = null` makes `p` unchecked; `p[i] = 7`
+                                 * only writes an element and must not replace
+                                 * the base pointer's state. */
+                                self.states.insert(
+                                    path.clone(),
+                                    VarState::NullPointer {
+                                        type_name: "void*".to_string(),
+                                    },
+                                );
                             } else {
                                 self.states.insert(path.clone(), VarState::Safe);
                             }
@@ -512,20 +640,25 @@ impl MemorySafetyAnalyzer {
                     let mut then_states = self.states.clone();
                     if let Some(ref path) = checked_var {
                         if check_is_not_null {
-                            if let Some(VarState::Allocated {
-                                allocated_line,
-                                type_name,
-                                ..
-                            }) = then_states.get(path)
-                            {
-                                then_states.insert(
-                                    path.clone(),
-                                    VarState::Allocated {
-                                        allocated_line: *allocated_line,
-                                        checked_not_null: true,
-                                        type_name: type_name.clone(),
-                                    },
-                                );
+                            match then_states.get(path).cloned() {
+                                Some(VarState::Allocated {
+                                    allocated_line,
+                                    type_name,
+                                    ..
+                                }) => {
+                                    then_states.insert(
+                                        path.clone(),
+                                        VarState::Allocated {
+                                            allocated_line,
+                                            checked_not_null: true,
+                                            type_name,
+                                        },
+                                    );
+                                }
+                                Some(VarState::NullPointer { .. }) => {
+                                    then_states.insert(path.clone(), VarState::Safe);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -546,20 +679,25 @@ impl MemorySafetyAnalyzer {
                     if let Some(else_stmts) = else_branch {
                         if let Some(ref path) = checked_var {
                             if !check_is_not_null {
-                                if let Some(VarState::Allocated {
-                                    allocated_line,
-                                    type_name,
-                                    ..
-                                }) = else_states.get(path)
-                                {
-                                    else_states.insert(
-                                        path.clone(),
-                                        VarState::Allocated {
-                                            allocated_line: *allocated_line,
-                                            checked_not_null: true,
-                                            type_name: type_name.clone(),
-                                        },
-                                    );
+                                match else_states.get(path).cloned() {
+                                    Some(VarState::Allocated {
+                                        allocated_line,
+                                        type_name,
+                                        ..
+                                    }) => {
+                                        else_states.insert(
+                                            path.clone(),
+                                            VarState::Allocated {
+                                                allocated_line,
+                                                checked_not_null: true,
+                                                type_name,
+                                            },
+                                        );
+                                    }
+                                    Some(VarState::NullPointer { .. }) => {
+                                        else_states.insert(path.clone(), VarState::Safe);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -585,7 +723,39 @@ impl MemorySafetyAnalyzer {
                             self.merge_states(then_analyzer.states, else_analyzer.states);
                         }
                     } else {
-                        if !then_terminates {
+                        if then_terminates {
+                            /* The implicit else path is the one that continues.
+                             * Refine the checked variable for that path before
+                             * adopting its state. */
+                            let mut fallthrough_states = self.states.clone();
+                            if let Some(ref path) = checked_var {
+                                if !check_is_not_null {
+                                    /* `if (p == null) return;` leaves a non-null
+                                     * pointer on the fallthrough path. */
+                                    match fallthrough_states.get(path).cloned() {
+                                        Some(VarState::NullPointer { .. }) => {
+                                            fallthrough_states.insert(path.clone(), VarState::Safe);
+                                        }
+                                        Some(VarState::Allocated {
+                                            allocated_line,
+                                            type_name,
+                                            ..
+                                        }) => {
+                                            fallthrough_states.insert(
+                                                path.clone(),
+                                                VarState::Allocated {
+                                                    allocated_line,
+                                                    checked_not_null: true,
+                                                    type_name,
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            self.states = fallthrough_states;
+                        } else {
                             self.states = then_analyzer.states;
                         }
                     }
@@ -697,6 +867,10 @@ impl MemorySafetyAnalyzer {
             return;
         }
 
+        if let Expr::Index { expr: base, .. } = expr {
+            self.check_index_base_safety(base, line);
+        }
+
         match expr {
             Expr::Variable(_) | Expr::MemberAccess { .. } | Expr::Index { .. } => {
                 if let Some(path) = self.get_expr_path(expr) {
@@ -798,13 +972,29 @@ impl MemorySafetyAnalyzer {
             member,
         } = expr
         {
+            if Self::is_null_or_scalar(base) {
+                self.push_error(
+                    "error",
+                    &format!(
+                        "potential null pointer dereference when accessing field '{}'",
+                        member
+                    ),
+                    line,
+                    "check the pointer before dereferencing it",
+                );
+                return;
+            }
+
             if let Some(path) = self.get_expr_path(base) {
-                if let Some(VarState::Allocated {
-                    allocated_line: _,
-                    checked_not_null: false,
-                    ..
-                }) = self.states.get(&path)
-                {
+                let unchecked = match self.states.get(&path) {
+                    Some(VarState::Allocated {
+                        checked_not_null: false,
+                        ..
+                    })
+                    | Some(VarState::NullPointer { .. }) => true,
+                    _ => false,
+                };
+                if unchecked {
                     self.push_error(
                         "error",
                         &format!(

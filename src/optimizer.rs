@@ -1190,11 +1190,28 @@ fn optimize_expr_recursive(
 
     match expr {
         Expr::Binary { left, right, .. } => {
-            count += optimize_expr_recursive(left, consts, escaped, env);
-            count += optimize_expr_recursive(right, consts, escaped, env);
+            /* Preserve the variable in a null comparison. Substituting a
+             * cached null here removes the information the safety analyzer
+             * needs to refine the checked branch. */
+            let is_null_comparison =
+                matches!(&**left, Expr::Null) || matches!(&**right, Expr::Null);
+            if !is_null_comparison {
+                count += optimize_expr_recursive(left, consts, escaped, env);
+                count += optimize_expr_recursive(right, consts, escaped, env);
+            }
         }
         Expr::MemberAccess { expr: base, .. } => {
-            count += optimize_expr_recursive(base, consts, escaped, env);
+            /* Keep a cached null/scalar value out of the pointer base. The
+             * safety analyzer needs the original variable so an explicit null
+             * check can refine it and an unchecked dereference can be
+             * diagnosed. */
+            let cached_constant_base = get_expr_path(base)
+                .and_then(|path| consts.get(&path))
+                .map(|value| is_constant_expr(value))
+                .unwrap_or(false);
+            if !cached_constant_base {
+                count += optimize_expr_recursive(base, consts, escaped, env);
+            }
         }
         Expr::Index { expr: base, index } => {
             count += optimize_expr_recursive(base, consts, escaped, env);
