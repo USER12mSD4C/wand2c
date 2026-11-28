@@ -503,6 +503,13 @@ typedef struct {
     size_t func_count;
 } WProgram;
 
+/* Runtime aggregate initializer helpers (defined after InitLeaf below). */
+static WStruct* find_struct_by_name(Gen* g, WStr name);
+static uint32_t emit_runtime_init_rbx(Gen* g, WExpr* init, WType* type,
+                                      uint32_t max_bytes);
+static uint32_t emit_runtime_init_local(Gen* g, WExpr* init, WType* type,
+                                        uint32_t off, uint32_t max_bytes);
+
 /* ------------------------------------------------------------------ */
 /* Wire reader                                                         */
 /* ------------------------------------------------------------------ */
@@ -5922,74 +5929,37 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
     }
 }
 
-/* Flatten aggregate initializer leaves into the destination addressed by rbx.
- * Mirrors emit_local_array_leaves, but for a computed destination. Returns the
- * number of bytes written so the caller can zero-fill the rest. */
-static uint32_t emit_array_leaves_to_rbx(Gen* g, WExpr* init, uint32_t disp,
-                                         uint32_t max_bytes, uint32_t elem_size,
-                                         int elem_is_byte) {
-    if (!init || !max_bytes || !elem_size) {
-        return 0;
-    }
-    Buf* b = &g->code;
-    if (init->tag == 12) {
-        uint32_t used = 0;
-        for (size_t i = 0; i < init->arg_count && used < max_bytes; i++) {
-            used += emit_array_leaves_to_rbx(g, init->args[i], disp + used,
-                                             max_bytes - used, elem_size,
-                                             elem_is_byte);
-        }
-        return used;
-    }
-    if (init->tag == 2 && elem_is_byte) {
-        Buf bytes = {0};
-        unescape_string(init->str, &bytes);
-        uint64_t len = bytes.len + 1;
-        if (len > max_bytes) {
-            len = max_bytes;
-        }
-        for (uint64_t i = 0; i < len; i++) {
-            uint8_t value = i < bytes.len ? (uint8_t)bytes.data[i] : 0;
-            emit_mov_imm64(b, 0, value);
-            emit_rbx_mem_store(b, disp + (uint32_t)i, 1);
-        }
-        return (uint32_t)len;
-    }
-    if (elem_size > 8 && (init->tag == 3 || init->tag == 7)) {
-        /* A whole aggregate leaf is an lvalue. Copy all of its bytes instead
-         * of the 8-byte scalar store, which would drop later fields. */
-        uint32_t n = elem_size <= max_bytes ? elem_size : max_bytes;
-        buf_u8(b, 0x53); /* push destination base */
-        compile_address(g, init, 3);
-        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
-        buf_u8(b, 0x5F); /* pop %rdi */
-        if (disp) {
-            buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xC7);
-            buf_u32(b, disp); /* add $disp,%rdi */
-        }
-        emit_mov_imm64(b, 1, n);
-        buf_u8(b, 0xFC);
-        buf_u8(b, 0xF3); buf_u8(b, 0xA4);
-        return n;
-    }
-    uint32_t width = elem_size <= 8 ? elem_size : 8;
-    if (width > max_bytes) {
-        width = max_bytes;
-    }
-    /* Leaf codegen uses rbx as scratch, so preserve the destination. */
-    buf_u8(b, 0x53); /* push rbx */
-    compile_expr(g, init, 0, 1);
-    buf_u8(b, 0x5B); /* pop rbx */
-    emit_rbx_mem_store(b, disp, width);
-    return width;
-}
-
 static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
     if (!target || !value) {
         return 0;
     }
     WType* resolved = resolve_named_type(g, resolve_expr_type(g, target));
-    if (!resolved || resolved->tag != 12 || resolved->count == 0) {
+    if (!resolved) {
+        return 0;
+    }
+    Buf* b = &g->code;
+    /* Whole struct assignment copies every field, including structs reached
+     * through an array index such as `arr[0] = p0`. */
+    if (resolved->tag == 11) {
+        uint32_t total = type_size(g, resolved);
+        WType* value_type = resolve_named_type(g, resolve_expr_type(g, value));
+        if (total > 8 && value_type && value_type->tag == 11 &&
+            type_size(g, value_type) == total &&
+            (value->tag == 3 || value->tag == 6 || value->tag == 7 ||
+             value->tag == 10)) {
+            compile_address(g, target, 3);
+            buf_u8(b, 0x53); /* push destination address */
+            compile_address(g, value, 3);
+            buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+            buf_u8(b, 0x5F); /* pop %rdi */
+            emit_mov_imm64(b, 1, total);
+            buf_u8(b, 0xFC);
+            buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+            return 1;
+        }
+        return 0;
+    }
+    if (resolved->tag != 12 || resolved->count == 0) {
         return 0;
     }
     WType* elem = resolve_named_type(g, resolved->inner);
@@ -5998,7 +5968,6 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
         return 0;
     }
     uint64_t total = resolved->count * elem_size;
-    Buf* b = &g->code;
 
     if (value->tag == 2) {
         /* Whole-array string copy, including the terminating NUL. */
@@ -6025,17 +5994,10 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
     }
 
     if (value->tag == 12) {
-        /* Flatten nested braces and byte-string leaves the same way local
-         * definitions do. For pointer arrays a string leaf stays an address. */
+        /* Flatten nested braces and byte-string leaves using the declared
+         * type's real field offsets. Pointer-array string leaves stay addresses. */
         compile_address(g, target, 3);
-        uint32_t used = emit_array_leaves_to_rbx(
-            g, value, 0, (uint32_t)total, elem_size,
-            elem->tag == 0 || elem->tag == 4);
-        while (used < total) {
-            emit_mov_imm64(b, 0, 0);
-            emit_rbx_mem_store(b, used, 1);
-            used++;
-        }
+        emit_runtime_init_rbx(g, value, resolved, (uint32_t)total);
         return 1;
     }
 
@@ -6057,59 +6019,6 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
         return 1;
     }
     return 0;
-}
-
-/* Initialize a local aggregate from brace/string leaves. Returns the number of
- * bytes written so the caller can zero-fill the rest of the declared object. */
-static uint32_t emit_local_array_leaves(Gen* g, WExpr* init, uint32_t byte_off,
-                                        uint32_t max_bytes, uint32_t elem_size, int elem_is_byte) {
-    if (!init || !max_bytes || !elem_size) {
-        return 0;
-    }
-    Buf* b = &g->code;
-    if (init->tag == 12) {
-        uint32_t used = 0;
-        for (size_t i = 0; i < init->arg_count && used < max_bytes; i++) {
-            /* byte_off is the positive rbp displacement of the next element;
-             * increasing array indexes move toward lower displacements. */
-            used += emit_local_array_leaves(g, init->args[i], byte_off - used,
-                                            max_bytes - used, elem_size,
-                                            elem_is_byte);
-        }
-        return used;
-    }
-    if (init->tag == 2 && elem_is_byte) {
-        Buf bytes = {0};
-        unescape_string(init->str, &bytes);
-        uint64_t len = bytes.len + 1;
-        if (len > max_bytes) {
-            len = max_bytes;
-        }
-        for (uint64_t i = 0; i < len; i++) {
-            uint8_t value = i < bytes.len ? (uint8_t)bytes.data[i] : 0;
-            emit_mov_imm64(b, 0, value);
-            emit_mem_store(b, 0, byte_off - (uint32_t)i, 1);
-        }
-        return (uint32_t)len;
-    }
-    if (elem_size > 8 && (init->tag == 3 || init->tag == 7)) {
-        /* A whole aggregate leaf is an lvalue; copy every field. */
-        uint32_t n = elem_size <= max_bytes ? elem_size : max_bytes;
-        compile_address(g, init, 3);
-        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
-        emit_mem_op(b, 0x8D, 7, byte_off); /* lea [rbp-byte_off],%rdi */
-        emit_mov_imm64(b, 1, n);
-        buf_u8(b, 0xFC);
-        buf_u8(b, 0xF3); buf_u8(b, 0xA4);
-        return n;
-    }
-    uint32_t width = elem_size <= 8 ? elem_size : 8;
-    if (width > max_bytes) {
-        width = max_bytes;
-    }
-    compile_expr(g, init, 0, 1);
-    emit_mem_store(b, 0, byte_off, width);
-    return width;
 }
 
 static char* trim_line(char* s) {
@@ -6396,22 +6305,17 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 WType* vtype = s->type;
                 int aggregate_init = 0;
                 WType* declared = resolve_named_type(g, s->type);
+                int aggregate_value = 0;
+                if (s->e1->tag == 3 || s->e1->tag == 6 ||
+                    s->e1->tag == 7 || s->e1->tag == 10) {
+                    WType* vt = resolve_named_type(g, resolve_expr_type(g, s->e1));
+                    aggregate_value = vt && (vt->tag == 11 || vt->tag == 12) &&
+                                      type_size(g, vt) > 8;
+                }
                 if (declared && declared->tag == 12 && s->access == 3 &&
-                    (s->e1->tag == 12 || s->e1->tag == 2)) {
-                    WType* elem = resolve_named_type(g, declared->inner);
-                    uint32_t elem_size = elem ? type_size(g, elem) : 0;
-                    if (elem_size) {
-                        int elem_is_byte = elem->tag == 0 || elem->tag == 4;
-                        uint32_t used = emit_local_array_leaves(g, s->e1, off,
-                                                                var_size, elem_size,
-                                                                elem_is_byte);
-                        while (used < var_size) {
-                            emit_mov_imm64(b, 0, 0);
-                            emit_mem_store(b, 0, off - used, 1);
-                            used++;
-                        }
-                        aggregate_init = 1;
-                    }
+                    (s->e1->tag == 12 || s->e1->tag == 2 || aggregate_value)) {
+                    emit_runtime_init_local(g, s->e1, s->type, off, var_size);
+                    aggregate_init = 1;
                 }
                 uint8_t xmm_reg = 0;
                 if (!aggregate_init && var_size == 8 && s->access == 3 &&
@@ -7240,6 +7144,314 @@ static uint32_t byte_array_count(Gen* g, WType* t) {
         return 0;
     }
     return (uint32_t)peeled->count;
+}
+
+/* ------------------------------------------------------------------ */
+/* Runtime aggregate initialization                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int use_rbx;     /* destination is [rbx] instead of [rbp-base] */
+    uint32_t base;   /* rbp displacement of the object start (local mode) */
+    uint32_t size;   /* total declared object size */
+    uint32_t used;   /* highest byte offset written so far */
+} RuntimeInitCtx;
+
+static uint32_t runtime_leaf_width(Gen* g, WType* t) {
+    WType* p = resolve_named_type(g, t);
+    uint32_t w = p ? type_size(g, p) : 0;
+    if (!w) w = 1;
+    if (w > 8) w = 8;
+    return w;
+}
+
+static void emit_runtime_leaf_store(Gen* g, RuntimeInitCtx* ctx, InitLeaf* leaf,
+                                    WExpr* arg) {
+    if (!ctx || !leaf || !arg) {
+        return;
+    }
+    Buf* b = &g->code;
+    uint32_t width = runtime_leaf_width(g, leaf->type);
+    if (leaf->off >= ctx->size) {
+        return;
+    }
+    if (width > ctx->size - leaf->off) {
+        width = ctx->size - leaf->off;
+    }
+    if (!width) {
+        return;
+    }
+    if (ctx->use_rbx) {
+        /* Leaf expression codegen may use rbx as scratch. */
+        buf_u8(b, 0x53); /* push rbx */
+        compile_expr(g, arg, 0, 1);
+        buf_u8(b, 0x5B); /* pop rbx */
+        emit_rbx_mem_store(b, leaf->off, width);
+    } else {
+        if (leaf->off > ctx->base) {
+            return;
+        }
+        compile_expr(g, arg, 0, 1);
+        emit_mem_store(b, 0, ctx->base - leaf->off, width);
+    }
+    uint32_t end = leaf->off + width;
+    if (end > ctx->used) {
+        ctx->used = end;
+    }
+}
+
+/* Fill consecutive byte leaves with a string, including its NUL. */
+static size_t emit_runtime_string_leaves(Gen* g, RuntimeInitCtx* ctx,
+                                         InitLeaf* leaves, size_t leaf_count,
+                                         size_t pos, WExpr* arg,
+                                         uint32_t max_count) {
+    if (!arg || pos >= leaf_count || !max_count) {
+        return pos;
+    }
+    Buf* b = &g->code;
+    Buf bytes = {0};
+    unescape_string(arg->str, &bytes);
+    size_t limit = max_count;
+    if (limit > leaf_count - pos) {
+        limit = leaf_count - pos;
+    }
+    size_t first_off = leaves[pos].off;
+    size_t consumed = 0;
+    while (consumed < limit) {
+        InitLeaf* leaf = &leaves[pos + consumed];
+        WType* lt = resolve_named_type(g, leaf->type);
+        if (!lt || (lt->tag != 0 && lt->tag != 4) ||
+            leaf->off != first_off + consumed || leaf->off >= ctx->size) {
+            break;
+        }
+        uint8_t value = consumed < bytes.len ? (uint8_t)bytes.data[consumed] : 0;
+        emit_mov_imm64(b, 0, value);
+        if (ctx->use_rbx) {
+            emit_rbx_mem_store(b, leaf->off, 1);
+        } else {
+            if (leaf->off > ctx->base) {
+                break;
+            }
+            emit_mem_store(b, 0, ctx->base - leaf->off, 1);
+        }
+        if (leaf->off + 1 > ctx->used) {
+            ctx->used = leaf->off + 1;
+        }
+        consumed++;
+    }
+    return pos + (consumed ? consumed : 1);
+}
+
+static int is_aggregate_lvalue_expr(WExpr* e) {
+    return e && (e->tag == 3 || e->tag == 6 || e->tag == 7 || e->tag == 10);
+}
+
+/* Copy a whole struct/array lvalue into the destination at the current leaf. */
+static size_t emit_runtime_aggregate_copy(Gen* g, RuntimeInitCtx* ctx, WType* t,
+                                          InitLeaf* leaves, size_t leaf_count,
+                                          size_t pos, WExpr* arg) {
+    if (!is_aggregate_lvalue_expr(arg) || pos >= leaf_count) {
+        return pos;
+    }
+    WType* peeled = resolve_named_type(g, t);
+    if (!peeled || (peeled->tag != 11 && peeled->tag != 12)) {
+        return pos;
+    }
+    uint32_t total = type_size(g, t);
+    uint32_t at = leaves[pos].off;
+    if (total <= 8 || at >= ctx->size) {
+        return pos;
+    }
+    uint32_t n = total <= ctx->size - at ? total : ctx->size - at;
+    Buf* b = &g->code;
+    if (ctx->use_rbx) {
+        buf_u8(b, 0x53); /* push destination base */
+        compile_address(g, arg, 3);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+        buf_u8(b, 0x5F); /* pop %rdi */
+        if (at) {
+            buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xC7);
+            buf_u32(b, at); /* add $at,%rdi */
+        }
+    } else {
+        if (at > ctx->base) {
+            return pos;
+        }
+        compile_address(g, arg, 3);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+        emit_mem_op(b, 0x8D, 7, ctx->base - at); /* lea [rbp-disp],%rdi */
+    }
+    emit_mov_imm64(b, 1, n);
+    buf_u8(b, 0xFC);
+    buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+    if (at + n > ctx->used) {
+        ctx->used = at + n;
+    }
+    InitLeafVec tmp = {0};
+    collect_init_leaves(g, t, 0, &tmp, 0);
+    size_t advance = tmp.n ? tmp.n : 1;
+    if (advance > leaf_count - pos) {
+        advance = leaf_count - pos;
+    }
+    return pos + advance;
+}
+
+/* Store a flat list of scalar leaves, expanding nested braces. This covers
+ * `u8 n[4] = {{1,2},{3,4}}` and pointer-array string leaves. */
+static size_t emit_runtime_flat_args(Gen* g, RuntimeInitCtx* ctx,
+                                     InitLeaf* leaves, size_t leaf_count,
+                                     size_t pos, WExpr* init, uint32_t depth) {
+    if (!init || pos >= leaf_count || depth > 16) {
+        return pos;
+    }
+    if (init->tag == 12) {
+        for (size_t i = 0; i < init->arg_count && pos < leaf_count; i++) {
+            pos = emit_runtime_flat_args(g, ctx, leaves, leaf_count, pos,
+                                         init->args[i], depth + 1);
+        }
+        return pos;
+    }
+    if (init->tag == 2) {
+        WType* lt = resolve_named_type(g, leaves[pos].type);
+        if (lt && (lt->tag == 0 || lt->tag == 4)) {
+            return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, pos,
+                                              init, (uint32_t)(leaf_count - pos));
+        }
+    }
+    emit_runtime_leaf_store(g, ctx, &leaves[pos], init);
+    return pos + 1;
+}
+
+static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
+                                     WExpr* init, InitLeaf* leaves,
+                                     size_t leaf_count, size_t pos,
+                                     uint32_t depth) {
+    if (!init || !leaves || pos >= leaf_count || depth > 16) {
+        return pos;
+    }
+    size_t after = emit_runtime_aggregate_copy(g, ctx, t, leaves, leaf_count,
+                                               pos, init);
+    if (after != pos) {
+        return after;
+    }
+    WType* peeled = resolve_named_type(g, t);
+    if (init->tag == 2) {
+        uint32_t byte_count = byte_array_count(g, t);
+        if (byte_count) {
+            return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, pos,
+                                              init, byte_count);
+        }
+    }
+    if (init->tag == 12) {
+        size_t sub_count = 0;
+        WStruct* st = NULL;
+        if (peeled && peeled->tag == 11) {
+            st = find_struct_by_name(g, peeled->name);
+            if (st) sub_count = st->is_union ? 1 : st->field_count;
+        } else if (peeled && peeled->tag == 12) {
+            sub_count = peeled->count;
+        }
+        if (peeled && peeled->tag == 12 && init->arg_count &&
+            init->args[0] && init->args[0]->tag == 2) {
+            uint32_t byte_count = byte_array_count(g, t);
+            if (byte_count) {
+                return emit_runtime_string_leaves(g, ctx, leaves, leaf_count,
+                                                  pos, init->args[0], byte_count);
+            }
+        }
+        if (peeled && peeled->tag == 12) {
+            WType* inner = resolve_named_type(g, peeled->inner);
+            int scalar_elem = inner && inner->tag != 11 && inner->tag != 12;
+            if (scalar_elem || (sub_count && init->arg_count > sub_count)) {
+                /* A flat list longer than the declared sub-aggregate fills
+                 * leaves in order. This also covers `Outer arr[1] = {...}`
+                 * where the element's nested field braces precede a tag. */
+                return emit_runtime_flat_args(g, ctx, leaves, leaf_count, pos,
+                                              init, depth + 1);
+            }
+        }
+        if (peeled && peeled->tag == 11 && st) {
+            size_t count = st->is_union ? 1 : st->field_count;
+            if (count > init->arg_count) count = init->arg_count;
+            for (size_t i = 0; i < count && pos < leaf_count; i++) {
+                pos = emit_runtime_init_expr(g, ctx, st->fields[i].type,
+                                             init->args[i], leaves, leaf_count,
+                                             pos, depth + 1);
+            }
+            return pos;
+        }
+        if (peeled && peeled->tag == 12) {
+            size_t count = peeled->count;
+            if (count > init->arg_count) count = init->arg_count;
+            for (size_t i = 0; i < count && pos < leaf_count; i++) {
+                pos = emit_runtime_init_expr(g, ctx, peeled->inner, init->args[i],
+                                             leaves, leaf_count, pos, depth + 1);
+            }
+            return pos;
+        }
+        if (init->arg_count) {
+            emit_runtime_leaf_store(g, ctx, &leaves[pos], init->args[0]);
+            return pos + 1;
+        }
+        return pos;
+    }
+    emit_runtime_leaf_store(g, ctx, &leaves[pos], init);
+    return pos + 1;
+}
+
+static uint32_t finish_runtime_init(Gen* g, RuntimeInitCtx* ctx) {
+    Buf* b = &g->code;
+    while (ctx->used < ctx->size) {
+        emit_mov_imm64(b, 0, 0);
+        if (ctx->use_rbx) {
+            emit_rbx_mem_store(b, ctx->used, 1);
+        } else {
+            if (ctx->used > ctx->base) {
+                break;
+            }
+            emit_mem_store(b, 0, ctx->base - ctx->used, 1);
+        }
+        ctx->used++;
+    }
+    return ctx->used;
+}
+
+static uint32_t emit_runtime_init_rbx(Gen* g, WExpr* init, WType* type,
+                                      uint32_t max_bytes) {
+    if (!init || !type || !max_bytes) {
+        return 0;
+    }
+    uint32_t size = type_size(g, type);
+    if (!size || size > max_bytes) {
+        size = max_bytes;
+    }
+    InitLeafVec leaves = {0};
+    collect_init_leaves(g, type, 0, &leaves, 0);
+    if (!leaves.n) {
+        return 0;
+    }
+    RuntimeInitCtx ctx = {1, 0, size, 0};
+    emit_runtime_init_expr(g, &ctx, type, init, leaves.v, leaves.n, 0, 0);
+    return finish_runtime_init(g, &ctx);
+}
+
+static uint32_t emit_runtime_init_local(Gen* g, WExpr* init, WType* type,
+                                        uint32_t off, uint32_t max_bytes) {
+    if (!init || !type || !max_bytes) {
+        return 0;
+    }
+    uint32_t size = type_size(g, type);
+    if (!size || size > max_bytes) {
+        size = max_bytes;
+    }
+    InitLeafVec leaves = {0};
+    collect_init_leaves(g, type, 0, &leaves, 0);
+    if (!leaves.n) {
+        return 0;
+    }
+    RuntimeInitCtx ctx = {0, off, size, 0};
+    emit_runtime_init_expr(g, &ctx, type, init, leaves.v, leaves.n, 0, 0);
+    return finish_runtime_init(g, &ctx);
 }
 
 /* Consume initializer arguments against the flattened leaf list. Braces map
