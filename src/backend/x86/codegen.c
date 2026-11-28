@@ -5921,6 +5921,47 @@ static int try_compile_string_copy_to_u8_array(Gen* g, WExpr* target, WExpr* val
     return 1;
 }
 
+/* Initialize a local aggregate from brace/string leaves. Returns the number of
+ * bytes written so the caller can zero-fill the rest of the declared object. */
+static uint32_t emit_local_array_leaves(Gen* g, WExpr* init, uint32_t byte_off,
+                                        uint32_t max_bytes, uint32_t elem_size) {
+    if (!init || !max_bytes || !elem_size) {
+        return 0;
+    }
+    Buf* b = &g->code;
+    if (init->tag == 12) {
+        uint32_t used = 0;
+        for (size_t i = 0; i < init->arg_count && used < max_bytes; i++) {
+            /* byte_off is the positive rbp displacement of the next element;
+             * increasing array indexes move toward lower displacements. */
+            used += emit_local_array_leaves(g, init->args[i], byte_off - used,
+                                            max_bytes - used, elem_size);
+        }
+        return used;
+    }
+    if (init->tag == 2) {
+        Buf bytes = {0};
+        unescape_string(init->str, &bytes);
+        uint64_t len = bytes.len + 1;
+        if (len > max_bytes) {
+            len = max_bytes;
+        }
+        for (uint64_t i = 0; i < len; i++) {
+            uint8_t value = i < bytes.len ? (uint8_t)bytes.data[i] : 0;
+            emit_mov_imm64(b, 0, value);
+            emit_mem_store(b, 0, byte_off - (uint32_t)i, 1);
+        }
+        return (uint32_t)len;
+    }
+    uint32_t width = elem_size <= 8 ? elem_size : 8;
+    if (width > max_bytes) {
+        width = max_bytes;
+    }
+    compile_expr(g, init, 0, 1);
+    emit_mem_store(b, 0, byte_off, width);
+    return width;
+}
+
 static char* trim_line(char* s) {
     while (*s && isspace((unsigned char)*s)) s++;
     char* end = s + strlen(s);
@@ -6203,8 +6244,26 @@ static void compile_stmt(Gen* g, WStmt* s) {
             map_put_str(&g->local_types, s->name, PTR(s->type));
             if (s->e1) {
                 WType* vtype = s->type;
+                int aggregate_init = 0;
+                WType* declared = resolve_named_type(g, s->type);
+                if (declared && declared->tag == 12 && s->access == 3 &&
+                    (s->e1->tag == 12 || s->e1->tag == 2)) {
+                    WType* elem = resolve_named_type(g, declared->inner);
+                    uint32_t elem_size = elem ? type_size(g, elem) : 0;
+                    if (elem_size && elem_size <= 8) {
+                        uint32_t used = emit_local_array_leaves(g, s->e1, off,
+                                                                var_size, elem_size);
+                        while (used < var_size) {
+                            emit_mov_imm64(b, 0, 0);
+                            emit_mem_store(b, 0, off - used, 1);
+                            used++;
+                        }
+                        aggregate_init = 1;
+                    }
+                }
                 uint8_t xmm_reg = 0;
-                if (var_size == 8 && s->access == 3 && is_float_type(vtype) &&
+                if (!aggregate_init && var_size == 8 && s->access == 3 &&
+                    is_float_type(vtype) &&
                     xmm_local_lookup(g, s->name, &xmm_reg)) {
                     /* Keep f64 loop locals in an XMM register. */
                     if (is_float_expr(g, s->e1)) {
@@ -6214,8 +6273,8 @@ static void compile_stmt(Gen* g, WStmt* s) {
                         compile_expr(g, s->e1, 0, 1);
                         emit_movq_gpr_to_xmm(b, 0, xmm_reg);
                     }
-                } else if (var_size == 8 && s->access == 3 && is_float_type(vtype) &&
-                    is_float_expr(g, s->e1)) {
+                } else if (!aggregate_init && var_size == 8 && s->access == 3 &&
+                    is_float_type(vtype) && is_float_expr(g, s->e1)) {
                     /* Store the f64 bit pattern straight from xmm0 instead of
                      * routing it through rax and emit_mem_store. */
                     compile_float_to_xmm0(g, s->e1);
@@ -6223,7 +6282,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     buf_u8(b, off <= 127 ? 0x45 : 0x85);
                     if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
                     else buf_u32(b, (uint32_t)(-(int32_t)off));
-                } else {
+                } else if (!aggregate_init) {
                     compile_expr(g, s->e1, 0, 1);
                     emit_mem_store(b, 0, off, var_size);
                 }
@@ -7355,7 +7414,15 @@ static void compile_function(Gen* g, WFunc* f) {
     for (size_t i = 0; i < f->param_count; i++) {
         WParam* p = &f->params[i];
         int is_ptr_modifier = p->access == 0 || p->access == 1 || p->access == 2;
-        uint32_t var_size = is_ptr_modifier ? 8 : type_size(g, p->type);
+        WType* actual = p->type;
+        WType* declared = resolve_named_type(g, actual);
+        /* Array parameters decay to a pointer in the caller, even when the
+         * declared type is a named typedef. Reserve a full 64-bit slot; the
+         * load side already treats an array parameter slot as an address. */
+        uint32_t var_size =
+            (is_ptr_modifier || (declared && declared->tag == 12))
+                ? 8
+                : type_size(g, p->type);
         uint32_t align_mask = var_size >= 8 ? 7 : (var_size >= 4 ? 3 : (var_size >= 2 ? 1 : 0));
         g->next_offset = (g->next_offset + align_mask) & ~align_mask;
         g->next_offset += var_size;
@@ -7365,11 +7432,9 @@ static void compile_function(Gen* g, WFunc* f) {
         map_put_str(&g->local_access, p->name, p->access);
         map_put_str(&g->local_is_param, p->name, 1);
 
-        WType* actual = p->type;
         /* A named typedef can already be a pointer. Wrapping it again would
          * make `*i`/`*o` parameters dereference a pointer-to-pointer and use
          * 8-byte accessors even for u8/i16 pointees. */
-        WType* declared = resolve_named_type(g, actual);
         if (is_ptr_modifier && (!declared || declared->tag != 10)) {
             actual = pointer_type_for(g, actual);
         }

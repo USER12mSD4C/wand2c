@@ -23,7 +23,11 @@ struct OptimizeEnv {
 }
 
 impl OptimizeEnv {
-    fn from_function(func: &FuncDecl, structs: &HashMap<String, StructDecl>) -> Self {
+    fn from_function(
+        func: &FuncDecl,
+        structs: &HashMap<String, StructDecl>,
+        typedefs: &HashMap<String, DataType>,
+    ) -> Self {
         let mut signs = HashMap::new();
         let mut assigned: HashMap<String, usize> = HashMap::new();
         let mut volatile = HashSet::new();
@@ -35,10 +39,10 @@ impl OptimizeEnv {
             if matches!(access, PtrAccess::Volatile | PtrAccess::Atomic) {
                 volatile.insert(name.clone());
             }
-            if matches!(ty, DataType::Array(_, _)) {
+            if type_is_array(ty, typedefs) {
                 array_roots.insert(name.clone());
             }
-            if type_is_union(ty, structs) {
+            if type_is_union(ty, structs, typedefs) {
                 union_roots.insert(name.clone());
             }
             let count = assigned.entry(name.clone()).or_insert(0);
@@ -59,6 +63,7 @@ impl OptimizeEnv {
             collect_decl_aliases(
                 body,
                 structs,
+                typedefs,
                 &mut volatile,
                 &mut array_roots,
                 &mut union_roots,
@@ -119,11 +124,33 @@ fn data_type_sign(ty: &DataType) -> ValueSign {
     }
 }
 
-fn type_is_union(ty: &DataType, structs: &HashMap<String, StructDecl>) -> bool {
+fn type_is_array(ty: &DataType, typedefs: &HashMap<String, DataType>) -> bool {
     match ty {
-        DataType::Struct(name) => structs.get(name).map(|s| s.is_union).unwrap_or(false),
+        DataType::Array(_, _) => true,
+        DataType::Typedef(_, inner) => type_is_array(inner, typedefs),
+        /* Named typedefs are packed as Struct(name) in the optimizer AST. */
+        DataType::Struct(name) => typedefs
+            .get(name)
+            .map(|inner| type_is_array(inner, typedefs))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn type_is_union(
+    ty: &DataType,
+    structs: &HashMap<String, StructDecl>,
+    typedefs: &HashMap<String, DataType>,
+) -> bool {
+    match ty {
+        DataType::Struct(name) => {
+            if let Some(inner) = typedefs.get(name) {
+                return type_is_union(inner, structs, typedefs);
+            }
+            structs.get(name).map(|s| s.is_union).unwrap_or(false)
+        }
         DataType::Typedef(_, inner) | DataType::Pointer(inner) | DataType::Array(inner, _) => {
-            type_is_union(inner, structs)
+            type_is_union(inner, structs, typedefs)
         }
         _ => false,
     }
@@ -132,6 +159,7 @@ fn type_is_union(ty: &DataType, structs: &HashMap<String, StructDecl>) -> bool {
 fn collect_decl_aliases(
     body: &[Stmt],
     structs: &HashMap<String, StructDecl>,
+    typedefs: &HashMap<String, DataType>,
     volatile: &mut HashSet<String>,
     array_roots: &mut HashSet<String>,
     union_roots: &mut HashSet<String>,
@@ -142,10 +170,10 @@ fn collect_decl_aliases(
                 if matches!(decl.modifier, PtrAccess::Volatile | PtrAccess::Atomic) {
                     volatile.insert(decl.name.clone());
                 }
-                if matches!(decl.data_type, DataType::Array(_, _)) {
+                if type_is_array(&decl.data_type, typedefs) {
                     array_roots.insert(decl.name.clone());
                 }
-                if type_is_union(&decl.data_type, structs) {
+                if type_is_union(&decl.data_type, structs, typedefs) {
                     union_roots.insert(decl.name.clone());
                 }
             }
@@ -154,13 +182,13 @@ fn collect_decl_aliases(
                 else_branch,
                 ..
             } => {
-                collect_decl_aliases(then_branch, structs, volatile, array_roots, union_roots);
+                collect_decl_aliases(then_branch, structs, typedefs, volatile, array_roots, union_roots);
                 if let Some(branch) = else_branch {
-                    collect_decl_aliases(branch, structs, volatile, array_roots, union_roots);
+                    collect_decl_aliases(branch, structs, typedefs, volatile, array_roots, union_roots);
                 }
             }
             Stmt::While { body, .. } | Stmt::Critical(body) => {
-                collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                collect_decl_aliases(body, structs, typedefs, volatile, array_roots, union_roots);
             }
             Stmt::For { init, post, body, .. } => {
                 for nested in [init, post] {
@@ -168,23 +196,24 @@ fn collect_decl_aliases(
                         collect_decl_aliases(
                             std::slice::from_ref(stmt.as_ref()),
                             structs,
+                            typedefs,
                             volatile,
                             array_roots,
                             union_roots,
                         );
                     }
                 }
-                collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                collect_decl_aliases(body, structs, typedefs, volatile, array_roots, union_roots);
             }
             Stmt::Jmpto { args, .. } => {
-                collect_decl_aliases(args, structs, volatile, array_roots, union_roots);
+                collect_decl_aliases(args, structs, typedefs, volatile, array_roots, union_roots);
             }
             Stmt::Match { cases, default, .. } => {
                 for (_, body) in cases {
-                    collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                    collect_decl_aliases(body, structs, typedefs, volatile, array_roots, union_roots);
                 }
                 if let Some(body) = default {
-                    collect_decl_aliases(body, structs, volatile, array_roots, union_roots);
+                    collect_decl_aliases(body, structs, typedefs, volatile, array_roots, union_roots);
                 }
             }
             _ => {}
@@ -362,9 +391,14 @@ impl Optimizer {
             .iter()
             .map(|s| (s.name.clone(), s.clone()))
             .collect();
+        let typedefs: HashMap<String, DataType> = program
+            .typedefs
+            .iter()
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect();
         let mut total_optimized = 0;
         for func in &mut program.functions {
-            let env = OptimizeEnv::from_function(&*func, &structs);
+            let env = OptimizeEnv::from_function(&*func, &structs, &typedefs);
             if let Some(ref mut body) = func.body {
                 let mut iteration = 0;
                 loop {
@@ -1651,7 +1685,9 @@ fn optimize_statements(
                      * expression does not. Propagating it would turn p[i]
                      * into ptr[i], making the backend scale by 8 and load a
                      * full qword instead of one byte. */
-                    if propagatable && !is_pointer_like(&decl.data_type) {
+                    if propagatable && !is_pointer_like(&decl.data_type)
+                        && !env.array_roots.contains(&decl.name)
+                    {
                         if is_constant_expr(init) {
                             consts.insert(decl.name.clone(), *init.clone());
                         } else if env.single_assignment.contains(&decl.name) {
@@ -1710,7 +1746,14 @@ fn optimize_statements(
                                 let prefix = format!("{}.", root);
                                 consts.retain(|k, _| !k.starts_with(&prefix));
                             }
-                            if is_constant_expr(&value) {
+                            if env.array_roots.contains(root) {
+                                /* A whole-array assignment is a memcpy, not a
+                                 * value binding. Propagating the string/array
+                                 * expression would replace the index base with
+                                 * the literal and leave the real array dead. */
+                                consts.remove(&target_path);
+                                invalidate_root_elements(consts, root);
+                            } else if is_constant_expr(&value) {
                                 consts.insert(target_path, value.clone());
                             } else {
                                 consts.remove(&target_path);
