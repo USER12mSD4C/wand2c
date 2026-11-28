@@ -39,6 +39,9 @@ const TUI_MOUSE_RIGHT = 2;
 const TUI_MOUSE_WHEEL_UP = 64;
 const TUI_MOUSE_WHEEL_DOWN = 65;
 
+// Per-line style marker for textview lines (see tui_textview_add_line_styled).
+const TUI_LINE_STYLE = 255;
+
 const TUI_CLR_BLACK = 0;
 const TUI_CLR_RED = 1;
 const TUI_CLR_GREEN = 2;
@@ -607,9 +610,20 @@ fn tui_clear_screen(TuiState* s) {
     tui_out_flush(s);
 }
 
+// Signals must not do any rendering: just set a flag that the event loop (or
+// tui_render_frame) applies at a safe point. No SA_RESTART, so a blocking
+// sys_read is interrupted and the pending resize is observed immediately.
+fn tui_on_sigwinch() {
+    TuiState* s = tui_get_state();
+    if (s != null) {
+        s->resize_pending = 1;
+    }
+}
+
 fn tui_install_sigwinch() {
     SignalHandler handler;
     signal_init_handler(handler*adr);
+    signal_set_handler(handler*adr, tui_on_sigwinch);
     signal_install(handler*adr, 28);
 }
 
@@ -1466,6 +1480,38 @@ fn tui_textview_add_line(TextViewData* td, u8* text) {
     td->line_count = td->line_count + 1;
 }
 
+// A styled line is stored as [255][fg][bg][attr][text...]. The first byte
+// doubles as a marker because normal log text never starts with 255.
+fn tui_textview_add_line_styled(TextViewData* td, u8* text, u8 fg, u8 bg, u8 attr) {
+    if (td->line_count >= td->line_capacity) {
+        u64 new_cap = td->line_capacity * 2;
+        if (new_cap == 0) {
+            new_cap = 32;
+        }
+        u64 old_size = td->line_capacity * 8;
+        u64 new_size = new_cap * 8;
+        u64 new_lines = tui_realloc(td->lines, old_size, new_size);
+        if (new_lines == 0) {
+            return;
+        }
+        td->lines = new_lines;
+        td->line_capacity = new_cap;
+    }
+    u64 text_len = strlen(text);
+    u64 text_buf = tui_malloc(text_len + 5);
+    if (text_buf != 0) {
+        u8* dst = text_buf;
+        dst[0] = TUI_LINE_STYLE;
+        dst[1] = fg;
+        dst[2] = bg;
+        dst[3] = attr;
+        strcpy(dst + 4, text);
+    }
+    u64* arr = td->lines;
+    arr[td->line_count] = text_buf;
+    td->line_count = td->line_count + 1;
+}
+
 fn tui_textview_set_text(u64 widget, u8* text) {
     if (widget == 0) {
         return;
@@ -1876,8 +1922,18 @@ fn tui_draw_textview(u64 buf, i64 cols, TuiWidget* w) {
             u64 line_ptr = lines[line_idx];
             u8* text = line_ptr;
             if (text != null) {
-                tui_buf_draw_span(buf, cols, w->x, w->y + r, text + td->scroll_col,
-                                  w->w, fg, bg, attr);
+                u8 line_fg = fg;
+                u8 line_bg = bg;
+                u8 line_attr = attr;
+                u8* span = text;
+                if (text[0] == TUI_LINE_STYLE) {
+                    line_fg = text[1];
+                    line_bg = text[2];
+                    line_attr = text[3];
+                    span = text + 4;
+                }
+                tui_buf_draw_span(buf, cols, w->x, w->y + r, span + td->scroll_col,
+                                  w->w, line_fg, line_bg, line_attr);
             }
         }
         r = r + 1;
@@ -2535,7 +2591,7 @@ fn tui_run(u64 root) {
 
 // Append text to a textview, splitting newlines and wrapping long lines to the
 // widget width. Useful for log-style panes where callers append whole records.
-fn tui_emit_wrapped_segment(TextViewData* td, u8* text, u64 start, u64 end, i64 width) {
+fn tui_emit_wrapped_segment(TextViewData* td, u8* text, u64 start, u64 end, i64 width, u8 fg, u8 bg, u8 attr) {
     if (width < 4) { width = 40; }
     i64 limit = width - 1;
     u64 pos = start;
@@ -2548,11 +2604,11 @@ fn tui_emit_wrapped_segment(TextViewData* td, u8* text, u64 start, u64 end, i64 
             pos = pos + 1;
         }
         seg[n] = 0;
-        tui_textview_add_line(td, seg);
+        tui_textview_add_line_styled(td, seg, fg, bg, attr);
     }
 }
 
-export fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width) {
+fn tui_append_wrapped_impl(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr) {
     if (widget == 0 || text == null) { return; }
     TuiWidget* w = widget;
     if (w->widget_type != TUI_TYPE_TEXTVIEW) { return; }
@@ -2561,13 +2617,23 @@ export fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width) {
     u64 start = 0;
     while (text[i] != 0) {
         if (text[i] == 10 || text[i] == 13) {
-            tui_emit_wrapped_segment(td, text, start, i, width);
+            tui_emit_wrapped_segment(td, text, start, i, width, fg, bg, attr);
             start = i + 1;
         }
         i = i + 1;
     }
-    if (start < i) { tui_emit_wrapped_segment(td, text, start, i, width); }
+    if (start < i) { tui_emit_wrapped_segment(td, text, start, i, width, fg, bg, attr); }
     tui_widget_mark_dirty(widget);
+}
+
+export fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width) {
+    if (widget == 0) { return; }
+    TuiWidget* w = widget;
+    tui_append_wrapped_impl(widget, text, width, w->fg, w->bg, w->attr);
+}
+
+export fn tui_textview_append_wrapped_styled(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr) {
+    tui_append_wrapped_impl(widget, text, width, fg, bg, attr);
 }
 
 export fn tui_textview_scroll_bottom(u64 widget) {
@@ -2611,6 +2677,10 @@ export fn tui_render_frame() {
     }
     if (s->initialized == 0) {
         return;
+    }
+    if (s->resize_pending != 0) {
+        s->resize_pending = 0;
+        tui_handle_resize(s);
     }
     tui_render(s);
 }

@@ -58,6 +58,7 @@ extern fn tui_textview_append_line(u64 widget, u8* line);
 extern fn tui_textview_clear(u64 widget);
 extern fn tui_textview_get_line_count(u64 widget) -> i64;
 extern fn tui_textview_append_wrapped(u64 widget, u8* text, i64 width);
+extern fn tui_textview_append_wrapped_styled(u64 widget, u8* text, i64 width, u8 fg, u8 bg, u8 attr);
 extern fn tui_textview_scroll_bottom(u64 widget);
 
 extern fn tui_button_set_text(u64 widget, u8* text);
