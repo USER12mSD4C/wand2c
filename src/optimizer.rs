@@ -932,6 +932,76 @@ fn is_constant_expr(expr: &Expr) -> bool {
     )
 }
 
+/* A call can mutate bare globals, and string literals are aggregate storage
+ * rather than scalar constants. Neither may be cached across later reads. */
+fn expr_contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_call(left) || expr_contains_call(right)
+        }
+        Expr::Index { expr, index } => expr_contains_call(expr) || expr_contains_call(index),
+        Expr::MemberAccess { expr, .. } | Expr::AddrOfExpr(expr) => expr_contains_call(expr),
+        Expr::ArrayInit(items) => items.iter().any(expr_contains_call),
+        _ => false,
+    }
+}
+
+fn stmt_contains_call(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::VarDefinition(decl) => decl
+            .initial_value
+            .as_deref()
+            .map_or(false, expr_contains_call),
+        Stmt::Assignment { targets, value } => {
+            expr_contains_call(value) || targets.iter().any(expr_contains_call)
+        }
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_contains_call(cond)
+                || then_branch.iter().any(stmt_contains_call)
+                || else_branch
+                    .as_ref()
+                    .map_or(false, |body| body.iter().any(stmt_contains_call))
+        }
+        Stmt::While { cond, body } => {
+            expr_contains_call(cond) || body.iter().any(stmt_contains_call)
+        }
+        Stmt::For {
+            init,
+            cond,
+            post,
+            body,
+        } => {
+            init.as_deref().map_or(false, stmt_contains_call)
+                || expr_contains_call(cond)
+                || post.as_deref().map_or(false, stmt_contains_call)
+                || body.iter().any(stmt_contains_call)
+        }
+        Stmt::Jmpto { args, .. } => args.iter().any(stmt_contains_call),
+        Stmt::Return(values) => values.iter().any(|(_, expr)| expr_contains_call(expr)),
+        Stmt::Critical(body) => body.iter().any(stmt_contains_call),
+        Stmt::Match {
+            expr,
+            cases,
+            default,
+        } => {
+            expr_contains_call(expr)
+                || cases.iter().any(|(case, body)| {
+                    expr_contains_call(case) || body.iter().any(stmt_contains_call)
+                })
+                || default
+                    .as_ref()
+                    .map_or(false, |body| body.iter().any(stmt_contains_call))
+        }
+        Stmt::Expr(expr) => expr_contains_call(expr),
+        _ => false,
+    }
+}
+
 fn has_side_effects(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. }
@@ -1648,6 +1718,12 @@ fn optimize_statements(
 ) -> Vec<Stmt> {
     let mut new_stmts = Vec::new();
     for stmt in stmts {
+        /* A callee can write a bare global, so no fact from before the call
+         * may be used after it. This is conservative for locals, which a call
+         * normally cannot reach, but keeps shared state correct. */
+        if stmt_contains_call(&stmt) {
+            consts.clear();
+        }
         match stmt {
             Stmt::VarDefinition(mut decl) => {
                 if decl.modifier == PtrAccess::Output
@@ -1687,6 +1763,7 @@ fn optimize_statements(
                      * full qword instead of one byte. */
                     if propagatable && !is_pointer_like(&decl.data_type)
                         && !env.array_roots.contains(&decl.name)
+                        && !matches!(&**init, Expr::StringLit(_))
                     {
                         if is_constant_expr(init) {
                             consts.insert(decl.name.clone(), *init.clone());
@@ -1747,7 +1824,9 @@ fn optimize_statements(
                                  * the literal and leave the real array dead. */
                                 consts.remove(&target_path);
                                 invalidate_root_elements(consts, root);
-                            } else if is_constant_expr(&value) {
+                            } else if is_constant_expr(&value)
+                                && !matches!(&value, Expr::StringLit(_))
+                            {
                                 consts.insert(target_path, value.clone());
                             } else {
                                 consts.remove(&target_path);

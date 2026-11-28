@@ -5955,9 +5955,10 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
      * through an array index such as `arr[0] = p0`. */
     if (resolved->tag == 11) {
         uint32_t total = type_size(g, resolved);
-        if (value->tag == 12 && total) {
-            /* Brace initializer for a whole struct: use field offsets and
-             * zero-fill unspecified fields instead of the scalar path. */
+        if ((value->tag == 12 || value->tag == 2) && total) {
+            /* Brace or string initializer for a whole struct: use field
+             * offsets and zero-fill unspecified fields instead of storing
+             * the string address as a scalar. */
             compile_address(g, target, 3);
             emit_runtime_init_rbx(g, value, resolved, total);
             return 1;
@@ -6335,7 +6336,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     WType* vt = resolve_named_type(g, resolve_expr_type(g, s->e1));
                     aggregate_value = vt && (vt->tag == 11 || vt->tag == 12);
                 }
-                if (declared && declared->tag == 12 &&
+                if (declared && (declared->tag == 11 || declared->tag == 12) &&
                     (s->e1->tag == 12 || s->e1->tag == 2 || aggregate_value)) {
                     emit_runtime_init_local(g, s->e1, s->type, off, var_size);
                     aggregate_init = 1;
@@ -7537,6 +7538,24 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
             }
         }
         if (peeled && peeled->tag == 11 && st) {
+            /* A one-element brace list containing only a string uses the
+             * same field-list rule as a bare string: it fills the first byte
+             * array reachable through brace elision, not an earlier scalar. */
+            if (init->arg_count == 1 && init->args[0] &&
+                init->args[0]->tag == 2) {
+                size_t prefix = 0;
+                uint32_t first_count = 0;
+                if (first_byte_array_span(g, t, &prefix, &first_count, 0)) {
+                    size_t start = pos + prefix;
+                    if (start < leaf_count) {
+                        zero_runtime_range(g, ctx, (uint32_t)leaves[start].off);
+                        return emit_runtime_string_leaves(g, ctx, leaves,
+                                                          leaf_count, start,
+                                                          init->args[0],
+                                                          first_count);
+                    }
+                }
+            }
             size_t count = st->is_union ? 1 : st->field_count;
             for (size_t i = 0; i < count && pos < leaf_count; i++) {
                 WType* field_type = st->fields[i].type;

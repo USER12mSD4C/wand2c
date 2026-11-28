@@ -288,14 +288,14 @@ impl MemorySafetyAnalyzer {
                             self.states.insert(decl.name.clone(), VarState::Safe);
 
                             if !is_pointer {
+                                /* A direct struct initializer (brace, string,
+                                 * or aggregate value) initializes every field,
+                                 * with omitted fields zero-filled. */
                                 self.register_struct_fields(
                                     &decl.name,
                                     &decl.data_type,
                                     structs,
-                                    VarState::Uninitialized {
-                                        declared_line: current_line,
-                                        type_name: type_str.clone(),
-                                    },
+                                    VarState::Safe,
                                 );
                             }
                         }
