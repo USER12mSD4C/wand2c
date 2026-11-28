@@ -70,7 +70,8 @@ set(n*adr);
 
 In value context, `*i` and `*io` read the pointee. An `*i` **local** used as a
 pointer walker keeps its address in pointer arithmetic and comparisons, so
-`p = p + 1` and `p != end` advance/compare addresses rather than pointee bytes.
+`p = p + 1`, `p != end`, and `match (p) { case end ... }` advance/compare
+addresses rather than pointee bytes.
 
 Do not combine `volatile` or `atomic` with `*i/*o/*io`.
 
@@ -145,6 +146,9 @@ u64 q; u64 r;
 export fn api(u64 x) -> u64;    // visible to other modules
 extern fn other(u64 x) -> u64;  // defined elsewhere
 ```
+
+A pointer- or array-typed return slot preserves pointer identity; scalar return
+slots read through `*i`/`*io` value context as usual.
 
 Function `version N` suffixes are parsed but not implemented for ABI versioning; two definitions differing only in version collide. Struct/union `versionof` works.
 

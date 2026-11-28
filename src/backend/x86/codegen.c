@@ -1043,6 +1043,7 @@ struct Gen {
     size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
     uint8_t r10_busy; /* an outer expression is keeping a live value in r10 */
+    WFunc* current_function; /* signature for return-value deref classification */
     WStr suppress_deref_var; /* *i local whose pointer slot is being updated */
 
     WandOutputFormat format;
@@ -2941,6 +2942,18 @@ static int expr_deref_flag(Gen* g, WExpr* e, int deref_ptr) {
         return is_param ? 1 : 0;
     }
     return deref_ptr;
+}
+
+/* A return slot with pointer/array type must preserve the pointer value even
+ * when the source variable carries an input or input/output modifier. Scalar
+ * slots keep the existing value-read context. */
+static int return_deref_flag(Gen* g, size_t i) {
+    WFunc* f = g->current_function;
+    WType* t = NULL;
+    if (f && i < f->return_count) {
+        t = resolve_named_type(g, f->returns[i]);
+    }
+    return (t && (t->tag == 10 || t->tag == 12)) ? 0 : 1;
 }
 
 /* Compile an assignment's value with the right pointer-read context. A
@@ -6785,7 +6798,10 @@ static void compile_stmt(Gen* g, WStmt* s) {
             size_t n = s->return_count < 4 ? s->return_count : 4;
             if (n <= 1) {
                 /* Preserve the single-value path exactly. */
-                if (n == 1) compile_expr(g, s->returns[0].expr, 0, 1);
+                if (n == 1) {
+                    compile_expr(g, s->returns[0].expr, 0,
+                                 return_deref_flag(g, 0));
+                }
             } else {
                 /* Multi-value returns use rax, rdx, rcx, r8. compile_expr
                  * leaves each result in rax and may clobber rdx/rcx/r8 (for
@@ -6797,7 +6813,8 @@ static void compile_stmt(Gen* g, WStmt* s) {
                  * order into the ABI registers.  The epilogue below resets
                  * rsp, so the temporary pushes need no explicit cleanup. */
                 for (size_t i = 0; i < n; i++) {
-                    compile_expr(g, s->returns[i].expr, 0, 1);
+                    compile_expr(g, s->returns[i].expr, 0,
+                                 return_deref_flag(g, i));
                     buf_u8(b, 0x50); /* push rax */
                 }
                 for (size_t k = n; k > 0; k--) {
@@ -6839,12 +6856,13 @@ static void compile_stmt(Gen* g, WStmt* s) {
             compile_nasm(g, s->name);
             break;
         case 9: { /* Match */
-            compile_expr(g, s->e1, 0, 1);
+            compile_expr(g, s->e1, 0, expr_deref_flag(g, s->e1, 1));
             buf_u8(b, 0x50); /* push rax - save scrutinee */
             g->match_depth++;
             SizeVec je_patches = {0};
             for (size_t i = 0; i < s->case_count; i++) {
-                compile_expr(g, s->cases[i].expr, 0, 1);
+                compile_expr(g, s->cases[i].expr, 0,
+                             expr_deref_flag(g, s->cases[i].expr, 1));
                 /* cmp qword [rsp], rax */
                 buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0x04); buf_u8(b, 0x24);
                 buf_u8(b, 0x0F); buf_u8(b, 0x84);
@@ -8073,6 +8091,7 @@ static void compile_function(Gen* g, WFunc* f) {
     g->escaped_locals.len = 0;
     g->next_offset = f->is_irq ? 16 : 24; /* leave rbp-16 for saved r12 */
     g->current_is_irq = f->is_irq;
+    g->current_function = f;
     g->suppress_deref_var = (WStr){0};
     g->stack_depth = 0;
     g->loop_stack.n = 0;
