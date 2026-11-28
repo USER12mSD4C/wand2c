@@ -33,6 +33,7 @@ pub struct MemorySafetyAnalyzer {
     source_lines: Rc<Vec<String>>,
     base_line: usize,
     typedefs: HashMap<String, DataType>,
+    decl_types: HashMap<String, DataType>,
 }
 
 impl MemorySafetyAnalyzer {
@@ -43,6 +44,7 @@ impl MemorySafetyAnalyzer {
             source_lines: Rc::new(Vec::new()),
             base_line: 0,
             typedefs: HashMap::new(),
+            decl_types: HashMap::new(),
         }
     }
 
@@ -51,6 +53,115 @@ impl MemorySafetyAnalyzer {
         for (name, dt) in typedefs {
             self.typedefs.insert(name.clone(), dt.clone());
         }
+    }
+
+    /* Typedef uses may arrive as `Typedef(name, inner)` or as a named struct
+     * reference that is really a typedef alias. Resolve both forms before
+     * deciding whether a declaration is a pointer. */
+    fn resolve_decl_type(&self, dt: &DataType) -> DataType {
+        match dt {
+            DataType::Typedef(_, inner) => self.resolve_decl_type(inner),
+            DataType::Struct(name) => match self.typedefs.get(name) {
+                Some(inner) => self.resolve_decl_type(inner),
+                None => dt.clone(),
+            },
+            _ => dt.clone(),
+        }
+    }
+
+    fn is_pointer_type(&self, dt: &DataType) -> bool {
+        matches!(self.resolve_decl_type(dt), DataType::Pointer(_))
+    }
+
+    fn is_pointer_path(&self, path: &str) -> bool {
+        if let Some(state) = self.states.get(path) {
+            let type_name = match state {
+                VarState::Uninitialized { type_name, .. }
+                | VarState::NullPointer { type_name }
+                | VarState::Allocated { type_name, .. } => Some(type_name.as_str()),
+                VarState::Freed { .. } | VarState::Safe => None,
+            };
+            if let Some(type_name) = type_name {
+                return type_name.ends_with('*');
+            }
+        }
+        self.decl_types
+            .get(path)
+            .map_or(false, |dt| self.is_pointer_type(dt))
+    }
+
+    fn is_array_path(&self, path: &str) -> bool {
+        if let Some(dt) = self.decl_types.get(path) {
+            if matches!(self.resolve_decl_type(dt), DataType::Array(_, _)) {
+                return true;
+            }
+        }
+        self.states
+            .get(path)
+            .map(|state| match state {
+                VarState::Uninitialized { type_name, .. } => type_name.contains('['),
+                _ => false,
+            })
+            .unwrap_or(false)
+    }
+
+    /* A dynamic index collapses to one path. Recover the strongest safe state
+     * shared by all constant elements so a checked pointer array is not called
+     * uninitialized, while any null or unchecked element is still reported. */
+    fn collapsed_indexed_state(&self, src: &str, suffix: &str) -> Option<VarState> {
+        let elem_prefix = format!("{}[", src);
+        let mut states = Vec::new();
+        for (key, state) in &self.states {
+            if let Some(rest) = key.strip_prefix(&elem_prefix) {
+                if let Some(pos) = rest.find(']') {
+                    if suffix.is_empty() {
+                        if &rest[pos + 1..] == "" {
+                            states.push(state.clone());
+                        }
+                    } else if rest[pos..].starts_with("].") && &rest[pos + 2..] == suffix {
+                        states.push(state.clone());
+                    }
+                }
+            }
+        }
+        if states.is_empty() {
+            return None;
+        }
+        if states.iter().any(|s| matches!(s, VarState::Uninitialized { .. })) {
+            return Some(states[0].clone());
+        }
+        if let Some(state) = states.iter().find(|s| matches!(s, VarState::NullPointer { .. })) {
+            return Some(state.clone());
+        }
+        if let Some(state) = states.iter().find(|s| {
+            matches!(s, VarState::Allocated { checked_not_null: false, .. })
+        }) {
+            return Some(state.clone());
+        }
+        if states
+            .iter()
+            .all(|s| matches!(s, VarState::Allocated { checked_not_null: true, .. }))
+        {
+            return Some(states[0].clone());
+        }
+        Some(VarState::Safe)
+    }
+
+    fn effective_state(&self, path: &str) -> Option<VarState> {
+        let state = self.states.get(path).cloned()?;
+        if !matches!(state, VarState::Uninitialized { .. }) {
+            return Some(state);
+        }
+        let candidates = match path.find('.') {
+            Some(dot) => vec![(&path[..dot], &path[dot + 1..]), (path, "")],
+            None => vec![(path, "")],
+        };
+        for (base, suffix) in candidates {
+            if let Some(effective) = self.collapsed_indexed_state(base, suffix) {
+                return Some(effective);
+            }
+        }
+        Some(state)
     }
 
     fn format_data_type(dt: &DataType) -> String {
@@ -68,7 +179,7 @@ impl MemorySafetyAnalyzer {
             DataType::Pointer(inner) => format!("{}*", Self::format_data_type(inner)),
             DataType::Struct(name) => name.clone(),
             DataType::Array(inner, size) => format!("{}[{}]", Self::format_data_type(inner), size),
-            DataType::Typedef(name, _) => name.clone(),
+            DataType::Typedef(_, inner) => Self::format_data_type(inner),
         }
     }
 
@@ -207,15 +318,18 @@ impl MemorySafetyAnalyzer {
         match expr {
             Expr::Variable(_) => true,
             Expr::MemberAccess { is_arrow: false, .. } => true,
-            /* A constant index names one pointer element. A dynamic index
-             * collapses to the base and must not poison sibling elements. */
-            Expr::Index { index, .. } => Self::const_index_text(index).is_some(),
+            /* Every index in the path must be constant. A dynamic index
+             * collapses to the base and can otherwise make a scalar store to
+             * `p[i][0]` poison the state of `p[0]`. */
+            Expr::Index { expr: base, index } => {
+                Self::const_index_text(index).is_some() && Self::is_direct_pointer_target(base)
+            }
             _ => false,
         }
     }
 
     fn report_pointer_state(&mut self, path: &str, line: usize) {
-        match self.states.get(path).cloned() {
+        match self.effective_state(path) {
             /* An uninitialized pointer field is dereferenced when used as an
              * index base. Uninitialized arrays are storage, not pointers, so
              * their `type_name` does not end in `*`. */
@@ -255,8 +369,11 @@ impl MemorySafetyAnalyzer {
     fn check_pointer_chain_safety(&mut self, expr: &Expr, line: usize) {
         match expr {
             Expr::Variable(_) => {
-                self.check_expression_safety(expr, line);
-                if let Some(path) = self.get_expr_path(expr) {
+                let path = self.get_expr_path(expr);
+                if !path.as_deref().map_or(false, |p| self.is_array_path(p)) {
+                    self.check_expression_safety(expr, line);
+                }
+                if let Some(path) = path {
                     if let Some(VarState::NullPointer { .. })
                     | Some(VarState::Allocated {
                         checked_not_null: false,
@@ -314,6 +431,7 @@ impl MemorySafetyAnalyzer {
         base_line: usize,
     ) -> Result<(), Vec<String>> {
         self.states.clear();
+        self.decl_types.clear();
         self.errors.clear();
         self.source_lines = Rc::new(
             source
@@ -324,6 +442,7 @@ impl MemorySafetyAnalyzer {
 
         for (dt, name, _) in &func.params {
             self.states.insert(name.clone(), VarState::Safe);
+            self.decl_types.insert(name.clone(), dt.clone());
             self.register_struct_fields(name, dt, structs, VarState::Safe, 0);
         }
 
@@ -408,6 +527,27 @@ impl MemorySafetyAnalyzer {
                 );
             }
             DataType::Array(inner, count) => {
+                /* Pointer arrays have no struct fields to register, but each
+                 * element still has pointer state. Register both constant
+                 * elements and the collapsed dynamic-index path. */
+                if self.is_pointer_type(inner) {
+                    let element_state = match &initial_state {
+                        VarState::Uninitialized { declared_line, .. } => {
+                            VarState::Uninitialized {
+                                declared_line: *declared_line,
+                                type_name: Self::format_data_type(
+                                    &self.resolve_decl_type(inner),
+                                ),
+                            }
+                        }
+                        _ => initial_state.clone(),
+                    };
+                    self.states.insert(prefix.to_string(), initial_state.clone());
+                    for i in 0..*count {
+                        let element_prefix = format!("{}[{}]", prefix, i);
+                        self.states.insert(element_prefix, element_state.clone());
+                    }
+                }
                 self.register_struct_fields(
                     prefix,
                     inner,
@@ -433,7 +573,8 @@ impl MemorySafetyAnalyzer {
         if let Some(s_decl) = structs.get(&struct_name) {
             for field in &s_decl.fields {
                 let field_path = format!("{}.{}", prefix, field.name);
-                let type_str = Self::format_data_type(&field.data_type);
+                let resolved_field = self.resolve_decl_type(&field.data_type);
+                let type_str = Self::format_data_type(&resolved_field);
 
                 let field_state = match &initial_state {
                     VarState::Uninitialized { declared_line, .. } => VarState::Uninitialized {
@@ -453,6 +594,81 @@ impl MemorySafetyAnalyzer {
                     depth + 1,
                 );
             }
+        }
+    }
+
+    /* A literal initializer can explicitly store null into a pointer leaf.
+     * Those leaves must be NullPointer rather than generically Safe so a later
+     * dereference is still diagnosed. */
+    fn apply_literal_field_states(
+        &mut self,
+        prefix: &str,
+        dt: &DataType,
+        init: &Expr,
+        structs: &HashMap<String, StructDecl>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+
+        let resolved = self.resolve_decl_type(dt);
+        match resolved {
+            DataType::Struct(name) => {
+                let decl = match structs.get(&name).cloned() {
+                    Some(decl) => decl,
+                    None => return,
+                };
+                if let Expr::ArrayInit(items) = init {
+                    for (idx, field) in decl.fields.iter().enumerate() {
+                        if let Some(item) = items.get(idx) {
+                            let path = format!("{}.{}", prefix, field.name);
+                            if matches!(item, Expr::Null) && self.is_pointer_type(&field.data_type) {
+                                self.states.insert(
+                                    path,
+                                    VarState::NullPointer {
+                                        type_name: Self::format_data_type(
+                                            &self.resolve_decl_type(&field.data_type),
+                                        ),
+                                    },
+                                );
+                            } else {
+                                self.apply_literal_field_states(
+                                    &path,
+                                    &field.data_type,
+                                    item,
+                                    structs,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            DataType::Array(inner, count) => {
+                if let Expr::ArrayInit(items) = init {
+                    for idx in 0..count.min(items.len()) {
+                        let path = format!("{}[{}]", prefix, idx);
+                        if matches!(&items[idx], Expr::Null) && self.is_pointer_type(&inner) {
+                            self.states.insert(
+                                path,
+                                VarState::NullPointer {
+                                    type_name: Self::format_data_type(&self.resolve_decl_type(&inner)),
+                                },
+                            );
+                        } else {
+                            self.apply_literal_field_states(
+                                &path,
+                                &inner,
+                                &items[idx],
+                                structs,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -611,8 +827,11 @@ impl MemorySafetyAnalyzer {
 
             match stmt {
                 Stmt::VarDefinition(decl) => {
-                    let type_str = Self::format_data_type(&decl.data_type);
-                    let is_pointer = matches!(&decl.data_type, DataType::Pointer(_));
+                    let resolved_type = self.resolve_decl_type(&decl.data_type);
+                    let type_str = Self::format_data_type(&resolved_type);
+                    let is_pointer = matches!(resolved_type, DataType::Pointer(_));
+                    self.decl_types
+                        .insert(decl.name.clone(), decl.data_type.clone());
 
                     if let Some(init_expr) = &decl.initial_value {
                         self.check_expression_safety(init_expr, current_line);
@@ -654,6 +873,15 @@ impl MemorySafetyAnalyzer {
                                     field_state,
                                     0,
                                 );
+                                if Self::initializer_covers_struct_fields(init_expr) {
+                                    self.apply_literal_field_states(
+                                        &decl.name,
+                                        &decl.data_type,
+                                        init_expr,
+                                        structs,
+                                        0,
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -701,6 +929,7 @@ impl MemorySafetyAnalyzer {
                                 );
                             } else if Self::is_null_or_scalar(value)
                                 && Self::is_direct_pointer_target(target)
+                                && self.is_pointer_path(&path)
                             {
                                 /* `p = null` makes `p` unchecked; `p[i] = 7`
                                  * only writes an element and must not replace
@@ -715,6 +944,13 @@ impl MemorySafetyAnalyzer {
                                 self.states.insert(path.clone(), VarState::Safe);
                             }
                             self.update_assigned_fields(&path, value, current_line);
+                            if Self::initializer_covers_struct_fields(value) {
+                                if let Some(dt) = self.decl_types.get(&path).cloned() {
+                                    self.apply_literal_field_states(
+                                        &path, &dt, value, structs, 0,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -776,6 +1012,7 @@ impl MemorySafetyAnalyzer {
                         source_lines: self.source_lines.clone(),
                         base_line: self.base_line,
                         typedefs: self.typedefs.clone(),
+                        decl_types: self.decl_types.clone(),
                     };
                     then_analyzer.analyze_statements(then_branch, structs);
                     self.errors.extend(then_analyzer.errors);
@@ -815,6 +1052,7 @@ impl MemorySafetyAnalyzer {
                             source_lines: self.source_lines.clone(),
                             base_line: self.base_line,
                             typedefs: self.typedefs.clone(),
+                        decl_types: self.decl_types.clone(),
                         };
                         else_analyzer.analyze_statements(else_stmts, structs);
                         self.errors.extend(else_analyzer.errors);
@@ -988,12 +1226,15 @@ impl MemorySafetyAnalyzer {
         match expr {
             Expr::Variable(_) | Expr::MemberAccess { .. } | Expr::Index { .. } => {
                 if let Some(path) = self.get_expr_path(expr) {
-                    if let Some(state) = self.states.get(&path).cloned() {
+                    if let Some(state) = self.effective_state(&path) {
                         match &state {
+                            /* Arrays are storage. Their collapsed base state
+                             * is uninitialized until elements are written, but
+                             * indexing that storage is not a pointer use. */
                             VarState::Uninitialized {
                                 declared_line: _,
                                 type_name,
-                            } => {
+                            } if !type_name.contains('[') => {
                                 self.push_uninitialized_error(&path, type_name, line);
                             }
                             VarState::Freed { freed_line } => {
