@@ -1040,6 +1040,8 @@ static int is_signed_expr(Gen* g, WExpr* e);
 static int expr_has_call_deep(WExpr* e);
 static void compile_stmt(Gen* g, WStmt* s);
 static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr);
+static int index_sib_ready(Gen* g, WExpr* e, uint8_t* base, uint8_t* index,
+                           int* scale_bits);
 static void compile_address(Gen* g, WExpr* e, uint8_t reg);
 static void compile_bool_expr(Gen* g, WExpr* e);
 static int simple_left(Gen* g, WExpr* e);
@@ -1341,6 +1343,83 @@ static void emit_lea_scaled(Buf* b, uint8_t dst, uint8_t base, uint8_t index,
     buf_u8(b, 0x8D);
     buf_u8(b, (uint8_t)(0x04 | ((dst & 7) << 3)));
     buf_u8(b, (uint8_t)((scale_bits << 6) | ((index & 7) << 3) | (base & 7)));
+}
+
+/* REX prefix for a SIB memory operand. rex_w selects a 64-bit data operand.
+ * Every REX byte starts at 0x40; the extension bits alone are not a prefix. */
+static uint8_t sib_rex(uint8_t reg_field, uint8_t base, uint8_t index, int rex_w) {
+    return (uint8_t)(0x40 | (rex_w ? 8 : 0) | (reg_field >= 8 ? 4 : 0) |
+                     (index >= 8 ? 2 : 0) | (base >= 8 ? 1 : 0));
+}
+
+static void emit_rex(Buf* b, uint8_t rex) {
+    buf_u8(b, rex);
+}
+
+/* modrm and sib for [base + index * scale] with no displacement. Callers
+ * must have checked that base's low bits are not 101 (rbp/r13), which would
+ * require a disp32 encoding. */
+static void emit_sib_modrm(Buf* b, uint8_t reg_field, uint8_t base,
+                           uint8_t index, int scale_bits) {
+    buf_u8(b, (uint8_t)(0x04 | ((reg_field & 7) << 3)));
+    buf_u8(b, (uint8_t)((scale_bits << 6) | ((index & 7) << 3) | (base & 7)));
+}
+
+/* movsd xmm0, [base + index * scale] */
+static void emit_movsd_sib_load(Buf* b, uint8_t base, uint8_t index, int scale_bits) {
+    buf_u8(b, 0xF2);
+    buf_u8(b, sib_rex(0, base, index, 1));
+    buf_u8(b, 0x0F); buf_u8(b, 0x10);
+    emit_sib_modrm(b, 0, base, index, scale_bits);
+}
+
+/* movsd [base + index * scale], xmm0 */
+static void emit_movsd_sib_store(Buf* b, uint8_t base, uint8_t index, int scale_bits) {
+    buf_u8(b, 0xF2);
+    buf_u8(b, sib_rex(0, base, index, 1));
+    buf_u8(b, 0x0F); buf_u8(b, 0x11);
+    emit_sib_modrm(b, 0, base, index, scale_bits);
+}
+
+/* mov reg, [base + index * scale] with sign or zero extension for 1/2 bytes. */
+static void emit_gpr_sib_load(Buf* b, uint8_t reg, uint8_t base, uint8_t index,
+                              int scale_bits, uint32_t size, int is_signed) {
+    switch (size) {
+        case 1:
+            emit_rex(b, sib_rex(reg, base, index, 1));
+            buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBE : 0xB6);
+            break;
+        case 2:
+            emit_rex(b, sib_rex(reg, base, index, 1));
+            buf_u8(b, 0x0F); buf_u8(b, is_signed ? 0xBF : 0xB7);
+            break;
+        case 4:
+            emit_rex(b, sib_rex(reg, base, index, is_signed ? 1 : 0));
+            buf_u8(b, is_signed ? 0x63 : 0x8B);
+            break;
+        default:
+            emit_rex(b, sib_rex(reg, base, index, 1));
+            buf_u8(b, 0x8B);
+            break;
+    }
+    emit_sib_modrm(b, reg, base, index, scale_bits);
+}
+
+/* mov [base + index * scale], reg */
+static void emit_gpr_sib_store(Buf* b, uint8_t reg, uint8_t base, uint8_t index,
+                               int scale_bits, uint32_t size) {
+    if (size == 1) {
+        emit_rex(b, sib_rex(reg, base, index, 0));
+        buf_u8(b, 0x88);
+    } else if (size == 2) {
+        buf_u8(b, 0x66);
+        emit_rex(b, sib_rex(reg, base, index, 0));
+        buf_u8(b, 0x89);
+    } else {
+        emit_rex(b, sib_rex(reg, base, index, size == 8 ? 1 : 0));
+        buf_u8(b, 0x89);
+    }
+    emit_sib_modrm(b, reg, base, index, scale_bits);
 }
 
 /* movsd xmm<N>, [rip+key] — loads a float constant in one instruction
@@ -2958,10 +3037,16 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
         }
         case 6: /* MemberAccess */
         case 10: { /* Index */
-            /* The load below uses (%rbx) directly, so keep the computed
-             * address in rbx and skip the dead mov %rbx,%rcx. */
-            compile_address(g, e, 3);
             WType* t = resolve_expr_type(g, e);
+            uint8_t sib_base = 0, sib_index = 0;
+            int sib_scale = -1;
+            int sib_ready = e->tag == 10 && !(t && t->tag == 12) &&
+                index_sib_ready(g, e, &sib_base, &sib_index, &sib_scale);
+            if (!sib_ready) {
+                /* The load below uses (%rbx) directly, so keep the computed
+                 * address in rbx and skip the dead mov %rbx,%rcx. */
+                compile_address(g, e, 3);
+            }
             if (t && t->tag == 12) {
                 if (reg == 0) {
                     buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xD8);
@@ -2970,6 +3055,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 uint32_t size = expr_size(g, e);
                 WType* scalar = peel_typedefs(t);
                 int is_signed = scalar && scalar->tag >= 4 && scalar->tag <= 7;
+                if (sib_ready) {
+                    emit_gpr_sib_load(b, reg, sib_base, sib_index, sib_scale,
+                                      size, is_signed);
+                    break;
+                }
                 uint8_t modrm = (uint8_t)(0x03 | ((reg & 7) << 3));
                 /* modrm puts the destination in the reg field, so an
                  * extended destination needs REX.R as well as REX.W. */
@@ -4072,6 +4162,12 @@ static int compile_f64_index_to_xmm0(Gen* g, WExpr* e) {
         return 0;
     }
     Buf* b = &g->code;
+    uint8_t sib_base = 0, sib_index = 0;
+    int sib_scale = -1;
+    if (index_sib_ready(g, e, &sib_base, &sib_index, &sib_scale)) {
+        emit_movsd_sib_load(b, sib_base, sib_index, sib_scale);
+        return 1;
+    }
     compile_address(g, e, 3);
     buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x10); buf_u8(b, 0x03);
     return 1;
@@ -5087,6 +5183,38 @@ static int address_expr_needs_deref(WExpr* e) {
     }
 }
 
+/* True when e is an Index whose base and index are both held in registers
+ * right now. A caller can then use (base, index, scale) as a memory operand
+ * and skip the separate lea into rbx. No code is emitted here. */
+static int index_sib_ready(Gen* g, WExpr* e, uint8_t* base, uint8_t* index,
+                           int* scale_bits) {
+    if (!e || e->tag != 10 || !e->a || !e->b) return 0;
+    if (e->a->tag != 3 || e->b->tag != 3) return 0;
+    WType* bt = peel_typedefs(resolve_expr_type(g, e->a));
+    uint32_t elem = 8;
+    if (bt && (bt->tag == 12 || bt->tag == 10)) elem = type_size(g, bt->inner);
+    int scale = -1;
+    switch (elem) {
+        case 1: scale = 0; break;
+        case 2: scale = 1; break;
+        case 4: scale = 2; break;
+        case 8: scale = 3; break;
+        default: return 0;
+    }
+    uint8_t b = 0, i = 0;
+    uint64_t ba = 3, ia = 3;
+    if (!reg_local_lookup(g, e->a->str, &b) ||
+        !reg_local_lookup(g, e->b->str, &i)) return 0;
+    if (!map_get_str(&g->local_access, e->a->str, &ba) ||
+        !map_get_str(&g->local_access, e->b->str, &ia)) return 0;
+    if (ba != 3 || ia != 3) return 0;
+    if ((b & 7) == 5) return 0; /* mod=00 with base=101 needs disp32 */
+    *base = b;
+    *index = i;
+    *scale_bits = scale;
+    return 1;
+}
+
 static void compile_address(Gen* g, WExpr* e, uint8_t reg) {
     Buf* b = &g->code;
     uint8_t internal_reg = reg == 0 ? 0 : 3;
@@ -5574,6 +5702,20 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
         }
         case 6: /* MemberAccess */
         case 10: { /* Index */
+            uint8_t sib_base = 0, sib_index = 0;
+            int sib_scale = -1;
+            if (target->tag == 10 &&
+                index_sib_ready(g, target, &sib_base, &sib_index, &sib_scale)) {
+                /* The value is already in rax and both address registers are
+                 * live, so store straight through the SIB operand. */
+                uint32_t sib_size = expr_size(g, target);
+                if (sib_size == 0) sib_size = 8;
+                emit_gpr_sib_store(b, 0, sib_base, sib_index, sib_scale, sib_size);
+                if (is_volatile_member_expr(g, target)) {
+                    buf_u8(b, 0x0F); buf_u8(b, 0xAE); buf_u8(b, 0xF0);
+                }
+                break;
+            }
             /* For simple indices, save rax in r10 instead of pushing it on
              * the stack. compile_address uses only rbx/rax for simple
              * operands, so r10 survives and no memory round-trip is needed. */
@@ -6023,8 +6165,15 @@ static void compile_stmt(Gen* g, WStmt* s) {
                         if (off <= 127) buf_u8(b, (uint8_t)(-(int32_t)off));
                         else buf_u32(b, (uint32_t)(-(int32_t)off));
                     } else {
-                        compile_address(g, s->exprs[0], 3);
-                        buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
+                        uint8_t sib_base = 0, sib_index = 0;
+                        int sib_scale = -1;
+                        if (index_sib_ready(g, s->exprs[0], &sib_base,
+                                            &sib_index, &sib_scale)) {
+                            emit_movsd_sib_store(b, sib_base, sib_index, sib_scale);
+                        } else {
+                            compile_address(g, s->exprs[0], 3);
+                            buf_u8(b, 0xF2); buf_u8(b, 0x0F); buf_u8(b, 0x11); buf_u8(b, 0x03);
+                        }
                     }
                 } else if (!copied) {
                     WExpr* tgt = s->exprs[0];
