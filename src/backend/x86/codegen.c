@@ -5942,6 +5942,13 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
      * through an array index such as `arr[0] = p0`. */
     if (resolved->tag == 11) {
         uint32_t total = type_size(g, resolved);
+        if (value->tag == 12 && total) {
+            /* Brace initializer for a whole struct: use field offsets and
+             * zero-fill unspecified fields instead of the scalar path. */
+            compile_address(g, target, 3);
+            emit_runtime_init_rbx(g, value, resolved, total);
+            return 1;
+        }
         WType* value_type = resolve_named_type(g, resolve_expr_type(g, value));
         if (total > 8 && value_type && value_type->tag == 11 &&
             type_size(g, value_type) == total &&
@@ -6309,8 +6316,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 if (s->e1->tag == 3 || s->e1->tag == 6 ||
                     s->e1->tag == 7 || s->e1->tag == 10) {
                     WType* vt = resolve_named_type(g, resolve_expr_type(g, s->e1));
-                    aggregate_value = vt && (vt->tag == 11 || vt->tag == 12) &&
-                                      type_size(g, vt) > 8;
+                    aggregate_value = vt && (vt->tag == 11 || vt->tag == 12);
                 }
                 if (declared && declared->tag == 12 && s->access == 3 &&
                     (s->e1->tag == 12 || s->e1->tag == 2 || aggregate_value)) {
@@ -7259,8 +7265,15 @@ static size_t emit_runtime_aggregate_copy(Gen* g, RuntimeInitCtx* ctx, WType* t,
     }
     uint32_t total = type_size(g, t);
     uint32_t at = leaves[pos].off;
-    if (total <= 8 || at >= ctx->size) {
+    if (!total || at >= ctx->size) {
         return pos;
+    }
+    /* Copy only the source object's size; a smaller source leaves the tail to
+     * the caller's zero-fill instead of reading past the source. */
+    WType* src_type = resolve_named_type(g, resolve_expr_type(g, arg));
+    uint32_t src_total = src_type ? type_size(g, src_type) : 0;
+    if (src_total && src_total < total) {
+        total = src_total;
     }
     uint32_t n = total <= ctx->size - at ? total : ctx->size - at;
     Buf* b = &g->code;
@@ -7288,7 +7301,8 @@ static size_t emit_runtime_aggregate_copy(Gen* g, RuntimeInitCtx* ctx, WType* t,
         ctx->used = at + n;
     }
     InitLeafVec tmp = {0};
-    collect_init_leaves(g, t, 0, &tmp, 0);
+    collect_init_leaves(g, src_type && type_size(g, src_type) ? src_type : t,
+                        0, &tmp, 0);
     size_t advance = tmp.n ? tmp.n : 1;
     if (advance > leaf_count - pos) {
         advance = leaf_count - pos;
@@ -7314,8 +7328,15 @@ static size_t emit_runtime_flat_args(Gen* g, RuntimeInitCtx* ctx,
     if (init->tag == 2) {
         WType* lt = resolve_named_type(g, leaves[pos].type);
         if (lt && (lt->tag == 0 || lt->tag == 4)) {
+            /* A nested string contributes exactly its characters; the final
+             * tail zero-fill supplies the NUL. Only a string that initializes
+             * the whole byte array gets its own NUL, and that case is handled
+             * by byte_array_count before this flat path. */
+            Buf bytes = {0};
+            unescape_string(init->str, &bytes);
+            uint32_t count = bytes.len ? (uint32_t)bytes.len : 1;
             return emit_runtime_string_leaves(g, ctx, leaves, leaf_count, pos,
-                                              init, (uint32_t)(leaf_count - pos));
+                                              init, count);
         }
     }
     emit_runtime_leaf_store(g, ctx, &leaves[pos], init);
@@ -7362,6 +7383,29 @@ static size_t emit_runtime_init_expr(Gen* g, RuntimeInitCtx* ctx, WType* t,
         if (peeled && peeled->tag == 12) {
             WType* inner = resolve_named_type(g, peeled->inner);
             int scalar_elem = inner && inner->tag != 11 && inner->tag != 12;
+            /* `Bytes s[1] = {{"ABCD"},{"XYZ"}}` is one struct element whose
+             * two field initializers were written as sibling braces. Treat
+             * the whole brace as the element initializer instead of flattening
+             * it into the parent array's leaves. */
+            int element_fields = 0;
+            if (peeled->count == 1 && inner && inner->tag == 11) {
+                WStruct* ist = find_struct_by_name(g, inner->name);
+                size_t fields = ist ? (ist->is_union ? 1 : ist->field_count) : 0;
+                if (fields && init->arg_count == fields) {
+                    element_fields = 1;
+                    for (size_t i = 0; i < init->arg_count; i++) {
+                        if (!init->args[i] || (init->args[i]->tag != 12 &&
+                                               init->args[i]->tag != 2)) {
+                            element_fields = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (element_fields) {
+                return emit_runtime_init_expr(g, ctx, inner, init, leaves,
+                                              leaf_count, pos, depth + 1);
+            }
             if (scalar_elem || (sub_count && init->arg_count > sub_count)) {
                 /* A flat list longer than the declared sub-aggregate fills
                  * leaves in order. This also covers `Outer arr[1] = {...}`
