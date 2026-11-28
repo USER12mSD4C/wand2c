@@ -4326,7 +4326,7 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
         if (reg_local_lookup(g, e->b->str, &rhs_reg)) {
             emit_cmp_two_regs(b, lhs_reg, rhs_reg);
         } else {
-            compile_expr(g, e->b, 3, 1);
+            compile_expr(g, e->b, 3, expr_deref_flag(g, e->b, 1));
             emit_cmp_two_regs(b, lhs_reg, 3);
         }
         return;
@@ -4334,7 +4334,7 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
     if (e->b && (e->b->tag == 0 || e->b->tag == 1) &&
         !is_float_expr(g, e->a)) {
         int64_t sv = (int64_t)e->b->num;
-        compile_expr(g, e->a, 0, 1);
+        compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, 1));
         if (sv >= INT32_MIN && sv <= INT32_MAX) {
             emit_cmp_rax_imm(b, sv);
         } else {
@@ -4342,23 +4342,23 @@ static void emit_cmp_operands(Gen* g, WExpr* e) {
             buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
         }
     } else if (simple_left(g, e->a)) {
-        compile_expr(g, e->b, 3, 1);
-        compile_expr(g, e->a, 0, 1);
+        compile_expr(g, e->b, 3, expr_deref_flag(g, e->b, 1));
+        compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, 1));
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
     } else if (!g->r10_busy && !expr_has_call(g, e->a) && !expr_has_call(g, e->b)) {
         /* Keep LHS in r10 instead of push/pop. No calls in either operand,
          * and the RHS must not reuse r10 while the LHS is live. */
-        compile_expr(g, e->a, 10, 1);
+        compile_expr(g, e->a, 10, expr_deref_flag(g, e->a, 1));
         g->r10_busy = 1;
-        compile_expr(g, e->b, 0, 1);
+        compile_expr(g, e->b, 0, expr_deref_flag(g, e->b, 1));
         g->r10_busy = 0;
         buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
         buf_u8(b, 0x4C); buf_u8(b, 0x89); buf_u8(b, 0xD0); /* mov %r10,%rax */
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);
     } else {
-        compile_expr(g, e->a, 0, 1);
+        compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, 1));
         buf_u8(b, 0x50);
-        compile_expr(g, e->b, 0, 1);
+        compile_expr(g, e->b, 0, expr_deref_flag(g, e->b, 1));
         buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
         buf_u8(b, 0x58);
         buf_u8(b, 0x48); buf_u8(b, 0x39); buf_u8(b, 0xD8);

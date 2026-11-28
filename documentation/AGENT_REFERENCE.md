@@ -68,6 +68,10 @@ u64 n = 0;
 set(n*adr);
 ```
 
+In value context, `*i` and `*io` read the pointee. An `*i` **local** used as a
+pointer walker keeps its address in pointer arithmetic and comparisons, so
+`p = p + 1` and `p != end` advance/compare addresses rather than pointee bytes.
+
 Do not combine `volatile` or `atomic` with `*i/*o/*io`.
 
 ## 4. User types
