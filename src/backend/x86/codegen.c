@@ -5955,6 +5955,23 @@ static uint32_t emit_array_leaves_to_rbx(Gen* g, WExpr* init, uint32_t disp,
         }
         return (uint32_t)len;
     }
+    if (elem_size > 8 && (init->tag == 3 || init->tag == 7)) {
+        /* A whole aggregate leaf is an lvalue. Copy all of its bytes instead
+         * of the 8-byte scalar store, which would drop later fields. */
+        uint32_t n = elem_size <= max_bytes ? elem_size : max_bytes;
+        buf_u8(b, 0x53); /* push destination base */
+        compile_address(g, init, 3);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+        buf_u8(b, 0x5F); /* pop %rdi */
+        if (disp) {
+            buf_u8(b, 0x48); buf_u8(b, 0x81); buf_u8(b, 0xC7);
+            buf_u32(b, disp); /* add $disp,%rdi */
+        }
+        emit_mov_imm64(b, 1, n);
+        buf_u8(b, 0xFC);
+        buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+        return n;
+    }
     uint32_t width = elem_size <= 8 ? elem_size : 8;
     if (width > max_bytes) {
         width = max_bytes;
@@ -6045,7 +6062,7 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
 /* Initialize a local aggregate from brace/string leaves. Returns the number of
  * bytes written so the caller can zero-fill the rest of the declared object. */
 static uint32_t emit_local_array_leaves(Gen* g, WExpr* init, uint32_t byte_off,
-                                        uint32_t max_bytes, uint32_t elem_size) {
+                                        uint32_t max_bytes, uint32_t elem_size, int elem_is_byte) {
     if (!init || !max_bytes || !elem_size) {
         return 0;
     }
@@ -6056,11 +6073,12 @@ static uint32_t emit_local_array_leaves(Gen* g, WExpr* init, uint32_t byte_off,
             /* byte_off is the positive rbp displacement of the next element;
              * increasing array indexes move toward lower displacements. */
             used += emit_local_array_leaves(g, init->args[i], byte_off - used,
-                                            max_bytes - used, elem_size);
+                                            max_bytes - used, elem_size,
+                                            elem_is_byte);
         }
         return used;
     }
-    if (init->tag == 2) {
+    if (init->tag == 2 && elem_is_byte) {
         Buf bytes = {0};
         unescape_string(init->str, &bytes);
         uint64_t len = bytes.len + 1;
@@ -6073,6 +6091,17 @@ static uint32_t emit_local_array_leaves(Gen* g, WExpr* init, uint32_t byte_off,
             emit_mem_store(b, 0, byte_off - (uint32_t)i, 1);
         }
         return (uint32_t)len;
+    }
+    if (elem_size > 8 && (init->tag == 3 || init->tag == 7)) {
+        /* A whole aggregate leaf is an lvalue; copy every field. */
+        uint32_t n = elem_size <= max_bytes ? elem_size : max_bytes;
+        compile_address(g, init, 3);
+        buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xDE); /* mov %rbx,%rsi */
+        emit_mem_op(b, 0x8D, 7, byte_off); /* lea [rbp-byte_off],%rdi */
+        emit_mov_imm64(b, 1, n);
+        buf_u8(b, 0xFC);
+        buf_u8(b, 0xF3); buf_u8(b, 0xA4);
+        return n;
     }
     uint32_t width = elem_size <= 8 ? elem_size : 8;
     if (width > max_bytes) {
@@ -6371,9 +6400,11 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     (s->e1->tag == 12 || s->e1->tag == 2)) {
                     WType* elem = resolve_named_type(g, declared->inner);
                     uint32_t elem_size = elem ? type_size(g, elem) : 0;
-                    if (elem_size && elem_size <= 8) {
+                    if (elem_size) {
+                        int elem_is_byte = elem->tag == 0 || elem->tag == 4;
                         uint32_t used = emit_local_array_leaves(g, s->e1, off,
-                                                                var_size, elem_size);
+                                                                var_size, elem_size,
+                                                                elem_is_byte);
                         while (used < var_size) {
                             emit_mov_imm64(b, 0, 0);
                             emit_mem_store(b, 0, off - used, 1);
