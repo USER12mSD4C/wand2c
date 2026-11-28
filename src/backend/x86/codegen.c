@@ -2560,6 +2560,14 @@ static void collect_expr_literals(Gen* g, WExpr* e, int strings) {
             collect_expr_literals(g, e->a, strings);
             collect_expr_literals(g, e->b, strings);
             break;
+        case 12:
+            /* String literals nested in an aggregate initializer are still
+             * referenced by RIP-relative LEAs when the aggregate holds
+             * pointers. Register them so all formats emit the bytes/symbol. */
+            for (size_t i = 0; i < e->arg_count; i++) {
+                collect_expr_literals(g, e->args[i], strings);
+            }
+            break;
         case 6:
             collect_expr_literals(g, e->a, strings);
             break;
@@ -5914,6 +5922,51 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
     }
 }
 
+/* Flatten aggregate initializer leaves into the destination addressed by rbx.
+ * Mirrors emit_local_array_leaves, but for a computed destination. Returns the
+ * number of bytes written so the caller can zero-fill the rest. */
+static uint32_t emit_array_leaves_to_rbx(Gen* g, WExpr* init, uint32_t disp,
+                                         uint32_t max_bytes, uint32_t elem_size,
+                                         int elem_is_byte) {
+    if (!init || !max_bytes || !elem_size) {
+        return 0;
+    }
+    Buf* b = &g->code;
+    if (init->tag == 12) {
+        uint32_t used = 0;
+        for (size_t i = 0; i < init->arg_count && used < max_bytes; i++) {
+            used += emit_array_leaves_to_rbx(g, init->args[i], disp + used,
+                                             max_bytes - used, elem_size,
+                                             elem_is_byte);
+        }
+        return used;
+    }
+    if (init->tag == 2 && elem_is_byte) {
+        Buf bytes = {0};
+        unescape_string(init->str, &bytes);
+        uint64_t len = bytes.len + 1;
+        if (len > max_bytes) {
+            len = max_bytes;
+        }
+        for (uint64_t i = 0; i < len; i++) {
+            uint8_t value = i < bytes.len ? (uint8_t)bytes.data[i] : 0;
+            emit_mov_imm64(b, 0, value);
+            emit_rbx_mem_store(b, disp + (uint32_t)i, 1);
+        }
+        return (uint32_t)len;
+    }
+    uint32_t width = elem_size <= 8 ? elem_size : 8;
+    if (width > max_bytes) {
+        width = max_bytes;
+    }
+    /* Leaf codegen uses rbx as scratch, so preserve the destination. */
+    buf_u8(b, 0x53); /* push rbx */
+    compile_expr(g, init, 0, 1);
+    buf_u8(b, 0x5B); /* pop rbx */
+    emit_rbx_mem_store(b, disp, width);
+    return width;
+}
+
 static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
     if (!target || !value) {
         return 0;
@@ -5924,7 +5977,7 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
     }
     WType* elem = resolve_named_type(g, resolved->inner);
     uint32_t elem_size = elem ? type_size(g, elem) : 0;
-    if (!elem_size || elem_size > 8) {
+    if (!elem_size) {
         return 0;
     }
     uint64_t total = resolved->count * elem_size;
@@ -5955,25 +6008,15 @@ static int try_compile_array_assignment(Gen* g, WExpr* target, WExpr* value) {
     }
 
     if (value->tag == 12) {
-        /* Brace initializer: store each leaf into the destination and zero
-         * the remaining bytes. Preserve the destination across leaf codegen,
-         * which may use rbx as scratch. */
+        /* Flatten nested braces and byte-string leaves the same way local
+         * definitions do. For pointer arrays a string leaf stays an address. */
         compile_address(g, target, 3);
-        uint64_t used = 0;
-        for (size_t i = 0; i < value->arg_count && used < total; i++) {
-            buf_u8(b, 0x53); /* push rbx */
-            compile_expr(g, value->args[i], 0, 1);
-            buf_u8(b, 0x5B); /* pop rbx */
-            uint32_t width = elem_size;
-            if (width > total - used) {
-                width = (uint32_t)(total - used);
-            }
-            emit_rbx_mem_store(b, (uint32_t)used, width);
-            used += width;
-        }
+        uint32_t used = emit_array_leaves_to_rbx(
+            g, value, 0, (uint32_t)total, elem_size,
+            elem->tag == 0 || elem->tag == 4);
         while (used < total) {
             emit_mov_imm64(b, 0, 0);
-            emit_rbx_mem_store(b, (uint32_t)used, 1);
+            emit_rbx_mem_store(b, used, 1);
             used++;
         }
         return 1;
