@@ -112,7 +112,7 @@ u64 addr = (u64)p;
 u8* p2 = (u8*)addr;
 ```
 
-Reality check: implicit integer narrowing is currently accepted and truncates; prefer explicit casts in agent-authored code.
+The language forbids implicit type conversions; use explicit casts at every narrowing or widening boundary. Do not rely on compiler tolerance for implicit narrowing.
 
 ## 6. Control flow
 

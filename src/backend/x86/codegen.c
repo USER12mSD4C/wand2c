@@ -1043,6 +1043,7 @@ struct Gen {
     size_t match_depth; /* active `match` scrutinee slots on the stack */
     uint8_t current_is_irq;
     uint8_t r10_busy; /* an outer expression is keeping a live value in r10 */
+    WStr suppress_deref_var; /* *i local whose pointer slot is being updated */
 
     WandOutputFormat format;
     WStr entry_name;
@@ -2921,6 +2922,43 @@ static int simple_int_call_arg(Gen* g, WExpr* e, int depth) {
     return 0;
 }
 
+/* Decide whether a binary/unary operand should keep the incoming pointer
+ * dereference context. Plain *i locals are also used for pointer walkers
+ * (`p = p + 1`), so they stay raw inside arithmetic; *i parameters and *io
+ * variables name the pointed object and must be read through the slot. An
+ * assignment to a *i variable temporarily suppresses dereferencing of that
+ * same name so its pointer slot can be advanced. */
+static int expr_deref_flag(Gen* g, WExpr* e, int deref_ptr) {
+    if (!deref_ptr || !e || e->tag != 3) return deref_ptr;
+    if (g->suppress_deref_var.ptr && wstr_eq(g->suppress_deref_var, e->str)) {
+        return 0;
+    }
+    uint64_t access = 3;
+    map_get_str(&g->local_access, e->str, &access);
+    if (access == 0) {
+        uint64_t is_param = 0;
+        map_get_str(&g->local_is_param, e->str, &is_param);
+        return is_param ? 1 : 0;
+    }
+    return deref_ptr;
+}
+
+/* Compile an assignment's value with the right pointer-read context. A
+ * *i local/parameter assigned to itself is advancing its pointer slot, so
+ * the same name must stay raw on the RHS; *io variables write through the
+ * pointer and therefore read through it in the RHS. */
+static void compile_assignment_value(Gen* g, WExpr* target, WExpr* value) {
+    WStr saved = g->suppress_deref_var;
+    if (target && target->tag == 3) {
+        uint64_t access = 3;
+        if (map_get_str(&g->local_access, target->str, &access) && access == 0) {
+            g->suppress_deref_var = target->str;
+        }
+    }
+    compile_expr(g, value, 0, 1);
+    g->suppress_deref_var = saved;
+}
+
 /* ------------------------------------------------------------------ */
 /* compile_expr                                                        */
 /* ------------------------------------------------------------------ */
@@ -3001,11 +3039,15 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 WType* local_type = resolve_named_type(g, var_type);
                 if (local_type && local_type->tag == 12 && !is_param) {
                     emit_mem_op(b, 0x8D, reg, (uint32_t)off);
-                } else if ((access == 0 || access == 2) && deref_ptr) {
+                } else if ((access == 0 || access == 2) && deref_ptr &&
+                           !(g->suppress_deref_var.ptr &&
+                             wstr_eq(g->suppress_deref_var, e->str))) {
                     /* Input and input/output pointer parameters read through
                      * the pointer only in value context. In address context
                      * (deref_ptr=0) they must remain the pointer itself, so
-                     * they can be passed on to another function or indexed. */
+                     * they can be passed on to another function or indexed.
+                     * An assignment to a *i variable also needs the raw
+                     * pointer on its right-hand side. */
                     emit_mem_load(b, reg, (uint32_t)off, 8, 0);
                     WType* elem_type = NULL;
                     if (local_type && (local_type->tag == 10 || local_type->tag == 12)) {
@@ -3322,7 +3364,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (wstr_eq_c(op, "OpBitNot")) {
-                compile_expr(g, e->a, 0, 0);
+                compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x48); buf_u8(b, 0xF7); buf_u8(b, 0xD0);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3337,7 +3379,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
             if (float_op && e->a && e->b && e->a->tag == 3 && e->b->tag == 3 &&
                 wstr_eq(e->a->str, e->b->str) && emit_float_op_xmm1(NULL, op)) {
                 /* x op x: load once, copy to rbx; avoids a second stack load. */
-                compile_expr(g, e->a, 0, 0);
+                compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
                 emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
@@ -3379,8 +3421,10 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 /* Same shuffle removal as the integer path: evaluate the RHS
                  * straight into rbx, then the simple LHS into rax. Integer
                  * operands are converted to f64 before the xmm operation. */
-                compile_float_operand_bits(g, e->b, 3, 0);
-                compile_float_operand_bits(g, e->a, 0, 0);
+                compile_float_operand_bits(g, e->b, 3,
+                                           expr_deref_flag(g, e->b, deref_ptr));
+                compile_float_operand_bits(g, e->a, 0,
+                                           expr_deref_flag(g, e->a, deref_ptr));
                 emit_float_op_xmm1(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3389,9 +3433,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 /* General case: stash LHS in xmm1, evaluate RHS into rax.
                  * Avoids push/pop and the rbx mov; safe because no call can
                  * clobber the stashed xmm1. */
-                compile_float_operand_bits(g, e->a, 0, 0);
+                compile_float_operand_bits(g, e->a, 0,
+                                           expr_deref_flag(g, e->a, deref_ptr));
                 emit_float_op_stash_lhs(b);
-                compile_float_operand_bits(g, e->b, 0, 0);
+                compile_float_operand_bits(g, e->b, 0,
+                                           expr_deref_flag(g, e->b, deref_ptr));
                 emit_float_op_after_rhs(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
@@ -3403,7 +3449,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     uv >= 1 && uv <= 63) {
                     uint8_t group = wstr_eq_c(op, "OpShl") ? 4
                                   : (is_signed_expr(g, e->a) ? 7 : 5);
-                    compile_expr(g, e->a, 0, 0);
+                    compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                     buf_u8(b, 0x48); buf_u8(b, 0xC1);
                     buf_u8(b, (uint8_t)(0xC0 | (group << 3)));
                     buf_u8(b, (uint8_t)uv);
@@ -3411,7 +3457,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     return;
                 }
                 if (has_binary_imm(op)) {
-                    compile_expr(g, e->a, 0, 0);
+                    compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                     if (sv >= INT32_MIN && sv <= INT32_MAX) {
                         emit_binary_imm(b, op, sv);
                     } else {
@@ -3444,7 +3490,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     /* Narrow stack slots need an explicit zero/sign extension.
                      * Preserve rbx because compile_address may already hold
                      * an array base there when this expression is an index. */
-                    compile_expr(g, e->a, 0, 0);
+                    compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                     buf_u8(b, 0x53); /* push rbx */
                     emit_mem_load(b, 3, (uint32_t)off, rhs_size,
                                   is_signed_expr(g, e->b));
@@ -3463,7 +3509,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     else if (wstr_eq_c(op, "OpBitXor")) opcode = 0x33;
                     else if (wstr_eq_c(op, "OpMul")) opcode = 0xAF;
                     if (opcode) {
-                        compile_expr(g, e->a, 0, 0);
+                        compile_expr(g, e->a, 0, expr_deref_flag(g, e->a, deref_ptr));
                         if (is_bound) {
                             buf_u8(b, (uint8_t)(0x48 | (bound_reg >= 8 ? 1 : 0)));
                             if (opcode == 0xAF) buf_u8(b, 0x0F);
@@ -3488,11 +3534,15 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                  * straight into rbx while the other side stays in rax. This
                  * removes the push/mov/pop round trip in both directions. */
                 if (simple_left(g, e->a)) {
-                    compile_expr(g, e->b, 3, 0);
-                    compile_expr(g, e->a, 0, 0);
+                    compile_expr(g, e->b, 3,
+                                 expr_deref_flag(g, e->b, deref_ptr));
+                    compile_expr(g, e->a, 0,
+                                 expr_deref_flag(g, e->a, deref_ptr));
                 } else {
-                    compile_expr(g, e->a, 0, 0);
-                    compile_expr(g, e->b, 3, 0);
+                    compile_expr(g, e->a, 0,
+                                 expr_deref_flag(g, e->a, deref_ptr));
+                    compile_expr(g, e->b, 3,
+                                 expr_deref_flag(g, e->b, deref_ptr));
                 }
                 emit_binary_rbx(b, op);
                 if (reg != 0) move_rax_to_reg(b, reg);
@@ -3504,9 +3554,11 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                  * RHS evaluation, avoiding a push/pop stack round trip. r10
                  * is caller-saved, so the LHS must not contain a call and
                  * the RHS must not call or reuse r10 while the LHS is live. */
-                compile_expr(g, e->a, 10, 0);
+                compile_expr(g, e->a, 10,
+                             expr_deref_flag(g, e->a, deref_ptr));
                 g->r10_busy = 1;
-                compile_expr(g, e->b, 0, 0);
+                compile_expr(g, e->b, 0,
+                             expr_deref_flag(g, e->b, deref_ptr));
                 g->r10_busy = 0;
                 if (wstr_eq_c(op, "OpSub")) {
                     buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3); /* mov %rax,%rbx */
@@ -3519,13 +3571,17 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 return;
             }
             if (float_op) {
-                compile_float_operand_bits(g, e->a, 0, 0);
+                compile_float_operand_bits(g, e->a, 0,
+                                           expr_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x50);
-                compile_float_operand_bits(g, e->b, 0, 0);
+                compile_float_operand_bits(g, e->b, 0,
+                                           expr_deref_flag(g, e->b, deref_ptr));
             } else {
-                compile_expr(g, e->a, 0, 0);
+                compile_expr(g, e->a, 0,
+                             expr_deref_flag(g, e->a, deref_ptr));
                 buf_u8(b, 0x50);
-                compile_expr(g, e->b, 0, 0);
+                compile_expr(g, e->b, 0,
+                             expr_deref_flag(g, e->b, deref_ptr));
             }
             buf_u8(b, 0x48); buf_u8(b, 0x89); buf_u8(b, 0xC3);
             buf_u8(b, 0x58);
@@ -6481,7 +6537,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                             }
                         }
                     } else {
-                        compile_expr(g, s->e1, 0, 1);
+                        compile_assignment_value(g, tgt, s->e1);
                         store_assignment_target_from_rax(g, tgt);
                     }
                 }
@@ -6501,7 +6557,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                     }
                 }
             } else if (s->expr_count > 0) {
-                compile_expr(g, s->e1, 0, 1);
+                compile_assignment_value(g, s->exprs[0], s->e1);
                 store_assignment_target_from_rax(g, s->exprs[0]);
                 if (s->exprs[0]->tag == 3) {
                     uint64_t access = 3;
@@ -8017,6 +8073,7 @@ static void compile_function(Gen* g, WFunc* f) {
     g->escaped_locals.len = 0;
     g->next_offset = f->is_irq ? 16 : 24; /* leave rbp-16 for saved r12 */
     g->current_is_irq = f->is_irq;
+    g->suppress_deref_var = (WStr){0};
     g->stack_depth = 0;
     g->loop_stack.n = 0;
 
