@@ -2765,9 +2765,9 @@ static void emit_call_patch(Gen* g, WStr target) {
  * operation never touches adjacent memory (the old code always emitted
  * 64-bit instructions). Unknown types fall back to 8 bytes. */
 static WType* atomic_pointee_type(Gen* g, WExpr* e) {
-    WType* t = peel_typedefs(resolve_expr_type(g, e));
+    WType* t = resolve_named_type(g, resolve_expr_type(g, e));
     if (t && t->tag == 10) {
-        t = peel_typedefs(t->inner);
+        t = resolve_named_type(g, t->inner);
     }
     return t;
 }
@@ -2965,7 +2965,8 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 }
                 uint64_t is_param = 0;
                 map_get_str(&g->local_is_param, e->str, &is_param);
-                if (var_type && var_type->tag == 12 && !is_param) {
+                WType* local_type = resolve_named_type(g, var_type);
+                if (local_type && local_type->tag == 12 && !is_param) {
                     emit_mem_op(b, 0x8D, reg, (uint32_t)off);
                 } else if ((access == 0 || access == 2) && deref_ptr) {
                     /* Input and input/output pointer parameters read through
@@ -2973,15 +2974,15 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                      * (deref_ptr=0) they must remain the pointer itself, so
                      * they can be passed on to another function or indexed. */
                     emit_mem_load(b, reg, (uint32_t)off, 8, 0);
+                    WType* elem_type = NULL;
+                    if (local_type && (local_type->tag == 10 || local_type->tag == 12)) {
+                        elem_type = resolve_named_type(g, local_type->inner);
+                    }
                     uint32_t elem_size =
-                        (var_type && (var_type->tag == 10 || var_type->tag == 12))
-                            ? type_size(g, var_type->inner)
-                            : var_size;
-                    int elem_signed = var_type &&
-                        ((var_type->tag == 10 || var_type->tag == 12) &&
-                         var_type->inner &&
-                         (var_type->inner->tag == 4 || var_type->inner->tag == 5 ||
-                          var_type->inner->tag == 6));
+                        elem_type ? type_size(g, elem_type) : var_size;
+                    int elem_signed = elem_type &&
+                        (elem_type->tag == 4 || elem_type->tag == 5 ||
+                         elem_type->tag == 6);
                     uint8_t low = reg & 7;
                     int use_sib = low == 4 || low == 5;
                     uint8_t modrm = use_sib ? (uint8_t)((low == 5 ? 0x40 : 0) | (low << 3) | 0x04)
@@ -3021,7 +3022,6 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                     }
                 } else {
                     /* Array parameters hold a pointer in the stack slot. */
-                    WType* local_type = resolve_named_type(g, var_type);
                     uint32_t load_size =
                         (local_type && local_type->tag == 12) ? 8 : var_size;
                     int local_signed = local_type && (local_type->tag == 4 ||
@@ -5767,9 +5767,9 @@ static void store_assignment_target_from_rax(Gen* g, WExpr* target) {
                     uint32_t elem_size = 8;
                     uint64_t type_ptr;
                     if (map_get_str(&g->local_types, target->str, &type_ptr)) {
-                        WType* t = AS_PTR(WType, type_ptr);
+                        WType* t = resolve_named_type(g, AS_PTR(WType, type_ptr));
                         if (t && t->tag == 10) {
-                            elem_size = type_size(g, t->inner);
+                            elem_size = type_size(g, resolve_named_type(g, t->inner));
                         }
                     }
                     switch (elem_size) {
@@ -7366,7 +7366,11 @@ static void compile_function(Gen* g, WFunc* f) {
         map_put_str(&g->local_is_param, p->name, 1);
 
         WType* actual = p->type;
-        if (is_ptr_modifier && (!actual || actual->tag != 10)) {
+        /* A named typedef can already be a pointer. Wrapping it again would
+         * make `*i`/`*o` parameters dereference a pointer-to-pointer and use
+         * 8-byte accessors even for u8/i16 pointees. */
+        WType* declared = resolve_named_type(g, actual);
+        if (is_ptr_modifier && (!declared || declared->tag != 10)) {
             actual = pointer_type_for(g, actual);
         }
         map_put_str(&g->local_types, p->name, PTR(actual));
