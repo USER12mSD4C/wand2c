@@ -120,7 +120,7 @@ u8* p2 = (u8*)addr;
 
 The language forbids implicit type conversions; use explicit casts at every narrowing or widening boundary. Do not rely on compiler tolerance for implicit narrowing.
 
-For `f64* x*i`, `x` names the `f64` object in arithmetic; `x + 1.0` reads the pointee, not the address.
+For `f64* x*i`, `x` names the `f64` object when an f64 value is required, so `x + 1.0` reads the pointee. It remains a pointer in address context: `y = x` copies the address, `x != end` compares addresses, and `x = x + 8` advances the pointer.
 
 ## 6. Control flow
 

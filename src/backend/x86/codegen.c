@@ -1064,6 +1064,8 @@ static void compile_address(Gen* g, WExpr* e, uint8_t reg);
 static void compile_bool_expr(Gen* g, WExpr* e);
 static int simple_left(Gen* g, WExpr* e);
 static int is_float_expr(Gen* g, WExpr* e);
+static int is_float_value_expr(Gen* g, WExpr* e, int deref_ptr);
+static int is_f64_pointer_modifier_expr(Gen* g, WExpr* e);
 static int rax_only_expr(Gen* g, WExpr* e);
 static int expr_has_call(Gen* g, WExpr* e);
 static int is_local_self_addsub(Gen* g, WExpr* target, WExpr* e,
@@ -2186,7 +2188,7 @@ static void emit_int_bits_to_f64_bits(Gen* g, uint8_t reg, int src_signed) {
 static void compile_float_operand_bits(Gen* g, WExpr* e, uint8_t reg,
                                        int deref_ptr) {
     compile_expr(g, e, reg, deref_ptr);
-    if (e && !is_float_expr(g, e)) {
+    if (e && !is_float_value_expr(g, e, deref_ptr)) {
         emit_int_bits_to_f64_bits(g, reg, is_signed_expr(g, e));
     }
 }
@@ -2334,7 +2336,7 @@ static int compile_float_binary_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         return 0;
     }
     WStr op = e->str;
-    if (!is_float_expr(g, e->a) && !is_float_expr(g, e->b)) {
+    if (!is_float_value_expr(g, e->a, 1) && !is_float_value_expr(g, e->b, 1)) {
         return 0;
     }
     Buf* b = &g->code;
@@ -2672,13 +2674,6 @@ static int is_extern_func(Gen* g, WStr name) {
     return f && (f->is_extern || !f->has_body);
 }
 
-static int is_float_type(WType* t) {
-    while (t && (t->tag == 10 || t->tag == 12 || t->tag == 13)) {
-        t = t->inner;
-    }
-    return t && t->tag == 8;
-}
-
 static int is_float_expr(Gen* g, WExpr* e) {
     if (!e) {
         return 0;
@@ -2689,21 +2684,7 @@ static int is_float_expr(Gen* g, WExpr* e) {
         case 0:
         case 1:
             return 0;
-        case 3: {
-            /* An input or input/output variable whose declared type is a
-             * pointer to f64 names the f64 object in value context. */
-            uint64_t access = 3;
-            map_get_str(&g->local_access, e->str, &access);
-            WType* t = resolve_expr_type(g, e);
-            if (access == 0 || access == 2) {
-                t = resolve_named_type(g, t);
-                if (t && (t->tag == 10 || t->tag == 12)) {
-                    t = resolve_named_type(g, t->inner);
-                }
-                return t && t->tag == 8;
-            }
-            return is_float_type_named(g, t);
-        }
+        case 3:
         case 6:
         case 7:
             return is_float_type_named(g, resolve_expr_type(g, e));
@@ -2733,6 +2714,32 @@ static int is_float_expr(Gen* g, WExpr* e) {
         default:
             return 0;
     }
+}
+
+/* Strict f64-slot classification plus value-context extension: an input or
+ * input/output variable declared as f64* names an f64 value when it is read,
+ * but remains a pointer in address context (copies, comparisons, walks). */
+static int is_f64_pointer_modifier_expr(Gen* g, WExpr* e) {
+    if (!e || e->tag != 3) {
+        return 0;
+    }
+    uint64_t access = 3;
+    map_get_str(&g->local_access, e->str, &access);
+    if (access != 0 && access != 2) {
+        return 0;
+    }
+    WType* t = resolve_named_type(g, resolve_expr_type(g, e));
+    if (t && (t->tag == 10 || t->tag == 12)) {
+        t = resolve_named_type(g, t->inner);
+    }
+    return t && t->tag == 8;
+}
+
+static int is_float_value_expr(Gen* g, WExpr* e, int deref_ptr) {
+    if (is_float_expr(g, e)) {
+        return 1;
+    }
+    return deref_ptr && is_f64_pointer_modifier_expr(g, e);
 }
 
 static int is_signed_expr(Gen* g, WExpr* e) {
@@ -3072,7 +3079,7 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 uint32_t var_size = type_size(g, var_type);
                 uint8_t bound_reg = 0;
                 uint8_t xmm_reg = 0;
-                if (var_type && is_float_type(var_type) && var_size == 8 &&
+                if (var_type && is_float_type_named(g,var_type) && var_size == 8 &&
                     xmm_local_lookup(g, e->str, &xmm_reg)) {
                     if (reg == 0) emit_movapd_xmm_to_xmm0(b, xmm_reg);
                     else emit_movq_xmm_to_gpr(b, xmm_reg, reg);
@@ -3437,7 +3444,9 @@ static void compile_expr(Gen* g, WExpr* e, uint8_t reg, int deref_ptr) {
                 if (reg != 0) move_rax_to_reg(b, reg);
                 return;
             }
-            int float_op = is_float_expr(g, e->a) || is_float_expr(g, e->b);
+            int float_op =
+                is_float_value_expr(g, e->a, float_value_deref_flag(g, e->a, deref_ptr)) ||
+                is_float_value_expr(g, e->b, float_value_deref_flag(g, e->b, deref_ptr));
             /* Fused and literal-RHS float ops stay in XMM registers. */
             if (compile_float_binary_to_xmm0(g, e)) {
                 emit_movq_xmm0_to_rax(b);
@@ -4289,7 +4298,9 @@ static void emit_cmp_reg_imm(Buf* b, uint8_t lhs, int64_t imm) {
 }
 
 static int is_float_comparison(Gen* g, WExpr* e) {
-    return e && e->tag == 8 && (is_float_expr(g, e->a) || is_float_expr(g, e->b));
+    return e && e->tag == 8 &&
+           (is_float_value_expr(g, e->a, expr_deref_flag(g, e->a, 1)) ||
+            is_float_value_expr(g, e->b, expr_deref_flag(g, e->b, 1)));
 }
 
 /* f64 values travel as bit patterns in GPRs. Compare them numerically with
@@ -4461,7 +4472,8 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
         return;
     }
     if (e && e->tag == 8 && e->b && e->b->tag == 11 &&
-        float_op_code(e->str) && (is_float_expr(g, e->a) || is_float_expr(g, e->b))) {
+        float_op_code(e->str) &&
+        (is_float_value_expr(g, e->a, 1) || is_float_value_expr(g, e->b, 1))) {
         compile_float_to_xmm0_s(g, e->a, scratch);
         emit_float_op_xmm0_mem(g, e->str, e->b->str);
         return;
@@ -4613,7 +4625,7 @@ static void compile_float_to_xmm0_s(Gen* g, WExpr* e, uint8_t scratch) {
     }
     /* Integer operands of f64 arithmetic must become IEEE-754 values, not
      * raw bit patterns. This covers mixed expressions such as `3.0 * 2`. */
-    if (e && !is_float_expr(g, e)) {
+    if (e && !is_float_value_expr(g, e, 1)) {
         compile_expr(g, e, 0, float_value_deref_flag(g, e, 1));
         emit_int_bits_to_f64_bits(g, 0, is_signed_expr(g, e));
         emit_movq_rax_to_xmm0(b);
@@ -4885,7 +4897,7 @@ static int stmt_unsafe_for_xmm(WStmt* s) {
 static void collect_xmm_loop_locals(Gen* g, WStmt* s, XmmLocalVec* out,
                                     uint8_t* next_reg) {
     if (!s || *next_reg > 15) return;
-    if (s->tag == 0 && s->type && is_float_type(s->type) &&
+    if (s->tag == 0 && s->type && is_float_type_named(g,s->type) &&
         type_size(g, s->type) == 8 && s->access == 3 && s->name.ptr &&
         !map_has(&g->escaped_locals, s->name.ptr, s->name.len) && s->e1) {
         uint64_t existing = 0;
@@ -5733,7 +5745,7 @@ static int is_xmm_bound_f64_local(Gen* g, WExpr* e, uint8_t* reg) {
     uint64_t type_ptr = 0;
     if (!map_get_str(&g->local_types, e->str, &type_ptr)) return 0;
     WType* t = AS_PTR(WType, type_ptr);
-    if (!t || !is_float_type(t) || type_size(g, t) != 8) return 0;
+    if (!t || !is_float_type_named(g,t) || type_size(g, t) != 8) return 0;
     uint8_t xmm_reg = 0;
     if (!xmm_local_lookup(g, e->str, &xmm_reg)) return 0;
     if (reg) *reg = xmm_reg;
@@ -5750,7 +5762,7 @@ static int is_f64_store_target(Gen* g, WExpr* e) {
             return 0;
         }
         WType* t = AS_PTR(WType, type_ptr);
-        if (!is_float_type(t) || type_size(g, t) != 8) {
+        if (!is_float_type_named(g,t) || type_size(g, t) != 8) {
             return 0;
         }
         uint64_t access = 3, off = 0;
@@ -6467,7 +6479,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                 }
                 uint8_t xmm_reg = 0;
                 if (!aggregate_init && var_size == 8 && s->access == 3 &&
-                    is_float_type(vtype) &&
+                    is_float_type_named(g,vtype) &&
                     xmm_local_lookup(g, s->name, &xmm_reg)) {
                     /* Keep f64 loop locals in an XMM register. */
                     if (is_float_expr(g, s->e1)) {
@@ -6478,7 +6490,7 @@ static void compile_stmt(Gen* g, WStmt* s) {
                         emit_movq_gpr_to_xmm(b, 0, xmm_reg);
                     }
                 } else if (!aggregate_init && var_size == 8 && s->access == 3 &&
-                    is_float_type(vtype) && is_float_expr(g, s->e1)) {
+                    is_float_type_named(g,vtype) && is_float_expr(g, s->e1)) {
                     /* Store the f64 bit pattern straight from xmm0 instead of
                      * routing it through rax and emit_mem_store. */
                     compile_float_to_xmm0(g, s->e1);
