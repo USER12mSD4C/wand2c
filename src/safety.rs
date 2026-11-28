@@ -11,6 +11,11 @@ enum VarState {
         type_name: String,
     },
     Safe,
+    /* A pointer was proven non-null by a guard. It is not an allocation, so
+     * it must not create a leak warning or be re-collapsed to element facts. */
+    CheckedPointer {
+        type_name: String,
+    },
     /* A pointer was explicitly set to null (or a non-pointer scalar). It is
      * not an allocation, so it must not create a leak warning, but dereferencing
      * it still requires an explicit null check. */
@@ -77,6 +82,7 @@ impl MemorySafetyAnalyzer {
         if let Some(state) = self.states.get(path) {
             let type_name = match state {
                 VarState::Uninitialized { type_name, .. }
+                | VarState::CheckedPointer { type_name }
                 | VarState::NullPointer { type_name }
                 | VarState::Allocated { type_name, .. } => Some(type_name.as_str()),
                 VarState::Freed { .. } | VarState::Safe => None,
@@ -112,6 +118,28 @@ impl MemorySafetyAnalyzer {
             }
         }
         false
+    }
+
+    /* Does a collapsed dynamic index select a pointer object? Used before
+     * recovering element facts from an already Safe aggregate base so scalar
+     * arrays (for example a local conversion buffer) are left alone. */
+    fn collapsed_target_is_pointer(&self, base: &str, suffix: &str) -> bool {
+        if suffix.is_empty() {
+            return self.is_pointer_array_path(base);
+        }
+        let prefix = format!("{}[", base);
+        let tail = format!("].{}", suffix);
+        self.states.keys().any(|key| {
+            let rest = match key.strip_prefix(&prefix) {
+                Some(rest) => rest,
+                None => return false,
+            };
+            let pos = match rest.find(']') {
+                Some(pos) => pos,
+                None => return false,
+            };
+            &rest[pos..] == tail && self.is_pointer_path(key)
+        })
     }
 
     /* A dynamic index on an array of pointers names one pointer element. The
@@ -187,13 +215,25 @@ impl MemorySafetyAnalyzer {
 
     fn effective_state(&self, path: &str) -> Option<VarState> {
         let state = self.states.get(path).cloned()?;
-        if !matches!(state, VarState::Uninitialized { .. }) {
+        if !matches!(state, VarState::Uninitialized { .. } | VarState::Safe) {
             return Some(state);
         }
-        let candidates = match path.find('.') {
+        /* A literal aggregate initializer leaves the collapsed base Safe while
+         * its constant elements carry the real pointer facts. A guard-produced
+         * CheckedPointer state above deliberately skips this recovery so the
+         * checked dynamic path stays usable inside its branch. */
+        let mut candidates = match path.find('.') {
             Some(dot) => vec![(&path[..dot], &path[dot + 1..]), (path, "")],
             None => vec![(path, "")],
         };
+        /* A Safe scalar pointer can have element states from being indexed,
+         * but those elements are not a collapsed array base. Only literal
+         * aggregate bases (declared arrays and their fields) need recovery. */
+        if matches!(state, VarState::Safe) {
+            candidates.retain(|(base, suffix)| {
+                self.is_array_path(base) && self.collapsed_target_is_pointer(base, suffix)
+            });
+        }
         for (base, suffix) in candidates {
             if let Some(effective) = self.collapsed_indexed_state(base, suffix) {
                 return Some(effective);
@@ -241,7 +281,7 @@ impl MemorySafetyAnalyzer {
                 if let Some(pos) = rest.find(']') {
                     if rest[pos..].starts_with("].") && &rest[pos + 2..] == suffix {
                         found = true;
-                        if !matches!(state, VarState::Safe) {
+                        if !matches!(state, VarState::Safe | VarState::CheckedPointer { .. }) {
                             return false;
                         }
                     }
@@ -309,6 +349,11 @@ impl MemorySafetyAnalyzer {
             err.push_str("   |\n");
         }
         err.push_str(&format!("  \x1b[32;1mnote\x1b[0m: {}\n", note));
+        /* Several checks can observe the same bad state in one dereference
+         * chain. Report the violation once, not once per chain level. */
+        if self.errors.iter().any(|existing| existing == &err) {
+            return;
+        }
         self.errors.push(err);
     }
 
@@ -595,8 +640,6 @@ impl MemorySafetyAnalyzer {
                     self.states.insert(prefix.to_string(), initial_state.clone());
                     for i in 0..*count {
                         let element_prefix = format!("{}[{}]", prefix, i);
-                        self.decl_types
-                            .insert(element_prefix.clone(), (**inner).clone());
                         self.states.insert(element_prefix, element_state.clone());
                     }
                 }
@@ -609,6 +652,11 @@ impl MemorySafetyAnalyzer {
                 );
                 for i in 0..*count {
                     let element_prefix = format!("{}[{}]", prefix, i);
+                    /* Constant struct-array elements need their own declared
+                     * type so a whole-element literal assignment can apply
+                     * pointer-leaf states to its fields. */
+                    self.decl_types
+                        .insert(element_prefix.clone(), (**inner).clone());
                     self.register_struct_fields(
                         &element_prefix,
                         inner,
@@ -1063,7 +1111,12 @@ impl MemorySafetyAnalyzer {
                                     );
                                 }
                                 Some(VarState::NullPointer { .. }) => {
-                                    then_states.insert(path.clone(), VarState::Safe);
+                                    then_states.insert(
+                                        path.clone(),
+                                        VarState::CheckedPointer {
+                                            type_name: "void*".to_string(),
+                                        },
+                                    );
                                 }
                                 _ => {}
                             }
@@ -1103,7 +1156,12 @@ impl MemorySafetyAnalyzer {
                                         );
                                     }
                                     Some(VarState::NullPointer { .. }) => {
-                                        else_states.insert(path.clone(), VarState::Safe);
+                                        else_states.insert(
+                                            path.clone(),
+                                            VarState::CheckedPointer {
+                                                type_name: "void*".to_string(),
+                                            },
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -1143,7 +1201,12 @@ impl MemorySafetyAnalyzer {
                                      * pointer on the fallthrough path. */
                                     match self.effective_state(path) {
                                         Some(VarState::NullPointer { .. }) => {
-                                            fallthrough_states.insert(path.clone(), VarState::Safe);
+                                            fallthrough_states.insert(
+                                                path.clone(),
+                                                VarState::CheckedPointer {
+                                                    type_name: "void*".to_string(),
+                                                },
+                                            );
                                         }
                                         Some(VarState::Allocated {
                                             allocated_line,
